@@ -387,22 +387,19 @@ impl Node {
             return;
         }
         // Challenge it (once) and hold its chat until it answers.
-        let challenge = match room.challenges.get_mut(&from) {
-            Some(c) => c,
-            None => {
-                let nonce = fresh_nonce();
-                let probe = RoomBody::Probe { nonce: nonce.clone() };
-                let frame = room::seal(&room.keys, self.id, &RoomEnvelope { ts: now_millis(), body: probe });
-                room.challenges.insert(from, Challenge { nonce, started: now, buffered: Vec::new() });
-                self.send_to(from, frame);
-                match self.rooms.joined.get_mut(&id).and_then(|r| r.challenges.get_mut(&from)) {
-                    Some(c) => c,
-                    None => return,
-                }
-            }
-        };
+        let me = self.id;
+        let mut probe = None;
+        let challenge = room.challenges.entry(from).or_insert_with(|| {
+            let nonce = fresh_nonce();
+            let body = RoomBody::Probe { nonce: nonce.clone() };
+            probe = Some(room::seal(&room.keys, me, &RoomEnvelope { ts: now_millis(), body }));
+            Challenge { nonce, started: now, buffered: Vec::new() }
+        });
         if matches!(env.body, RoomBody::Chat { .. }) && challenge.buffered.len() < MAX_BUFFERED {
             challenge.buffered.push(env);
+        }
+        if let Some(frame) = probe {
+            self.send_to(from, frame);
         }
     }
 
