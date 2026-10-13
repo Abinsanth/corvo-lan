@@ -2,9 +2,16 @@
 //! Talks to GitHub through the system `curl` (as install.sh does), so the app
 //! needs no HTTP or TLS crates.
 
+use std::ffi::OsStr;
 use std::fmt;
+use std::io::ErrorKind;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+use crate::room::to_hex;
 
 pub const REPO: &str = "Abinsanth/lan-chat";
 pub const INSTALL_URL: &str = "https://raw.githubusercontent.com/Abinsanth/lan-chat/release/install.sh";
@@ -112,6 +119,131 @@ pub fn check_disabled_by(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// Where releases are listed and downloaded from. Tests point these at `file://`.
+pub struct Urls {
+    pub api: String,
+    pub download: String,
+}
+
+impl Default for Urls {
+    fn default() -> Self {
+        Urls {
+            api: format!("https://api.github.com/repos/{REPO}/releases?per_page=20"),
+            download: format!("https://github.com/{REPO}/releases/download"),
+        }
+    }
+}
+
+/// Releases newer than this binary.
+pub async fn check() -> Result<Vec<Release>, String> {
+    check_with(&Urls::default(), current()).await
+}
+
+pub async fn check_with(urls: &Urls, current: Version) -> Result<Vec<Release>, String> {
+    let agent = format!("User-Agent: lan-chat/{current}");
+    let accept = "Accept: application/vnd.github+json";
+    let body = curl(["-fsSL", "--max-time", "10", "-H", accept, "-H", &agent, &urls.api]).await?;
+    let json = String::from_utf8(body).map_err(|_| "unexpected reply from GitHub".to_string())?;
+    Ok(newer_than(current, parse_releases(&json)?))
+}
+
+/// Replaces `target` with `version`'s build for this system.
+pub async fn install(version: Version, target: &Path) -> Result<(), String> {
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let asset = asset_name(os, arch).ok_or_else(|| format!("no release build for {os}/{arch}; build from source"))?;
+    install_with(&Urls::default(), version, &asset, target).await
+}
+
+/// Downloads into a temp dir beside `target` (so the final rename is atomic and
+/// on one filesystem), verifies, unpacks, then swaps the new binary in. Any
+/// failure leaves `target` as it was.
+pub async fn install_with(urls: &Urls, version: Version, asset: &str, target: &Path) -> Result<(), String> {
+    let dir = target.parent().ok_or_else(|| cant_replace(target, "it has no parent directory"))?;
+    let tmp = dir.join(format!(".lan-chat-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp); // left by an update that crashed
+    if let Err(e) = std::fs::create_dir(&tmp) {
+        let reason = if e.kind() == ErrorKind::PermissionDenied { "permission denied".into() } else { e.to_string() };
+        return Err(cant_replace(target, &reason));
+    }
+    let result = install_in(&tmp, urls, version, asset, target).await;
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+async fn install_in(tmp: &Path, urls: &Urls, version: Version, asset: &str, target: &Path) -> Result<(), String> {
+    let url = format!("{}/v{version}/{asset}", urls.download);
+    let archive = tmp.join(asset);
+    let sums = tmp.join(format!("{asset}.sha256"));
+    for (out, url) in [(&archive, url.clone()), (&sums, format!("{url}.sha256"))] {
+        download(&url, out).await.map_err(|e| format!("couldn't download v{version}: {e}"))?;
+    }
+
+    let expected = std::fs::read_to_string(&sums).unwrap_or_default();
+    let expected = expected.split_whitespace().next().unwrap_or_default();
+    let actual = to_hex(&Sha256::digest(std::fs::read(&archive).map_err(|e| e.to_string())?));
+    if expected != actual {
+        return Err("download didn't match its checksum; nothing changed".into());
+    }
+
+    let status = tokio::process::Command::new("tar").arg("-xzf").arg(&archive).arg("-C").arg(tmp).status().await;
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => return Err("couldn't unpack the download; nothing changed".into()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Err("/update needs tar, which isn't installed".into()),
+        Err(e) => return Err(format!("couldn't run tar: {e}")),
+    }
+    let new = tmp.join("lan-chat");
+    if !new.is_file() {
+        return Err("the download didn't contain lan-chat; nothing changed".into());
+    }
+    std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    // The running process keeps its open copy of the old file; restarting picks up the new one.
+    std::fs::rename(&new, target).map_err(|e| cant_replace(target, &e.to_string()))
+}
+
+async fn download(url: &str, out: &Path) -> Result<(), String> {
+    let args = [OsStr::new("-fsSL"), OsStr::new("--max-time"), OsStr::new("120"), OsStr::new("-o"), out.as_os_str()];
+    curl(args.into_iter().chain([OsStr::new(url)])).await.map(|_| ())
+}
+
+fn cant_replace(target: &Path, reason: &str) -> String {
+    format!("can't replace {}: {reason}. Reinstall with: curl -fsSL {INSTALL_URL} | sh", target.display())
+}
+
+/// Runs curl and returns what it wrote to stdout.
+async fn curl<I, S>(args: I) -> Result<Vec<u8>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let out = tokio::process::Command::new("curl").args(args).output().await.map_err(|e| {
+        if e.kind() == ErrorKind::NotFound {
+            "/update needs curl, which isn't installed".to_string()
+        } else {
+            format!("couldn't run curl: {e}")
+        }
+    })?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(curl_error(out.status.code(), &String::from_utf8_lossy(&out.stderr)))
+    }
+}
+
+/// Turns a failed curl run into a message for people.
+fn curl_error(code: Option<i32>, stderr: &str) -> String {
+    match code {
+        // DNS, connect, timeout, TLS handshake.
+        Some(6 | 7 | 28 | 35) => "couldn't reach GitHub (offline?)".into(),
+        Some(22) => match stderr.rsplit_once("error: ").and_then(|(_, n)| n.trim().parse::<u16>().ok()) {
+            Some(status) => format!("GitHub said no (HTTP {status}); try again later"),
+            None => "GitHub said no; try again later".into(),
+        },
+        Some(n) => format!("curl failed (exit {n})"),
+        None => "curl was stopped".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +329,144 @@ mod tests {
         assert!(!check_disabled_by(Some("0")));
         assert!(check_disabled_by(Some("1")));
         assert!(check_disabled_by(Some("yes")));
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A fresh empty directory under the system temp dir.
+    fn scratch(name: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("lan-chat-test-{}-{n}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A fake release `v<version>` under `root`: a tarball holding a `lan-chat`
+    /// script that prints `marker`, and its checksum file.
+    fn fake_release(root: &Path, version: &str, asset: &str, marker: &str) -> Urls {
+        let dir = root.join(format!("v{version}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lan-chat"), format!("#!/bin/sh\necho {marker}\n")).unwrap();
+        let archive = dir.join(asset);
+        let ok = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .arg("lan-chat")
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let sum = to_hex(&Sha256::digest(std::fs::read(&archive).unwrap()));
+        std::fs::write(dir.join(format!("{asset}.sha256")), format!("{sum}  {asset}\n")).unwrap();
+        Urls { api: String::new(), download: format!("file://{}", root.display()) }
+    }
+
+    fn old_binary(dir: &Path) -> PathBuf {
+        let target = dir.join("lan-chat");
+        std::fs::write(&target, "old").unwrap();
+        target
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "lan-chat")
+            .collect()
+    }
+
+    const ASSET: &str = "lan-chat-test.tar.gz";
+
+    #[tokio::test]
+    async fn check_reads_the_api_and_keeps_newer_releases() {
+        let root = scratch("check");
+        std::fs::write(root.join("releases.json"), API).unwrap();
+        let urls = Urls { api: format!("file://{}/releases.json", root.display()), download: String::new() };
+        let newer = check_with(&urls, Version(0, 2, 0)).await.unwrap();
+        let versions: Vec<Version> = newer.iter().map(|r| r.version).collect();
+        assert_eq!(versions, vec![Version(0, 10, 0), Version(0, 2, 1)]);
+    }
+
+    #[tokio::test]
+    async fn install_replaces_the_target() {
+        let root = scratch("ok-release");
+        let bin = scratch("ok-bin");
+        let urls = fake_release(&root, "0.3.0", ASSET, "new");
+        let target = old_binary(&bin);
+        install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "#!/bin/sh\necho new\n");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(leftovers(&bin).is_empty(), "{:?}", leftovers(&bin));
+    }
+
+    #[tokio::test]
+    async fn checksum_mismatch_leaves_target_unchanged() {
+        let root = scratch("bad-release");
+        let bin = scratch("bad-bin");
+        let urls = fake_release(&root, "0.3.0", ASSET, "new");
+        std::fs::write(root.join(format!("v0.3.0/{ASSET}.sha256")), format!("{}  {ASSET}\n", "0".repeat(64))).unwrap();
+        let target = old_binary(&bin);
+        let err = install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap_err();
+        assert_eq!(err, "download didn't match its checksum; nothing changed");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        assert!(leftovers(&bin).is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_archive_leaves_target_unchanged() {
+        let root = scratch("empty-release");
+        let bin = scratch("missing-bin");
+        let urls = Urls { api: String::new(), download: format!("file://{}", root.display()) };
+        let target = old_binary(&bin);
+        let err = install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap_err();
+        assert!(err.starts_with("couldn't download v0.3.0"), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        assert!(leftovers(&bin).is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_only_directory_fails_before_downloading() {
+        let bin = scratch("ro-bin");
+        let target = old_binary(&bin);
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // The download URL is unreachable on purpose: we must fail before trying it.
+        let urls = Urls { api: String::new(), download: "file:///nonexistent".into() };
+        let err = install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap_err();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.starts_with(&format!("can't replace {}: permission denied", target.display())), "{err}");
+        assert!(err.ends_with(&format!("Reinstall with: curl -fsSL {INSTALL_URL} | sh")), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn a_leftover_temp_dir_does_not_block_install() {
+        let root = scratch("leftover-release");
+        let bin = scratch("leftover-bin");
+        let urls = fake_release(&root, "0.3.0", ASSET, "new");
+        let target = old_binary(&bin);
+        let stale = bin.join(format!(".lan-chat-update-{}", std::process::id()));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("junk"), "x").unwrap();
+        install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
+        assert!(leftovers(&bin).is_empty(), "{:?}", leftovers(&bin));
+    }
+
+    #[test]
+    fn curl_errors_read_like_people_talk() {
+        for code in [6, 7, 28, 35] {
+            assert_eq!(curl_error(Some(code), ""), "couldn't reach GitHub (offline?)");
+        }
+        let forbidden = "curl: (22) The requested URL returned error: 403";
+        assert_eq!(curl_error(Some(22), forbidden), "GitHub said no (HTTP 403); try again later");
+        assert_eq!(curl_error(Some(22), "curl: (22) weird"), "GitHub said no; try again later");
+        assert_eq!(curl_error(Some(37), ""), "curl failed (exit 37)");
+        assert_eq!(curl_error(None, ""), "curl was stopped");
     }
 }
