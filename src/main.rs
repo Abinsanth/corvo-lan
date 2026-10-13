@@ -6,6 +6,7 @@ use clap::Parser;
 use lan_chat::names;
 use lan_chat::node::{self, NodeConfig};
 use lan_chat::ui;
+use lan_chat::update;
 
 /// Serverless peer-to-peer chat for your local network.
 #[derive(Parser)]
@@ -23,6 +24,9 @@ struct Args {
     /// Write debug logs to ./lan-chat.log
     #[arg(long)]
     debug: bool,
+    /// Don't check GitHub for a newer version at startup (or set LAN_CHAT_NO_UPDATE_CHECK=1)
+    #[arg(long)]
+    no_update_check: bool,
 }
 
 #[tokio::main]
@@ -49,5 +53,6 @@ async fn main() -> anyhow::Result<()> {
         fixed_word: None,
     })
     .await?;
-    ui::line::run(handle, true).await
+    let env_off = update::check_disabled_by(std::env::var("LAN_CHAT_NO_UPDATE_CHECK").ok().as_deref());
+    ui::line::run(handle, !args.no_update_check && !env_off).await
 }

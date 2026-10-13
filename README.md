@@ -45,10 +45,19 @@ After about two seconds you get a name, and you're connected to everyone else ru
 /chat @bobRoger            # private chat
 /msg @bobRoger hi          # one-off private message
 /who                       # who's connected
+/update [yes]              # check for and install a newer version
 /help                      # all commands
 ```
 
 Plain text goes to the conversation shown in the prompt.
+
+### Updating
+
+Type `/update` to see newer versions, then `/update yes` to install the
+newest one; restart lan-chat to use it. At startup lan-chat makes one request
+to GitHub to see whether a newer version exists. That request sends only your
+IP address and the app version; turn it off with `--no-update-check` or
+`LAN_CHAT_NO_UPDATE_CHECK=1`. Nothing else ever leaves your network.
 
 ### If peers don't find each other
 
