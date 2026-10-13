@@ -62,8 +62,8 @@ impl Updater {
         }
         let (out, busy) = (self.out.clone(), self.busy.clone());
         tokio::spawn(async move {
+            let _clear = ClearOnDrop(busy);
             run(action, &out).await;
-            busy.store(false, Ordering::SeqCst);
         });
     }
 
@@ -76,6 +76,15 @@ impl Updater {
                 let _ = out.send(notice);
             }
         });
+    }
+}
+
+/// Frees the updater for the next job however this one ends, panics included.
+struct ClearOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -158,5 +167,17 @@ mod tests {
         assert_eq!(lines[5], "*   v0.2.3 (2026-10-20)");
         assert_eq!(lines[6], "*   …and 2 older");
         assert_eq!(lines[7], "* type /update yes to install v0.2.7");
+    }
+
+    #[test]
+    fn the_busy_flag_clears_even_if_the_job_panics() {
+        let busy = Arc::new(AtomicBool::new(true));
+        let flag = busy.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _clear = ClearOnDrop(flag);
+            panic!("a bug in the update job");
+        });
+        assert!(result.is_err());
+        assert!(!busy.load(Ordering::SeqCst));
     }
 }

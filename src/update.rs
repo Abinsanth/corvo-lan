@@ -15,6 +15,8 @@ use crate::room::to_hex;
 
 pub const REPO: &str = "Abinsanth/lan-chat";
 pub const INSTALL_URL: &str = "https://raw.githubusercontent.com/Abinsanth/lan-chat/release/install.sh";
+/// Names the temp dir an install works in, beside the binary it replaces.
+const TMP_PREFIX: &str = ".lan-chat-update-";
 /// Most PR titles shown per release.
 const SUMMARY_LINES: usize = 3;
 
@@ -159,8 +161,8 @@ pub async fn install(version: Version, target: &Path) -> Result<(), String> {
 /// failure leaves `target` as it was.
 pub async fn install_with(urls: &Urls, version: Version, asset: &str, target: &Path) -> Result<(), String> {
     let dir = target.parent().ok_or_else(|| cant_replace(target, "it has no parent directory"))?;
-    let tmp = dir.join(format!(".lan-chat-update-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp); // left by an update that crashed
+    sweep_leftovers(dir);
+    let tmp = dir.join(format!("{TMP_PREFIX}{}", std::process::id()));
     if let Err(e) = std::fs::create_dir(&tmp) {
         let reason = if e.kind() == ErrorKind::PermissionDenied { "permission denied".into() } else { e.to_string() };
         return Err(cant_replace(target, &reason));
@@ -185,7 +187,14 @@ async fn install_in(tmp: &Path, urls: &Urls, version: Version, asset: &str, targ
         return Err("download didn't match its checksum; nothing changed".into());
     }
 
-    let status = tokio::process::Command::new("tar").arg("-xzf").arg(&archive).arg("-C").arg(tmp).status().await;
+    let status = tokio::process::Command::new("tar")
+        .kill_on_drop(true)
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(tmp)
+        .status()
+        .await;
     match status {
         Ok(s) if s.success() => {}
         Ok(_) => return Err("couldn't unpack the download; nothing changed".into()),
@@ -206,6 +215,19 @@ async fn download(url: &str, out: &Path) -> Result<(), String> {
     curl(args.into_iter().chain([OsStr::new(url)])).await.map(|_| ())
 }
 
+/// Removes temp dirs left by updates that were quit or crashed mid-download.
+fn sweep_leftovers(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
+            let path = entry.path();
+            let _ = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
+        }
+    }
+}
+
 fn cant_replace(target: &Path, reason: &str) -> String {
     format!("can't replace {}: {reason}. Reinstall with: curl -fsSL {INSTALL_URL} | sh", target.display())
 }
@@ -216,7 +238,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let out = tokio::process::Command::new("curl").args(args).output().await.map_err(|e| {
+    let out = tokio::process::Command::new("curl").kill_on_drop(true).args(args).output().await.map_err(|e| {
         if e.kind() == ErrorKind::NotFound {
             "/update needs curl, which isn't installed".to_string()
         } else {
@@ -451,9 +473,12 @@ mod tests {
         let bin = scratch("leftover-bin");
         let urls = fake_release(&root, "0.3.0", ASSET, "new");
         let target = old_binary(&bin);
-        let stale = bin.join(format!(".lan-chat-update-{}", std::process::id()));
+        // Left by earlier runs (other process ids): one quit mid-download, one odd file.
+        let stale = bin.join(".lan-chat-update-1");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("junk"), "x").unwrap();
+        std::fs::write(bin.join(".lan-chat-update-2"), "x").unwrap();
+        std::fs::write(bin.join(format!(".lan-chat-update-{}", std::process::id())), "x").unwrap();
         install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
         assert!(leftovers(&bin).is_empty(), "{:?}", leftovers(&bin));
     }
