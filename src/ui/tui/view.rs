@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::state::{Hit, MAX_INPUT_ROWS, Tab, TuiState, tabs};
+use super::state::{Editor, Hit, MAX_INPUT_ROWS, Tab, TuiState, tabs};
 use crate::api::Conv;
 use crate::convo::LineKind;
 use crate::ui::render::{Tone, clean, hhmm, nick_color, tone_of_notice};
@@ -236,9 +236,34 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, session: &Session, state: &mut Tu
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The input as visual rows (no prompts) and the cursor as (row, col). Long
+/// rows are cut into `width`-char chunks so the cursor maps exactly.
+fn input_layout(editor: &Editor, width: usize) -> (Vec<String>, (usize, usize)) {
+    let width = width.max(1);
+    let (crow, ccol) = editor.cursor_pos();
+    let mut out = Vec::new();
+    let mut cursor = (0, 0);
+    for (i, row) in editor.rows().into_iter().enumerate() {
+        let chars: Vec<char> = row.chars().collect();
+        if i == crow {
+            let at_full_end = ccol > 0 && ccol % width == 0 && ccol == chars.len();
+            cursor = if at_full_end {
+                (out.len() + ccol / width - 1, width)
+            } else {
+                (out.len() + ccol / width, ccol % width)
+            };
+        }
+        if chars.is_empty() {
+            out.push(String::new());
+        } else {
+            out.extend(chars.chunks(width).map(|c| c.iter().collect::<String>()));
+        }
+    }
+    (out, cursor)
+}
+
 fn draw_input(frame: &mut Frame, area: Rect, state: &TuiState) {
-    let rows = state.editor.rows();
-    let (crow, ccol) = state.editor.cursor_pos();
+    let (rows, (crow, ccol)) = input_layout(&state.editor, (area.width as usize).saturating_sub(2));
     let height = area.height as usize;
     let first = crow.saturating_sub(height.saturating_sub(1));
     let lines: Vec<Line> = if state.editor.is_empty() {
@@ -282,7 +307,8 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
         frame.render_widget(Paragraph::new("terminal too small, make it bigger"), area);
         return;
     }
-    let input_rows = state.editor.rows().len().clamp(1, MAX_INPUT_ROWS) as u16;
+    let input_rows =
+        input_layout(&state.editor, (area.width as usize).saturating_sub(2)).0.len().clamp(1, MAX_INPUT_ROWS) as u16;
     let [tabs_a, body_a, sep_a, input_a, status_a] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -495,5 +521,32 @@ mod tests {
         assert_eq!(wrap("hello there world", 11), vec!["hello there", "world"]);
         assert_eq!(wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         assert_eq!(wrap("", 5), vec![""]);
+    }
+
+    #[test]
+    fn long_lines_wrap_in_the_input_and_the_cursor_follows() {
+        let s = session();
+        let mut state = TuiState::new(false);
+        state.editor.set("x".repeat(120));
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw(f, &s, &mut state, Instant::now())).unwrap();
+        let r = rows(term.backend().buffer());
+        assert_eq!(r[17].trim_end(), format!("> {}", "x".repeat(78)));
+        assert_eq!(r[18].trim_end(), format!("  {}", "x".repeat(42)));
+        let pos = term.get_cursor_position().unwrap();
+        assert_eq!((pos.x, pos.y), (2 + 42, 18));
+    }
+
+    fn layout_of(text: &str, width: usize) -> (Vec<String>, (usize, usize)) {
+        let mut e = Editor::default();
+        e.set(text.into());
+        input_layout(&e, width)
+    }
+
+    #[test]
+    fn input_layout_splits_rows_and_maps_the_cursor() {
+        assert_eq!(layout_of("abcdefgh", 4), (vec!["abcd".to_string(), "efgh".into()], (1, 4)));
+        assert_eq!(layout_of("ab\ncdefg", 4), (vec!["ab".to_string(), "cdef".into(), "g".into()], (2, 1)));
+        assert_eq!(layout_of("", 4), (vec![String::new()], (0, 0)));
     }
 }
