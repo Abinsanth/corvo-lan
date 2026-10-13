@@ -78,6 +78,8 @@ pub enum Frame {
     Chat { text: String, ts: u64 },
     Direct { text: String, ts: u64 },
     Nick { nick: String },
+    /// Encrypted room traffic, sent to every peer; see `room`. All fields are lowercase hex.
+    Room { room_id: String, nonce: String, ct: String },
     Ping,
     Bye,
 }
@@ -150,6 +152,7 @@ mod tests {
             Frame::Chat { text: "hello".into(), ts: 1 },
             Frame::Direct { text: "psst".into(), ts: 2 },
             Frame::Nick { nick: "bob".into() },
+            Frame::Room { room_id: "ab".repeat(16), nonce: "cd".repeat(24), ct: "ef".repeat(20) },
             Frame::Ping,
             Frame::Bye,
         ];

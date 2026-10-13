@@ -4,4 +4,6 @@ pub mod names;
 pub mod node;
 pub mod peer;
 pub mod protocol;
+pub mod room;
 pub mod ui;
+pub mod words;
