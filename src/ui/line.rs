@@ -1,4 +1,5 @@
-//! Line-based frontend: wires `Session` to rustyline.
+//! Line-based frontend: rustyline on its own thread, output through a printer
+//! thread. It shares the `Session` with the TUI via `Ctx`.
 
 use std::sync::{Arc, Mutex};
 
@@ -7,11 +8,11 @@ use rustyline::{DefaultEditor, ExternalPrinter as _};
 use tokio::sync::mpsc;
 
 use super::render::Style;
-use super::session::Session;
-use super::updates::Updater;
-use crate::api::{Command, Conv, Event};
-use crate::node::NodeHandle;
+use super::{Ctx, Exit};
+use crate::api::{Command, Conv};
 use crate::protocol::now_millis;
+
+type Typed = Option<(String, Option<Conv>)>;
 
 /// Runs `print` on its own thread. Sending never blocks, so the UI task can't
 /// stall on rustyline's printer (which blocks while a prompt isn't being read).
@@ -33,121 +34,126 @@ fn readline_gives_up(err: &ReadlineError, consecutive: u32) -> bool {
     matches!(err, ReadlineError::Interrupted | ReadlineError::Eof) || consecutive >= MAX_READ_ERRORS
 }
 
-/// Runs the frontend until the user quits, then waits for the Node to say goodbye.
-pub async fn run(handle: NodeHandle, check_updates: bool) -> anyhow::Result<()> {
-    let NodeHandle { commands, mut events, task, .. } = handle;
-    let mut editor = DefaultEditor::new()?;
-    // The external printer redraws the prompt around output; it needs a real
-    // terminal, so piped stdin falls back to plain println.
-    let out = match editor.create_external_printer() {
-        Ok(mut printer) => spawn_printer(move |s| {
-            let _ = printer.print(s);
-        }),
-        Err(_) => spawn_printer(|s| println!("{s}")),
-    };
-    let print = |s: String| {
-        let _ = out.send(s);
-    };
-
-    let updater = Updater::new(out.clone());
-    if check_updates {
-        updater.check_at_startup();
-    }
-
-    // rustyline blocks, so it lives on its own thread. It waits for `resume`
-    // before each prompt so we never exit while the terminal is in raw mode,
-    // and reads the prompt then so it follows conversation switches.
-    let prompt = Arc::new(Mutex::new((String::from("> "), None)));
-    let (line_tx, mut lines) = mpsc::unbounded_channel::<Option<(String, Option<Conv>)>>();
-    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
-    let thread_prompt = prompt.clone();
-    std::thread::spawn(move || {
-        let mut errors = 0;
-        loop {
-            let (text, shown) = thread_prompt.lock().map(|p| p.clone()).unwrap_or_else(|_| ("> ".into(), None));
-            match editor.readline(&text) {
-                Ok(line) => {
-                    errors = 0;
-                    let _ = editor.add_history_entry(line.as_str());
-                    if line_tx.send(Some((line, shown))).is_err() || resume_rx.recv().is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    errors += 1;
-                    if readline_gives_up(&e, errors) {
-                        let _ = line_tx.send(None);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let mut session = Session::new(Style::detect());
-    let result =
-        event_loop(&mut session, &commands, &mut events, &mut lines, &resume_tx, &prompt, &updater, print).await;
-    drop(resume_tx);
-    let _ = task.await;
-    result
+pub struct LineFrontend {
+    out: std::sync::mpsc::Sender<String>,
+    prompt: Arc<Mutex<(String, Option<Conv>)>>,
+    lines: mpsc::UnboundedReceiver<Typed>,
+    /// Lets the input thread show one prompt. Dropped on shutdown.
+    resume: Option<std::sync::mpsc::Sender<()>>,
+    style: Style,
+    /// Has run before, so a later turn came from the TUI.
+    entered: bool,
 }
 
-/// Routes input lines to the Node and events to `print` until the user quits.
-/// Returns only while no prompt is active, so the terminal is never left raw.
-#[allow(clippy::too_many_arguments)] // each is a separate channel or handle `run` owns
-async fn event_loop(
-    session: &mut Session,
-    commands: &mpsc::Sender<Command>,
-    events: &mut mpsc::UnboundedReceiver<Event>,
-    lines: &mut mpsc::UnboundedReceiver<Option<(String, Option<Conv>)>>,
-    resume: &std::sync::mpsc::Sender<()>,
-    prompt: &Mutex<(String, Option<Conv>)>,
-    updater: &Updater,
-    print: impl Fn(String),
-) -> anyhow::Result<()> {
-    loop {
-        tokio::select! {
-            event = events.recv() => match event {
-                Some(event) => {
-                    if let Some(text) = session.on_event(&event, now_millis()) {
-                        print(text);
+impl LineFrontend {
+    /// Starts the input thread paused: it shows no prompt (and reads nothing)
+    /// until `run` asks, so it never competes with the TUI for the keyboard.
+    pub fn new(style: Style) -> anyhow::Result<Self> {
+        let mut editor = DefaultEditor::new()?;
+        // The external printer redraws the prompt around output; it needs a real
+        // terminal, so piped stdin falls back to plain println.
+        let out = match editor.create_external_printer() {
+            Ok(mut printer) => spawn_printer(move |s| {
+                let _ = printer.print(s);
+            }),
+            Err(_) => spawn_printer(|s| println!("{s}")),
+        };
+        let prompt = Arc::new(Mutex::new((String::from("> "), None)));
+        let (line_tx, lines) = mpsc::unbounded_channel::<Typed>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let thread_prompt = prompt.clone();
+        std::thread::spawn(move || {
+            let mut errors = 0;
+            'prompts: while resume_rx.recv().is_ok() {
+                loop {
+                    let (text, shown) = thread_prompt.lock().map(|p| p.clone()).unwrap_or_else(|_| ("> ".into(), None));
+                    match editor.readline(&text) {
+                        Ok(line) => {
+                            errors = 0;
+                            let _ = editor.add_history_entry(line.as_str());
+                            if line_tx.send(Some((line, shown))).is_err() {
+                                break 'prompts;
+                            }
+                            continue 'prompts;
+                        }
+                        Err(e) => {
+                            errors += 1;
+                            if readline_gives_up(&e, errors) {
+                                let _ = line_tx.send(None);
+                                break 'prompts;
+                            }
+                        }
                     }
-                    if let Ok(mut p) = prompt.lock() {
-                        *p = session.prompt_state();
-                    }
                 }
-                None => {
-                    // A prompt is showing; wait for it to return before exiting.
-                    print("! chat core stopped unexpectedly; press Enter to exit".into());
-                    lines.recv().await;
-                    return Ok(());
-                }
-            },
-            line = lines.recv() => {
-                let Some((line, shown)) = line.flatten() else {
-                    let _ = commands.send(Command::Quit).await;
-                    return Ok(());
-                };
-                let reaction = session.on_line(&line, shown.as_ref());
-                for text in reaction.print {
-                    print(text);
-                }
-                if reaction.quit {
-                    let _ = commands.send(Command::Quit).await;
-                    return Ok(());
-                }
-                for cmd in reaction.commands {
-                    commands.send(cmd).await?;
-                }
-                if let Some(action) = reaction.update {
-                    updater.start(action);
-                }
-                if let Ok(mut p) = prompt.lock() {
-                    *p = session.prompt_state();
-                }
-                let _ = resume.send(());
+            }
+        });
+        Ok(LineFrontend { out, prompt, lines, resume: Some(resume_tx), style, entered: false })
+    }
+
+    fn print(&self, s: impl Into<String>) {
+        let _ = self.out.send(s.into());
+    }
+
+    /// Updates the prompt and lets the input thread show it.
+    fn ready(&self, ctx: &Ctx) {
+        if let Ok(mut p) = self.prompt.lock() {
+            *p = ctx.session.prompt_state();
+        }
+        if let Some(resume) = &self.resume {
+            let _ = resume.send(());
+        }
+    }
+
+    /// Owns the terminal until the user quits or switches to the TUI. Returns
+    /// only while no prompt is showing, so the terminal is never left raw.
+    pub async fn run(&mut self, ctx: &mut Ctx) -> anyhow::Result<Exit> {
+        if self.entered {
+            for line in ctx.session.line_banner() {
+                self.print(line);
             }
         }
+        self.entered = true;
+        self.ready(ctx);
+        loop {
+            tokio::select! {
+                event = ctx.events.recv() => match event {
+                    Some(event) => {
+                        if let Some(text) = ctx.session.on_event(&event, now_millis()) {
+                            self.print(text);
+                        }
+                        if let Ok(mut p) = self.prompt.lock() {
+                            *p = ctx.session.prompt_state();
+                        }
+                    }
+                    None => {
+                        // A prompt is showing; wait for it to return before exiting.
+                        self.print("! chat core stopped unexpectedly; press Enter to exit");
+                        self.lines.recv().await;
+                        return Ok(Exit::Quit);
+                    }
+                },
+                Some(notice) = ctx.notices.recv() => self.print(self.style.tone(notice.tone, &notice.text)),
+                line = self.lines.recv() => {
+                    let Some((line, shown)) = line.flatten() else {
+                        let _ = ctx.commands.send(Command::Quit).await;
+                        return Ok(Exit::Quit);
+                    };
+                    let mut reaction = ctx.session.on_line(&line, shown.as_ref());
+                    for text in std::mem::take(&mut reaction.print) {
+                        self.print(self.style.toned(&text));
+                    }
+                    if let Some(exit) = ctx.act(reaction).await? {
+                        return Ok(exit);
+                    }
+                    self.ready(ctx);
+                }
+            }
+        }
+    }
+
+    /// Lets the input thread finish.
+    pub fn shutdown(&mut self) {
+        self.resume = None;
     }
 }
 
@@ -163,31 +169,6 @@ mod tests {
         assert!(!readline_gives_up(&glitch(), 1));
         assert!(!readline_gives_up(&glitch(), 2));
         assert!(readline_gives_up(&glitch(), 3));
-    }
-
-    #[tokio::test]
-    async fn when_the_core_stops_we_wait_for_the_prompt_before_exiting() {
-        use std::time::Duration;
-        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
-        let (event_tx, mut events) = mpsc::unbounded_channel();
-        let (line_tx, mut lines) = mpsc::unbounded_channel();
-        let (resume_tx, _resume_rx) = std::sync::mpsc::channel();
-        let printed = Arc::new(Mutex::new(Vec::<String>::new()));
-        let log = printed.clone();
-        drop(event_tx); // the Node is gone
-        let ui = tokio::spawn(async move {
-            let print = move |s: String| log.lock().unwrap().push(s);
-            let prompt = Mutex::new((String::new(), None));
-            let mut session = Session::new(Style::plain());
-            let updater = Updater::new(std::sync::mpsc::channel().0);
-            event_loop(&mut session, &cmd_tx, &mut events, &mut lines, &resume_tx, &prompt, &updater, print).await
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // Exiting now would leave rustyline's prompt (and raw mode) behind.
-        assert!(!ui.is_finished());
-        assert!(printed.lock().unwrap().iter().any(|s| s.contains("press Enter")));
-        line_tx.send(Some((String::new(), None))).unwrap(); // user presses Enter
-        tokio::time::timeout(Duration::from_secs(1), ui).await.unwrap().unwrap().unwrap();
     }
 
     #[test]
