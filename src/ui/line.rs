@@ -71,14 +71,21 @@ impl Session {
         render::event(event, now, &self.style)
     }
 
-    pub fn on_line(&mut self, line: &str) -> Reaction {
+    /// What the prompt shows: its text and the conversation plain text goes to.
+    pub fn prompt_state(&self) -> (String, Option<Conv>) {
+        (self.prompt(), self.store.current().cloned())
+    }
+
+    /// Handles a typed line. `shown` is the conversation its prompt showed:
+    /// plain text goes there even if a join switched us while the user typed.
+    pub fn on_line(&mut self, line: &str, shown: Option<&Conv>) -> Reaction {
         match parse_line(line) {
             Input::Empty => Reaction::default(),
             Input::Error(e) => Reaction::say(format!("! {e}")),
             Input::Help => Reaction::say(HELP),
             Input::Quit => Reaction { quit: true, ..Default::default() },
             Input::Who => Reaction::send(Command::ListPeers),
-            Input::Text(text) => match self.store.current() {
+            Input::Text(text) => match shown {
                 Some(Conv::Room(n)) => Reaction::send(Command::Send { to: Target::Room(n.clone()), text }),
                 Some(Conv::Dm(n)) => Reaction::send(Command::Send { to: Target::Dm(n.clone()), text }),
                 None => Reaction::say("! no conversation — /chat @nick or /create <name> <key>"),
@@ -176,19 +183,19 @@ pub async fn run(handle: NodeHandle) -> anyhow::Result<()> {
     // rustyline blocks, so it lives on its own thread. It waits for `resume`
     // before each prompt so we never exit while the terminal is in raw mode,
     // and reads the prompt then so it follows conversation switches.
-    let prompt = Arc::new(Mutex::new(String::from("> ")));
-    let (line_tx, mut lines) = mpsc::unbounded_channel::<Option<String>>();
+    let prompt = Arc::new(Mutex::new((String::from("> "), None)));
+    let (line_tx, mut lines) = mpsc::unbounded_channel::<Option<(String, Option<Conv>)>>();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
     let thread_prompt = prompt.clone();
     std::thread::spawn(move || {
         let mut errors = 0;
         loop {
-            let p = thread_prompt.lock().map(|p| p.clone()).unwrap_or_else(|_| "> ".into());
-            match editor.readline(&p) {
+            let (text, shown) = thread_prompt.lock().map(|p| p.clone()).unwrap_or_else(|_| ("> ".into(), None));
+            match editor.readline(&text) {
                 Ok(line) => {
                     errors = 0;
                     let _ = editor.add_history_entry(line.as_str());
-                    if line_tx.send(Some(line)).is_err() || resume_rx.recv().is_err() {
+                    if line_tx.send(Some((line, shown))).is_err() || resume_rx.recv().is_err() {
                         break;
                     }
                 }
@@ -216,9 +223,9 @@ async fn event_loop(
     session: &mut Session,
     commands: &mpsc::Sender<Command>,
     events: &mut mpsc::UnboundedReceiver<Event>,
-    lines: &mut mpsc::UnboundedReceiver<Option<String>>,
+    lines: &mut mpsc::UnboundedReceiver<Option<(String, Option<Conv>)>>,
     resume: &std::sync::mpsc::Sender<()>,
-    prompt: &Mutex<String>,
+    prompt: &Mutex<(String, Option<Conv>)>,
     print: impl Fn(String),
 ) -> anyhow::Result<()> {
     loop {
@@ -229,7 +236,7 @@ async fn event_loop(
                         print(text);
                     }
                     if let Ok(mut p) = prompt.lock() {
-                        *p = session.prompt();
+                        *p = session.prompt_state();
                     }
                 }
                 None => {
@@ -240,11 +247,11 @@ async fn event_loop(
                 }
             },
             line = lines.recv() => {
-                let Some(line) = line.flatten() else {
+                let Some((line, shown)) = line.flatten() else {
                     let _ = commands.send(Command::Quit).await;
                     return Ok(());
                 };
-                let reaction = session.on_line(&line);
+                let reaction = session.on_line(&line, shown.as_ref());
                 for text in reaction.print {
                     print(text);
                 }
@@ -256,7 +263,7 @@ async fn event_loop(
                     commands.send(cmd).await?;
                 }
                 if let Ok(mut p) = prompt.lock() {
-                    *p = session.prompt();
+                    *p = session.prompt_state();
                 }
                 let _ = resume.send(());
             }
@@ -276,6 +283,12 @@ mod tests {
         s
     }
 
+    /// Types `line` at whatever prompt is currently showing.
+    fn typed(s: &mut Session, line: &str) -> Reaction {
+        let shown = s.store.current().cloned();
+        s.on_line(line, shown.as_ref())
+    }
+
     fn send(to: Target, text: &str) -> Reaction {
         Reaction::send(Command::Send { to, text: text.into() })
     }
@@ -283,42 +296,56 @@ mod tests {
     #[test]
     fn plain_text_goes_to_the_current_conversation() {
         let mut s = session();
-        assert_eq!(s.on_line("hello").print, vec!["! no conversation — /chat @nick or /create <name> <key>"]);
-        assert_eq!(s.on_line("/chat @bobRoger"), Reaction::default());
+        assert_eq!(typed(&mut s, "hello").print, vec!["! no conversation — /chat @nick or /create <name> <key>"]);
+        assert_eq!(typed(&mut s, "/chat @bobRoger"), Reaction::default());
         assert_eq!(s.prompt(), "@bobRoger> ");
-        assert_eq!(s.on_line("hello"), send(Target::Dm("bobRoger".into()), "hello"));
+        assert_eq!(typed(&mut s, "hello"), send(Target::Dm("bobRoger".into()), "hello"));
     }
 
     #[test]
     fn creating_or_joining_a_room_switches_to_it() {
         let mut s = session();
         assert_eq!(
-            s.on_line("/create cat 123"),
+            typed(&mut s, "/create cat 123"),
             Reaction::send(Command::CreateRoom { base: "cat".into(), key_part: "123".into() })
         );
         s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
         assert_eq!(s.prompt(), "#catPieR> ");
-        assert_eq!(s.on_line("meow"), send(Target::Room("catPieR".into()), "meow"));
+        assert_eq!(typed(&mut s, "meow"), send(Target::Room("catPieR".into()), "meow"));
 
         assert_eq!(
-            s.on_line("/chat #dogFoxR 1-abcdef"),
+            typed(&mut s, "/chat #dogFoxR 1-abcdef"),
             Reaction::send(Command::JoinRoom { name: "dogFoxR".into(), key: "1-abcdef".into() })
         );
         assert_eq!(s.prompt(), "#catPieR> ", "not until the join succeeds");
         s.on_event(&Event::RoomJoined { name: "dogFoxR".into(), members: vec!["bobRoger".into()] }, 0);
         assert_eq!(s.prompt(), "#dogFoxR> ");
-        assert_eq!(s.on_line("/chat #catPieR"), Reaction::default(), "already in: just switch");
+        assert_eq!(typed(&mut s, "/chat #catPieR"), Reaction::default(), "already in: just switch");
         assert_eq!(s.prompt(), "#catPieR> ");
-        assert_eq!(s.on_line("/chat #nopeMoonR").print, vec!["! join with /chat #nopeMoonR <key>"]);
+        assert_eq!(typed(&mut s, "/chat #nopeMoonR").print, vec!["! join with /chat #nopeMoonR <key>"]);
+    }
+
+    #[test]
+    fn text_goes_where_the_prompt_pointed_even_if_a_join_switched_us() {
+        let mut s = session();
+        typed(&mut s, "/chat @bobRoger");
+        typed(&mut s, "/chat #catPieR 1-abcdef");
+        // The user starts typing at the "@bobRoger> " prompt...
+        let shown = s.store.current().cloned();
+        assert_eq!(shown, Some(Conv::Dm("bobRoger".into())));
+        // ...and the join completes meanwhile, switching the current conversation.
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
+        assert_eq!(s.on_line("for bob only", shown.as_ref()), send(Target::Dm("bobRoger".into()), "for bob only"));
+        assert_eq!(s.prompt(), "#catPieR> ", "the next prompt shows the room");
     }
 
     #[test]
     fn leave_uses_the_current_room_or_the_named_one() {
         let mut s = session();
-        assert_eq!(s.on_line("/leave").print, vec!["! you're not in a room here — /leave #room"]);
+        assert_eq!(typed(&mut s, "/leave").print, vec!["! you're not in a room here — /leave #room"]);
         s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "1-abcdef".into() }, 0);
-        assert_eq!(s.on_line("/leave"), Reaction::send(Command::LeaveRoom { name: "catPieR".into() }));
-        assert_eq!(s.on_line("/leave #dogFoxR"), Reaction::send(Command::LeaveRoom { name: "dogFoxR".into() }));
+        assert_eq!(typed(&mut s, "/leave"), Reaction::send(Command::LeaveRoom { name: "catPieR".into() }));
+        assert_eq!(typed(&mut s, "/leave #dogFoxR"), Reaction::send(Command::LeaveRoom { name: "dogFoxR".into() }));
         s.on_event(&Event::RoomLeft { name: "catPieR".into() }, 0);
         assert_eq!(s.prompt(), "> ");
     }
@@ -326,8 +353,8 @@ mod tests {
     #[test]
     fn chatting_with_yourself_or_someone_offline_is_refused() {
         let mut s = session();
-        assert_eq!(s.on_line("/chat @annMoon").print, vec!["! that's you"]);
-        assert_eq!(s.on_line("/chat @ghostMoon").print, vec!["! @ghostMoon is offline"]);
+        assert_eq!(typed(&mut s, "/chat @annMoon").print, vec!["! that's you"]);
+        assert_eq!(typed(&mut s, "/chat @ghostMoon").print, vec!["! @ghostMoon is offline"]);
     }
 
     #[test]
@@ -335,8 +362,8 @@ mod tests {
         let mut s = session();
         s.on_event(&Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "one".into(), ts: 0 }, 0);
         s.on_event(&Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "two".into(), ts: 0 }, 0);
-        assert_eq!(s.on_line("/chat @bobRoger").print, vec!["* @bobRoger: 2 unread — /history to see them"]);
-        let shown = s.on_line("/history 1").print;
+        assert_eq!(typed(&mut s, "/chat @bobRoger").print, vec!["* @bobRoger: 2 unread — /history to see them"]);
+        let shown = typed(&mut s, "/history 1").print;
         assert_eq!(shown.len(), 1);
         assert!(shown[0].ends_with("@bobRoger → you: two"), "{shown:?}");
     }
@@ -344,11 +371,11 @@ mod tests {
     #[test]
     fn msg_who_quit_and_errors() {
         let mut s = session();
-        assert_eq!(s.on_line("/msg @bobRoger hi"), send(Target::Dm("bobRoger".into()), "hi"));
-        assert_eq!(s.on_line("/who"), Reaction::send(Command::ListPeers));
-        assert!(s.on_line("/quit").quit);
-        assert_eq!(s.on_line("/nick x").print, vec!["! names are assigned by the system and can't be changed"]);
-        assert_eq!(s.on_line("/history").print, vec!["! no conversation — /chat @nick or /chat #room"]);
+        assert_eq!(typed(&mut s, "/msg @bobRoger hi"), send(Target::Dm("bobRoger".into()), "hi"));
+        assert_eq!(typed(&mut s, "/who"), Reaction::send(Command::ListPeers));
+        assert!(typed(&mut s, "/quit").quit);
+        assert_eq!(typed(&mut s, "/nick x").print, vec!["! names are assigned by the system and can't be changed"]);
+        assert_eq!(typed(&mut s, "/history").print, vec!["! no conversation — /chat @nick or /chat #room"]);
     }
 
     #[test]
@@ -373,7 +400,7 @@ mod tests {
         drop(event_tx); // the Node is gone
         let ui = tokio::spawn(async move {
             let print = move |s: String| log.lock().unwrap().push(s);
-            let prompt = Mutex::new(String::new());
+            let prompt = Mutex::new((String::new(), None));
             let mut session = Session::new(Style::plain());
             event_loop(&mut session, &cmd_tx, &mut events, &mut lines, &resume_tx, &prompt, print).await
         });
@@ -381,7 +408,7 @@ mod tests {
         // Exiting now would leave rustyline's prompt (and raw mode) behind.
         assert!(!ui.is_finished());
         assert!(printed.lock().unwrap().iter().any(|s| s.contains("press Enter")));
-        line_tx.send(Some(String::new())).unwrap(); // user presses Enter
+        line_tx.send(Some((String::new(), None))).unwrap(); // user presses Enter
         tokio::time::timeout(Duration::from_secs(1), ui).await.unwrap().unwrap().unwrap();
     }
 
