@@ -1,4 +1,5 @@
-//! The core actor. Owns the peer table; everything else talks to it via channels.
+//! The core actor. Owns the peer table and room state; everything else talks
+//! to it via channels. Room logic lives in `node/rooms.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -10,31 +11,42 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use crate::api::{Command, Event, LeaveReason, PeerInfo};
+use crate::api::{Command, Conv, Event, LeaveReason, PeerInfo, Target};
 use crate::discovery::{self, Sighting};
-use crate::names::{self, Resolve};
+use crate::names;
 use crate::peer::{self, ConnId, Me};
 use crate::protocol::{now_millis, Frame, PeerId, MAX_FRAME_LEN};
+use crate::room::{RoomId, RoomKeys};
 
-/// Longest chat text accepted, leaving headroom under `MAX_FRAME_LEN` for JSON escaping.
+mod rooms;
+
+pub use rooms::{HERE_INTERVAL, JOIN_SETTLE, JOIN_WAIT, MAX_ROOMS, MEMBER_TIMEOUT};
+
+/// Longest chat text accepted, leaving headroom under `MAX_FRAME_LEN` for hex and JSON.
 pub const MAX_TEXT_LEN: usize = MAX_FRAME_LEN / 8;
 /// Connected peers beyond this are refused, so a hostile host can't exhaust file descriptors.
 pub const MAX_PEERS: usize = 64;
 /// Messages a peer may send in a burst before being throttled to `RATE_PER_SEC`.
 pub const RATE_BURST: u32 = 30;
 const RATE_PER_SEC: f64 = 10.0;
+/// How long to listen to discovery before picking our name.
+pub const NAME_WAIT: Duration = Duration::from_secs(2);
+const TICK: Duration = Duration::from_secs(1);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 pub struct NodeConfig {
-    pub nick: String,
+    /// What the user typed for `--nick`; the system adds a word.
+    pub base: String,
     /// TCP listen address; port 0 lets the OS choose.
     pub listen: SocketAddr,
     /// Enable UDP multicast discovery (tests turn it off).
     pub discovery: bool,
-    /// Addresses to dial at startup regardless of discovery.
+    /// Addresses to dial once our name is assigned.
     pub manual_peers: Vec<SocketAddr>,
+    /// Listen-only discovery time before naming (`NAME_WAIT`; tests use zero).
+    pub name_wait: Duration,
 }
 
 pub struct NodeHandle {
@@ -47,7 +59,7 @@ pub struct NodeHandle {
     pub task: JoinHandle<()>,
 }
 
-/// Internal messages from listener, discovery and peer tasks to the Node.
+/// Internal messages from listener, discovery, peer, timer and worker tasks.
 pub enum NodeMsg {
     Discovered(Sighting),
     PeerConnected {
@@ -63,6 +75,13 @@ pub enum NodeMsg {
     PeerFrame { conn: ConnId, id: PeerId, frame: Frame },
     PeerGone { conn: ConnId, id: PeerId, reason: LeaveReason },
     ConnectFailed { addr: SocketAddr, expected: Option<PeerId>, error: String },
+    /// The listen-only naming window is over.
+    NameWaitOver,
+    /// A room key finished deriving on a worker thread.
+    Derived { job: rooms::Job, keys: RoomKeys },
+    JoinSettled(RoomId),
+    JoinTimeout(RoomId),
+    Tick,
 }
 
 /// Discovery dials only when our id is lower, so each pair opens one connection.
@@ -88,7 +107,7 @@ pub enum Verdict {
     /// noticed yet, so stop writing but keep reading until it drops it,
     /// instead of losing frames it already sent.
     Retire,
-    /// Refused (ourselves, or at the peer limit): close now.
+    /// Refused (ourselves, a bad or taken name, or the peer limit): close now.
     Close,
 }
 
@@ -146,16 +165,26 @@ struct Backoff {
 
 struct Node {
     id: PeerId,
+    /// What the user typed; kept to re-roll after a clash.
+    base: String,
+    /// Empty until assigned.
     nick: watch::Sender<String>,
+    /// `Some(nicks seen so far)` during the listen-only naming window.
+    naming: Option<HashSet<String>>,
     events: mpsc::UnboundedSender<Event>,
     msg_tx: mpsc::Sender<NodeMsg>,
     peers: HashMap<PeerId, PeerEntry>,
     dialing: HashSet<PeerId>,
     backoff: HashMap<PeerId, Backoff>,
+    /// Bound at start, accepted from only once we have a name.
+    listener: Option<TcpListener>,
+    manual_peers: Vec<SocketAddr>,
+    rooms: rooms::Rooms,
     background: Vec<JoinHandle<()>>,
 }
 
-/// Binds the listener, starts discovery and the actor. Returns immediately.
+/// Binds the listener, starts discovery and the actor. Returns immediately;
+/// `Event::Assigned` follows once the naming window is over.
 pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
     let id = PeerId::random();
     let listener = TcpListener::bind(config.listen).await?;
@@ -164,28 +193,18 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (msg_tx, msg_rx) = mpsc::channel(256);
-    let mut node = Node::new(id, config.nick.clone(), event_tx, msg_tx.clone());
-
-    let me = node.me();
-    let listen_tx = msg_tx.clone();
-    node.background.push(tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => peer::accept(stream, addr, me.clone(), listen_tx.clone()),
-                Err(e) => {
-                    warn!("accept failed: {e}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-    }));
+    let mut node = Node::new(id, config.base, event_tx, msg_tx.clone());
+    node.naming = Some(HashSet::new());
+    node.listener = Some(listener);
+    node.manual_peers = config.manual_peers;
 
     if config.discovery {
         let nick_rx = node.nick.subscribe();
         let events = node.events.clone();
         let port = local_addr.port();
+        let tx = msg_tx.clone();
         node.background.push(tokio::spawn(async move {
-            if let Err(e) = discovery::run(id, nick_rx, port, msg_tx).await {
+            if let Err(e) = discovery::run(id, nick_rx, port, tx).await {
                 let _ = events.send(Event::Info(format!(
                     "LAN discovery unavailable ({e}); use --peer <ip:port> to connect manually"
                 )));
@@ -193,15 +212,19 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
         }));
     }
 
-    for addr in config.manual_peers {
-        peer::dial(addr, None, node.me(), node.msg_tx.clone());
-    }
+    let tick_tx = msg_tx.clone();
+    node.background.push(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(TICK);
+        loop {
+            tick.tick().await;
+            if tick_tx.send(NodeMsg::Tick).await.is_err() {
+                return;
+            }
+        }
+    }));
 
-    node.emit(Event::Info(format!(
-        "you are {} ({id}), listening on TCP port {}",
-        config.nick,
-        local_addr.port()
-    )));
+    node.emit(Event::Info("looking for peers…".into()));
+    node.after(config.name_wait, NodeMsg::NameWaitOver);
     let task = tokio::spawn(node.run(cmd_rx, msg_rx));
     Ok(NodeHandle { id, local_addr, commands: cmd_tx, events: event_rx, task })
 }
@@ -209,24 +232,33 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
 impl Node {
     fn new(
         id: PeerId,
-        nick: String,
+        base: String,
         events: mpsc::UnboundedSender<Event>,
         msg_tx: mpsc::Sender<NodeMsg>,
     ) -> Self {
         Node {
             id,
-            nick: watch::Sender::new(nick),
+            base,
+            nick: watch::Sender::new(String::new()),
+            naming: None,
             events,
             msg_tx,
             peers: HashMap::new(),
             dialing: HashSet::new(),
             backoff: HashMap::new(),
+            listener: None,
+            manual_peers: Vec::new(),
+            rooms: rooms::Rooms::default(),
             background: Vec::new(),
         }
     }
 
     fn me(&self) -> Me {
         Me { id: self.id, nick: self.nick.subscribe() }
+    }
+
+    fn my_nick(&self) -> String {
+        self.nick.borrow().clone()
     }
 
     async fn run(mut self, mut cmd_rx: mpsc::Receiver<Command>, mut msg_rx: mpsc::Receiver<NodeMsg>) {
@@ -246,19 +278,21 @@ impl Node {
         let _ = self.events.send(event);
     }
 
-    fn roster(&self) -> Vec<(PeerId, &str)> {
-        self.peers.iter().map(|(id, p)| (*id, p.nick.as_str())).collect()
+    /// Sends `msg` back to ourselves after `delay`.
+    fn after(&self, delay: Duration, msg: NodeMsg) {
+        let tx = self.msg_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send(msg).await;
+        });
     }
 
-    /// Display name for a peer; our own nick counts as a clash too.
-    fn display(&self, id: PeerId) -> String {
-        let me = self.nick.borrow();
-        let mut everyone = self.roster();
-        everyone.push((self.id, me.as_str()));
-        match self.peers.get(&id) {
-            Some(p) => names::display_name(id, &p.nick, &everyone),
-            None => id.short(),
-        }
+    fn nick_of(&self, id: PeerId) -> Option<String> {
+        self.peers.get(&id).map(|p| p.nick.clone())
+    }
+
+    fn peer_by_nick(&self, nick: &str) -> Option<PeerId> {
+        self.peers.iter().find(|(_, p)| p.nick == nick).map(|(id, _)| *id)
     }
 
     /// Queues `frame` without waiting; a peer whose outbox is full misses it.
@@ -285,53 +319,44 @@ impl Node {
     }
 
     fn handle_command(&mut self, cmd: Command) {
+        if self.naming.is_some() && !matches!(cmd, Command::ListPeers | Command::Quit) {
+            self.emit(Event::Error("still picking your name, try again in a moment".into()));
+            return;
+        }
         match cmd {
-            Command::Say(text) => {
+            Command::Send { to, text } => {
                 if text.trim().is_empty() || !self.check_text(&text) {
                     return;
                 }
-                if self.peers.is_empty() {
-                    self.emit(Event::Info("nobody else is here yet".into()));
-                    return;
-                }
-                self.broadcast(Frame::Chat { text, ts: now_millis() });
-            }
-            Command::Direct { to, text } => {
-                if text.trim().is_empty() || !self.check_text(&text) {
-                    return;
-                }
-                match names::resolve(&to, &self.roster()) {
-                    Resolve::Found(id) => {
-                        self.send_to(id, Frame::Direct { text: text.clone(), ts: now_millis() });
-                        self.emit(Event::DirectSent { to: self.display(id), text });
-                    }
-                    Resolve::NotFound => self.emit(Event::Error(format!("no peer named '{to}'"))),
-                    Resolve::Ambiguous(candidates) => self.emit(Event::Error(format!(
-                        "'{to}' is ambiguous: {}",
-                        candidates.join(", ")
-                    ))),
+                match to {
+                    Target::Dm(nick) => self.send_dm(nick, text),
+                    Target::Room(name) => self.send_room(&name, text),
                 }
             }
-            Command::SetNick(nick) => {
-                if let Err(e) = names::validate_nick(&nick) {
-                    self.emit(Event::Error(e));
-                    return;
-                }
-                self.nick.send_replace(nick.clone());
-                self.broadcast(Frame::Nick { nick: nick.clone() });
-                self.emit(Event::Info(format!("you are now {nick}")));
-            }
+            Command::CreateRoom { base, key_part } => self.create_room(&base, &key_part),
+            Command::JoinRoom { name, key } => self.join_room(&name, &key),
+            Command::LeaveRoom { name } => self.leave_room(&name),
             Command::ListPeers => {
                 let mut peers: Vec<PeerInfo> = self
                     .peers
                     .iter()
-                    .map(|(id, p)| PeerInfo { id: *id, nick: self.display(*id), addr: p.addr })
+                    .map(|(id, p)| PeerInfo { id: *id, nick: p.nick.clone(), addr: p.addr })
                     .collect();
                 peers.sort_by(|a, b| a.nick.cmp(&b.nick));
                 self.emit(Event::Peers(peers));
             }
             Command::Quit => {} // handled in `run`
         }
+    }
+
+    fn send_dm(&mut self, nick: String, text: String) {
+        let Some(id) = self.peer_by_nick(&nick) else {
+            self.emit(Event::Error(format!("@{nick} is offline")));
+            return;
+        };
+        let ts = now_millis();
+        self.send_to(id, Frame::Direct { text: text.clone(), ts });
+        self.emit(Event::Sent { conv: Conv::Dm(nick), text, ts });
     }
 
     fn handle_msg(&mut self, msg: NodeMsg) {
@@ -342,15 +367,17 @@ impl Node {
                     self.dialing.remove(&expected);
                     self.backoff.remove(&expected);
                 }
-                let verdict = self.on_connected(PeerEntry { conn, nick, addr, key, out, limit: RateLimit::new(Instant::now()) }, id);
+                let entry = PeerEntry { conn, nick, addr, key, out, limit: RateLimit::new(Instant::now()) };
+                let verdict = self.on_connected(entry, id);
                 let _ = accept.send(verdict);
             }
             NodeMsg::PeerFrame { conn, id, frame } => self.on_frame(conn, id, frame),
             NodeMsg::PeerGone { conn, id, reason } => {
                 if self.peers.get(&id).is_some_and(|p| p.conn == conn) {
-                    let nick = self.display(id);
-                    self.peers.remove(&id);
-                    self.emit(Event::PeerLeft { id, nick, reason });
+                    self.forget_member_everywhere(id);
+                    if let Some(p) = self.peers.remove(&id) {
+                        self.emit(Event::PeerLeft { id, nick: p.nick, reason });
+                    }
                 }
             }
             NodeMsg::ConnectFailed { addr, expected, error } => match expected {
@@ -364,10 +391,54 @@ impl Node {
                 }
                 None => self.emit(Event::Error(format!("could not connect to {addr}: {error}"))),
             },
+            NodeMsg::NameWaitOver => self.assign_name(),
+            NodeMsg::Derived { job, keys } => self.on_derived(job, keys),
+            NodeMsg::JoinSettled(id) => self.on_join_settled(id),
+            NodeMsg::JoinTimeout(id) => self.on_join_timeout(id),
+            NodeMsg::Tick => self.on_tick(Instant::now()),
+        }
+    }
+
+    /// Ends the naming window: pick a name nobody announced, then go live.
+    fn assign_name(&mut self) {
+        let Some(seen) = self.naming.take() else {
+            return;
+        };
+        let Some(nick) = names::pick_nick(&self.base, |n| seen.contains(n)) else {
+            self.emit(Event::Error(format!("every name for '{}' is taken; restart with another --nick", self.base)));
+            return;
+        };
+        self.nick.send_replace(nick.clone());
+        self.emit(Event::Assigned { nick, renamed: false });
+
+        if let Some(listener) = self.listener.take() {
+            if let Ok(addr) = listener.local_addr() {
+                self.emit(Event::Info(format!("listening on TCP port {}", addr.port())));
+            }
+            let me = self.me();
+            let tx = self.msg_tx.clone();
+            self.background.push(tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, addr)) => peer::accept(stream, addr, me.clone(), tx.clone()),
+                        Err(e) => {
+                            warn!("accept failed: {e}");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }));
+        }
+        for addr in std::mem::take(&mut self.manual_peers) {
+            peer::dial(addr, None, self.me(), self.msg_tx.clone());
         }
     }
 
     fn on_discovered(&mut self, s: Sighting) {
+        if let Some(seen) = self.naming.as_mut() {
+            seen.insert(s.nick);
+            return;
+        }
         let id = s.id;
         if id == self.id
             || self.peers.contains_key(&id)
@@ -386,26 +457,45 @@ impl Node {
         if id == self.id {
             return Verdict::Close;
         }
-        match self.peers.get(&id) {
-            None if self.peers.len() >= MAX_PEERS => {
-                warn!(%id, "refusing peer: already at {MAX_PEERS} peers");
-                Verdict::Close
-            }
-            None => {
+        if let Some(existing) = self.peers.get(&id) {
+            return if keep_new_connection(self.id, id, existing.key, entry.key) {
+                // Dropping the old sender retires the old connection.
                 self.peers.insert(id, entry);
-                self.emit(Event::PeerJoined { id, nick: self.display(id) });
                 Verdict::Keep
-            }
-            Some(existing) => {
-                if keep_new_connection(self.id, id, existing.key, entry.key) {
-                    // Dropping the old sender retires the old connection.
-                    self.peers.insert(id, entry);
-                    Verdict::Keep
-                } else {
-                    Verdict::Retire
-                }
-            }
+            } else {
+                Verdict::Retire
+            };
         }
+        if self.peers.len() >= MAX_PEERS {
+            warn!(%id, "refusing peer: already at {MAX_PEERS} peers");
+            return Verdict::Close;
+        }
+        if self.peer_by_nick(&entry.nick).is_some() {
+            debug!(%id, "refusing peer: @{} is already connected", entry.nick);
+            return Verdict::Close;
+        }
+        let nick = entry.nick.clone();
+        let clash = nick == self.my_nick();
+        self.peers.insert(id, entry);
+        self.emit(Event::PeerJoined { id, nick });
+        if clash && self.id > id {
+            self.reroll_name();
+        }
+        Verdict::Keep
+    }
+
+    /// We and a peer drew the same name at the same moment and we have the
+    /// higher id, so we take a fresh one and tell everyone.
+    fn reroll_name(&mut self) {
+        let mine = self.my_nick();
+        let taken: HashSet<String> = self.peers.values().map(|p| p.nick.clone()).collect();
+        let Some(nick) = names::pick_nick(&self.base, |n| n == mine || taken.contains(n)) else {
+            self.emit(Event::Error(format!("every name for '{}' is taken", self.base)));
+            return;
+        };
+        self.nick.send_replace(nick.clone());
+        self.broadcast(Frame::Nick { nick: nick.clone() });
+        self.emit(Event::Assigned { nick, renamed: true });
     }
 
     /// Frames count from any connection to a known peer, including one being
@@ -416,35 +506,32 @@ impl Node {
         };
         if !peer.limit.allow(Instant::now()) {
             if !std::mem::replace(&mut peer.limit.warned, true) {
-                let nick = self.display(id);
-                self.emit(Event::Info(format!("{nick} is sending too fast; dropping messages")));
+                let nick = peer.nick.clone();
+                self.emit(Event::Info(format!("@{nick} is sending too fast; dropping messages")));
             }
             return;
         }
         peer.limit.warned = false;
+        let nick = peer.nick.clone();
         match frame {
-            Frame::Chat { text, ts } | Frame::Direct { text, ts } if text.len() > MAX_TEXT_LEN => {
-                debug!(%id, ts, "dropping oversized message ({} bytes)", text.len());
+            Frame::Direct { text, .. } if text.len() > MAX_TEXT_LEN => {
+                debug!(%id, "dropping oversized DM ({} bytes)", text.len());
             }
-            Frame::Chat { text, ts } => {
-                self.emit(Event::Message { from_id: id, from_nick: self.display(id), text, direct: false, ts })
+            Frame::Direct { text, .. } => {
+                self.emit(Event::Message { conv: Conv::Dm(nick.clone()), from: nick, text, ts: now_millis() })
             }
-            Frame::Direct { text, ts } => {
-                self.emit(Event::Message { from_id: id, from_nick: self.display(id), text, direct: true, ts })
-            }
-            Frame::Nick { nick } => {
-                if names::validate_nick(&nick).is_err() {
-                    debug!(%id, "ignoring invalid nick {nick:?}");
+            Frame::Room { room_id, nonce, ct } => self.on_room_frame(id, &room_id, &nonce, &ct, Instant::now()),
+            Frame::Nick { nick: new } => {
+                let taken = new == self.my_nick() || self.peer_by_nick(&new).is_some_and(|other| other != id);
+                if !names::is_valid_nick(&new) || taken {
+                    debug!(%id, "ignoring rename to {new:?}");
                     return;
                 }
-                let old = self.display(id);
                 if let Some(p) = self.peers.get_mut(&id) {
-                    p.nick = nick;
+                    p.nick = new.clone();
                 }
-                let new = self.display(id);
-                self.emit(Event::NickChanged { id, old, new });
+                self.emit(Event::Renamed { old: nick, new });
             }
-            Frame::Room { .. } => {} // handled from Task 4
             Frame::Hello { .. } | Frame::Ping | Frame::Bye => {} // consumed by the peer task
         }
     }
@@ -453,6 +540,7 @@ impl Node {
         for task in &self.background {
             task.abort();
         }
+        self.leave_all_rooms();
         // Queue Bye everywhere first, then wait (within the grace period) only
         // for peers whose outbox was full, so one slow peer can't starve the rest.
         let deadline = Instant::now() + SHUTDOWN_GRACE;
@@ -471,39 +559,43 @@ impl Node {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    const ME: PeerId = PeerId(0x1000_0000_0000_0000);
-    const BOB: PeerId = PeerId(0x2000_0000_0000_0000);
-    const CAROL: PeerId = PeerId(0x3000_0000_0000_0000);
+    pub(in crate::node) const ME: PeerId = PeerId(0x1000_0000_0000_0000);
+    pub(in crate::node) const BOB: PeerId = PeerId(0x2000_0000_0000_0000);
+    pub(in crate::node) const CAROL: PeerId = PeerId(0x3000_0000_0000_0000);
 
-    struct Harness {
-        node: Node,
-        events: mpsc::UnboundedReceiver<Event>,
-        outboxes: HashMap<PeerId, mpsc::Receiver<Frame>>,
+    pub(in crate::node) struct Harness {
+        pub(in crate::node) node: Node,
+        pub(in crate::node) events: mpsc::UnboundedReceiver<Event>,
+        pub(in crate::node) msgs: mpsc::Receiver<NodeMsg>,
+        pub(in crate::node) outboxes: HashMap<PeerId, mpsc::Receiver<Frame>>,
         next_conn: ConnId,
     }
 
     impl Harness {
-        fn new() -> Self {
+        /// A node already named `annMoon`, with no sockets.
+        pub(in crate::node) fn new() -> Self {
             let (event_tx, events) = mpsc::unbounded_channel();
-            let (msg_tx, _msg_rx) = mpsc::channel(8);
-            Harness { node: Node::new(ME, "me".into(), event_tx, msg_tx), events, outboxes: HashMap::new(), next_conn: 1 }
+            let (msg_tx, msgs) = mpsc::channel(64);
+            let node = Node::new(ME, "ann".into(), event_tx, msg_tx);
+            node.nick.send_replace("annMoon".into());
+            Harness { node, events, msgs, outboxes: HashMap::new(), next_conn: 1 }
         }
 
-        /// Simulates a peer task completing its handshake; returns the Node's verdict.
-        fn connect(&mut self, id: PeerId, nick: &str, outbound: bool) -> bool {
+        /// Simulates a peer task completing its handshake; returns whether it was kept.
+        pub(in crate::node) fn connect(&mut self, id: PeerId, nick: &str, outbound: bool) -> bool {
             let port = 40000 + self.next_conn as u16;
             self.connect_key(id, nick, ConnKey { outbound, dialer_port: port })
         }
 
-        fn connect_key(&mut self, id: PeerId, nick: &str, key: ConnKey) -> bool {
+        pub(in crate::node) fn connect_key(&mut self, id: PeerId, nick: &str, key: ConnKey) -> bool {
             self.connect_verdict(id, nick, key) == Verdict::Keep
         }
 
-        fn connect_verdict(&mut self, id: PeerId, nick: &str, key: ConnKey) -> Verdict {
-            let (out, rx) = mpsc::channel(8);
+        pub(in crate::node) fn connect_verdict(&mut self, id: PeerId, nick: &str, key: ConnKey) -> Verdict {
+            let (out, rx) = mpsc::channel(64);
             let conn = self.next_conn;
             self.next_conn += 1;
             let entry = PeerEntry {
@@ -521,20 +613,20 @@ mod tests {
             verdict
         }
 
-        fn sent(&mut self, id: PeerId) -> Vec<Frame> {
+        pub(in crate::node) fn sent(&mut self, id: PeerId) -> Vec<Frame> {
             let rx = self.outboxes.get_mut(&id).unwrap();
             std::iter::from_fn(|| rx.try_recv().ok()).collect()
         }
 
-        fn events(&mut self) -> Vec<Event> {
+        pub(in crate::node) fn events(&mut self) -> Vec<Event> {
             std::iter::from_fn(|| self.events.try_recv().ok()).collect()
         }
-    }
 
-    #[test]
-    fn dial_rule_picks_exactly_one_side() {
-        assert!(should_dial(ME, BOB));
-        assert!(!should_dial(BOB, ME));
+        /// Handles the next internal message (worker result or timer).
+        pub(in crate::node) async fn pump(&mut self) {
+            let msg = self.msgs.recv().await.expect("node sender alive");
+            self.node.handle_msg(msg);
+        }
     }
 
     fn out(dialer_port: u16) -> ConnKey {
@@ -543,6 +635,16 @@ mod tests {
 
     fn inb(dialer_port: u16) -> ConnKey {
         ConnKey { outbound: false, dialer_port }
+    }
+
+    fn dm(to: &str, text: &str) -> Command {
+        Command::Send { to: Target::Dm(to.into()), text: text.into() }
+    }
+
+    #[test]
+    fn dial_rule_picks_exactly_one_side() {
+        assert!(should_dial(ME, BOB));
+        assert!(!should_dial(BOB, ME));
     }
 
     #[test]
@@ -565,10 +667,10 @@ mod tests {
     #[test]
     fn duplicate_connection_does_not_rejoin() {
         let mut h = Harness::new();
-        assert!(h.connect_key(BOB, "bob", inb(7000)));
-        assert!(h.connect_key(BOB, "bob", out(9000))); // preferred direction replaces
-        assert!(h.connect_key(BOB, "bob", out(8000))); // same direction, lower port replaces
-        assert!(!h.connect_key(BOB, "bob", out(8500))); // same direction, higher port rejected
+        assert!(h.connect_key(BOB, "bobRoger", inb(7000)));
+        assert!(h.connect_key(BOB, "bobRoger", out(9000))); // preferred direction replaces
+        assert!(h.connect_key(BOB, "bobRoger", out(8000))); // same direction, lower port replaces
+        assert!(!h.connect_key(BOB, "bobRoger", out(8500))); // same direction, higher port rejected
         let joins = h.events().into_iter().filter(|e| matches!(e, Event::PeerJoined { .. })).count();
         assert_eq!(joins, 1);
     }
@@ -577,31 +679,94 @@ mod tests {
     fn peer_count_is_capped() {
         let mut h = Harness::new();
         for i in 0..MAX_PEERS as u64 {
-            assert!(h.connect(PeerId(0x4000_0000_0000_0000 + i), "p", true));
+            assert!(h.connect(PeerId(0x4000_0000_0000_0000 + i), &format!("p{i}Fox"), true));
         }
-        assert_eq!(h.connect_verdict(PeerId(0x5000_0000_0000_0000), "late", out(1)), Verdict::Close);
+        assert_eq!(h.connect_verdict(PeerId(0x5000_0000_0000_0000), "lateFox", out(1)), Verdict::Close);
         assert_eq!(h.node.peers.len(), MAX_PEERS);
     }
 
     #[test]
-    fn say_fans_out_to_every_peer() {
+    fn a_second_peer_with_a_taken_name_is_refused() {
         let mut h = Harness::new();
-        h.connect(BOB, "bob", true);
-        h.connect(CAROL, "carol", true);
-        h.node.handle_command(Command::Say("hi all".into()));
-        for id in [BOB, CAROL] {
-            assert!(matches!(h.sent(id).as_slice(), [Frame::Chat { text, .. }] if text == "hi all"));
+        assert!(h.connect(BOB, "bobRoger", true));
+        assert_eq!(h.connect_verdict(CAROL, "bobRoger", out(1)), Verdict::Close);
+    }
+
+    #[test]
+    fn same_moment_clash_rerolls_only_the_higher_id() {
+        // BOB (higher id than ME) shows up with our name: we keep ours.
+        let mut h = Harness::new();
+        assert!(h.connect(BOB, "annMoon", true));
+        assert_eq!(h.node.my_nick(), "annMoon");
+        assert!(!h.events().iter().any(|e| matches!(e, Event::Assigned { .. })));
+
+        // A lower id than ours shows up with our name: we re-roll and tell everyone.
+        let mut h = Harness::new();
+        let low = PeerId(1);
+        assert!(h.connect(low, "annMoon", true));
+        let mine = h.node.my_nick();
+        assert_ne!(mine, "annMoon");
+        assert!(mine.starts_with("ann") && names::is_valid_nick(&mine));
+        assert_eq!(h.sent(low), vec![Frame::Nick { nick: mine.clone() }]);
+        assert!(h.events().contains(&Event::Assigned { nick: mine, renamed: true }));
+    }
+
+    #[test]
+    fn peer_rename_is_accepted_only_when_valid_and_free() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bobRoger", true);
+        h.connect(CAROL, "carolFox", true);
+        h.events();
+        let conn = h.node.peers[&BOB].conn;
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "carolFox".into() }); // taken
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "annMoon".into() }); // ours
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "\u{1b}[2J".into() }); // invalid
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "bobPie".into() });
+        assert_eq!(h.events(), vec![Event::Renamed { old: "bobRoger".into(), new: "bobPie".into() }]);
+        assert_eq!(h.node.peer_by_nick("bobPie"), Some(BOB));
+    }
+
+    #[test]
+    fn commands_wait_for_a_name() {
+        let mut h = Harness::new();
+        h.node.naming = Some(HashSet::new());
+        h.node.handle_command(dm("bobRoger", "hi"));
+        assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("still picking")));
+    }
+
+    #[tokio::test]
+    async fn naming_avoids_names_announced_during_the_window() {
+        let mut h = Harness::new();
+        h.node.nick.send_replace(String::new());
+        h.node.naming = Some(HashSet::new());
+        let taken: Vec<String> = crate::words::WORDS.iter().skip(1).map(|w| format!("ann{w}")).collect();
+        for (i, nick) in taken.iter().enumerate() {
+            let s = Sighting { id: PeerId(100 + i as u64), nick: nick.clone(), tcp_addr: "127.0.0.1:1".parse().unwrap() };
+            h.node.on_discovered(s);
         }
+        assert!(h.node.dialing.is_empty(), "no dialing before we have a name");
+        h.node.assign_name();
+        let only_free = format!("ann{}", crate::words::WORDS[0]);
+        assert_eq!(h.node.my_nick(), only_free);
+        assert_eq!(h.events(), vec![Event::Assigned { nick: only_free, renamed: false }]);
     }
 
     #[tokio::test]
     async fn bye_waits_for_room_in_a_full_outbox() {
         let mut h = Harness::new();
-        h.connect(BOB, "bob", true);
+        let (out, mut rx) = mpsc::channel(8);
+        let entry = PeerEntry {
+            conn: 1,
+            nick: "bobRoger".into(),
+            addr: "127.0.0.1:1".parse().unwrap(),
+            key: out_key(),
+            out,
+            limit: RateLimit::new(Instant::now()),
+        };
+        assert_eq!(h.node.on_connected(entry, BOB), Verdict::Keep);
         for i in 0..8 {
-            h.node.handle_command(Command::Say(format!("msg {i}"))); // fills the 8-slot outbox
+            h.node.handle_command(dm("bobRoger", &format!("msg {i}"))); // fills the 8-slot outbox
         }
-        let mut rx = h.outboxes.remove(&BOB).unwrap();
         let drain = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let mut got = Vec::new();
@@ -620,6 +785,10 @@ mod tests {
         assert_eq!(got.last(), Some(&Frame::Bye));
     }
 
+    fn out_key() -> ConnKey {
+        out(1)
+    }
+
     #[test]
     fn rate_limit_allows_a_burst_then_refills() {
         let t0 = Instant::now();
@@ -633,11 +802,11 @@ mod tests {
     #[test]
     fn flooding_peer_is_throttled_with_one_warning() {
         let mut h = Harness::new();
-        h.connect(BOB, "bob", true);
+        h.connect(BOB, "bobRoger", true);
         h.events();
         let conn = h.node.peers[&BOB].conn;
         for i in 0..100 {
-            h.node.on_frame(conn, BOB, Frame::Chat { text: format!("spam {i}"), ts: 0 });
+            h.node.on_frame(conn, BOB, Frame::Direct { text: format!("spam {i}"), ts: 0 });
         }
         let events = h.events();
         let messages = events.iter().filter(|e| matches!(e, Event::Message { .. })).count();
@@ -647,107 +816,70 @@ mod tests {
     }
 
     #[test]
-    fn peer_sharing_my_nick_gets_a_suffix() {
-        let mut h = Harness::new(); // our nick is "me"
-        h.connect(BOB, "me", true);
-        assert_eq!(h.events(), vec![Event::PeerJoined { id: BOB, nick: "me#2000".into() }]);
-        // It's still addressable by the plain nick, since we can't DM ourselves.
-        h.node.handle_command(Command::Direct { to: "me".into(), text: "hi".into() });
-        assert_eq!(h.events(), vec![Event::DirectSent { to: "me#2000".into(), text: "hi".into() }]);
-    }
-
-    #[test]
-    fn say_with_no_peers_tells_the_user() {
+    fn dm_goes_only_to_its_target_and_is_recorded() {
         let mut h = Harness::new();
-        h.node.handle_command(Command::Say("anyone?".into()));
-        assert_eq!(h.events(), vec![Event::Info("nobody else is here yet".into())]);
-    }
-
-    #[test]
-    fn direct_goes_only_to_target_and_is_echoed() {
-        let mut h = Harness::new();
-        h.connect(BOB, "bob", true);
-        h.connect(CAROL, "carol", true);
+        h.connect(BOB, "bobRoger", true);
+        h.connect(CAROL, "carolFox", true);
         h.events();
-        h.node.handle_command(Command::Direct { to: "bob".into(), text: "psst".into() });
+        h.node.handle_command(dm("bobRoger", "psst"));
         assert!(matches!(h.sent(BOB).as_slice(), [Frame::Direct { text, .. }] if text == "psst"));
         assert!(h.sent(CAROL).is_empty());
-        assert_eq!(h.events(), vec![Event::DirectSent { to: "bob".into(), text: "psst".into() }]);
+        assert!(matches!(
+            h.events().as_slice(),
+            [Event::Sent { conv: Conv::Dm(n), text, .. }] if n == "bobRoger" && text == "psst"
+        ));
     }
 
     #[test]
-    fn direct_to_unknown_or_ambiguous_nick_is_an_error() {
+    fn dm_to_someone_not_connected_is_an_error() {
         let mut h = Harness::new();
-        h.connect(BOB, "bob", true);
-        h.connect(CAROL, "bob", true);
+        h.connect(BOB, "bobRoger", true);
         h.events();
-        h.node.handle_command(Command::Direct { to: "dave".into(), text: "x".into() });
-        h.node.handle_command(Command::Direct { to: "bob".into(), text: "x".into() });
-        assert_eq!(
-            h.events(),
-            vec![
-                Event::Error("no peer named 'dave'".into()),
-                Event::Error("'bob' is ambiguous: bob#2000, bob#3000".into()),
-            ]
-        );
-        assert!(h.sent(BOB).is_empty() && h.sent(CAROL).is_empty());
+        h.node.handle_command(dm("bobroger", "case matters"));
+        assert_eq!(h.events(), vec![Event::Error("@bobroger is offline".into())]);
+    }
+
+    #[test]
+    fn incoming_dm_becomes_a_dm_message() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bobRoger", true);
+        h.events();
+        let conn = h.node.peers[&BOB].conn;
+        h.node.on_frame(conn, BOB, Frame::Direct { text: "hi".into(), ts: 0 });
+        assert!(matches!(
+            h.events().as_slice(),
+            [Event::Message { conv: Conv::Dm(c), from, text, .. }] if c == "bobRoger" && from == "bobRoger" && text == "hi"
+        ));
     }
 
     #[test]
     fn oversized_text_is_rejected_before_sending() {
         let mut h = Harness::new();
-        h.connect(BOB, "bob", true);
+        h.connect(BOB, "bobRoger", true);
         h.events();
-        h.node.handle_command(Command::Say("x".repeat(MAX_TEXT_LEN + 1)));
+        h.node.handle_command(dm("bobRoger", &"x".repeat(MAX_TEXT_LEN + 1)));
         assert!(h.sent(BOB).is_empty());
         assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("too long")));
     }
 
     #[test]
-    fn invalid_nick_change_is_rejected() {
-        let mut h = Harness::new();
-        h.connect(BOB, "bob", true);
-        h.events();
-        h.node.handle_command(Command::SetNick("two words".into()));
-        assert!(h.sent(BOB).is_empty());
-        assert!(matches!(h.events().as_slice(), [Event::Error(_)]));
-    }
-
-    #[test]
     fn frames_from_a_replaced_connection_still_arrive_but_its_close_is_silent() {
         let mut h = Harness::new();
-        h.connect(BOB, "bob", false); // conn 1
-        h.connect(BOB, "bob", true); // conn 2 replaces it
+        h.connect(BOB, "bobRoger", false); // conn 1
+        h.connect(BOB, "bobRoger", true); // conn 2 replaces it
         h.events();
         // bob may have sent this before he switched over too.
-        h.node.on_frame(1, BOB, Frame::Chat { text: "in flight".into(), ts: 0 });
+        h.node.on_frame(1, BOB, Frame::Direct { text: "in flight".into(), ts: 0 });
         h.node.handle_msg(NodeMsg::PeerGone { conn: 1, id: BOB, reason: LeaveReason::Lost });
-        assert_eq!(
-            h.events(),
-            vec![Event::Message { from_id: BOB, from_nick: "bob".into(), text: "in flight".into(), direct: false, ts: 0 }]
-        );
+        assert!(matches!(h.events().as_slice(), [Event::Message { text, .. }] if text == "in flight"));
         assert!(h.node.peers.contains_key(&BOB));
     }
 
     #[test]
     fn losing_duplicates_are_retired_and_other_refusals_closed() {
         let mut h = Harness::new();
-        assert_eq!(h.connect_verdict(BOB, "bob", out(5000)), Verdict::Keep);
-        assert_eq!(h.connect_verdict(BOB, "bob", out(6000)), Verdict::Retire);
-        assert_eq!(h.connect_verdict(ME, "me", out(7000)), Verdict::Close);
-    }
-
-    #[test]
-    fn remote_nick_change_uses_display_names() {
-        let mut h = Harness::new();
-        h.connect(BOB, "bob", true);
-        h.events();
-        let conn = h.node.peers[&BOB].conn;
-        h.node.on_frame(conn, BOB, Frame::Nick { nick: "robert".into() });
-        h.node.on_frame(conn, BOB, Frame::Nick { nick: "\u{1b}[2J".into() });
-        assert_eq!(
-            h.events(),
-            vec![Event::NickChanged { id: BOB, old: "bob".into(), new: "robert".into() }]
-        );
+        assert_eq!(h.connect_verdict(BOB, "bobRoger", out(5000)), Verdict::Keep);
+        assert_eq!(h.connect_verdict(BOB, "bobRoger", out(6000)), Verdict::Retire);
+        assert_eq!(h.connect_verdict(ME, "annMoon", out(7000)), Verdict::Close);
     }
 }

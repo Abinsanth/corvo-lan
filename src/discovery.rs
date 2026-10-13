@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
 use crate::node::NodeMsg;
+use crate::names;
 use crate::protocol::{Announce, PeerId, PROTOCOL_VERSION};
 
 pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
@@ -27,7 +28,7 @@ pub struct Sighting {
 /// Validates a datagram. The TCP address uses the UDP source IP, never the payload.
 pub fn parse_announce(bytes: &[u8], src: SocketAddr, me: PeerId) -> Option<Sighting> {
     let a = Announce::from_bytes(bytes).ok()?;
-    if a.v != PROTOCOL_VERSION || a.id == me || a.tcp_port == 0 {
+    if a.v != PROTOCOL_VERSION || a.id == me || a.tcp_port == 0 || !names::is_valid_nick(&a.nick) {
         return None;
     }
     Some(Sighting { id: a.id, nick: a.nick, tcp_addr: SocketAddr::new(src.ip(), a.tcp_port) })
@@ -47,6 +48,7 @@ fn bind_socket() -> io::Result<std::net::UdpSocket> {
 }
 
 /// Runs until the socket fails to set up (returns the error) or `node_tx` closes.
+/// Listens from the start but only announces once `nick` is non-empty (assigned).
 pub async fn run(
     me: PeerId,
     nick: watch::Receiver<String>,
@@ -60,7 +62,11 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let announce = Announce { v: PROTOCOL_VERSION, id: me, nick: nick.borrow().clone(), tcp_port };
+                let nick = nick.borrow().clone();
+                if nick.is_empty() {
+                    continue;
+                }
+                let announce = Announce { v: PROTOCOL_VERSION, id: me, nick, tcp_port };
                 if let Err(e) = socket.send_to(&announce.to_bytes(), group).await {
                     warn!("discovery announce failed: {e}");
                 }
@@ -92,30 +98,36 @@ mod tests {
     }
 
     fn bytes(v: u8, id: PeerId, tcp_port: u16) -> Vec<u8> {
-        Announce { v, id, nick: "bob".into(), tcp_port }.to_bytes()
+        Announce { v, id, nick: "bobRoger".into(), tcp_port }.to_bytes()
     }
 
     #[test]
     fn valid_announce_uses_source_ip_and_payload_port() {
-        let s = parse_announce(&bytes(1, OTHER, 5000), src(), ME).unwrap();
+        let s = parse_announce(&bytes(PROTOCOL_VERSION, OTHER, 5000), src(), ME).unwrap();
         assert_eq!(s.id, OTHER);
-        assert_eq!(s.nick, "bob");
+        assert_eq!(s.nick, "bobRoger");
         assert_eq!(s.tcp_addr, "192.168.1.20:5000".parse().unwrap());
     }
 
     #[test]
     fn own_announce_is_ignored() {
-        assert_eq!(parse_announce(&bytes(1, ME, 5000), src(), ME), None);
+        assert_eq!(parse_announce(&bytes(PROTOCOL_VERSION, ME, 5000), src(), ME), None);
     }
 
     #[test]
     fn wrong_version_is_ignored() {
-        assert_eq!(parse_announce(&bytes(2, OTHER, 5000), src(), ME), None);
+        assert_eq!(parse_announce(&bytes(1, OTHER, 5000), src(), ME), None);
     }
 
     #[test]
     fn zero_port_is_ignored() {
-        assert_eq!(parse_announce(&bytes(1, OTHER, 0), src(), ME), None);
+        assert_eq!(parse_announce(&bytes(PROTOCOL_VERSION, OTHER, 0), src(), ME), None);
+    }
+
+    #[test]
+    fn invalid_nick_is_ignored() {
+        let a = Announce { v: PROTOCOL_VERSION, id: OTHER, nick: "bob".into(), tcp_port: 5000 };
+        assert_eq!(parse_announce(&a.to_bytes(), src(), ME), None);
     }
 
     #[test]
