@@ -55,7 +55,7 @@ impl Editor {
 
     /// Pasted text: CRLF and lone CR become newlines.
     pub fn insert_str(&mut self, s: &str) {
-        let s = s.replace("\r\n", "\n").replace('\r', "\n");
+        let s = s.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
         self.text.insert_str(self.cursor, &s);
         self.cursor += s.len();
     }
@@ -493,6 +493,14 @@ mod tests {
         assert!(!e.down(), "already on the last row");
         e.home();
         assert_eq!(e.cursor_pos(), (2, 0));
+    }
+
+    #[test]
+    fn pasted_tabs_become_spaces() {
+        let mut e = ed("");
+        e.insert_str("a\tb\r\n\tc");
+        assert_eq!(e.text(), "a    b\n    c");
+        assert_eq!(e.cursor_pos(), (1, 5));
     }
 
     #[test]

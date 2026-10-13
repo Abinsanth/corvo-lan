@@ -236,7 +236,11 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
         && !state.on_status
         && session.store.current() == Some(conv)
     {
-        state.scroll.note_new();
+        if matches!(event, Event::Sent { .. }) {
+            state.scroll.to_bottom();
+        } else {
+            state.scroll.note_new();
+        }
     }
     follow_current(state, before, session);
 }
@@ -436,6 +440,22 @@ mod tests {
         assert_eq!(state.scroll.unseen(), 1);
         on_event(&mut s, &mut state, &Event::RoomLeft { name: "catPieR".into() }, now);
         assert!(state.on_status, "leaving the room you're viewing falls back to corvo");
+    }
+
+    #[test]
+    fn sending_jumps_to_the_latest_but_others_messages_are_counted() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_event(&mut s, &mut state, &Event::RoomJoined { name: "catPieR".into(), members: vec![] }, now);
+        let room = Conv::Room("catPieR".into());
+        state.scroll.page_up(100, 10);
+        let msg = Event::Message { conv: room.clone(), from: "bobRoger".into(), text: "x".into(), ts: 0 };
+        on_event(&mut s, &mut state, &msg, now);
+        assert_eq!(state.scroll.unseen(), 1);
+        on_event(&mut s, &mut state, &Event::Sent { conv: room, text: "mine".into(), ts: 0 }, now);
+        assert_eq!(state.scroll.unseen(), 0, "our own message isn't news");
+        assert!(!state.scroll.is_scrolled(), "sending shows the latest messages");
     }
 
     #[test]
