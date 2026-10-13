@@ -34,6 +34,11 @@ fn readline_gives_up(err: &ReadlineError, consecutive: u32) -> bool {
     matches!(err, ReadlineError::Interrupted | ReadlineError::Eof) || consecutive >= MAX_READ_ERRORS
 }
 
+/// Whether a line-mode turn opens with the banner: every turn that follows the TUI.
+fn banner_due(entered: bool, from_tui: bool) -> bool {
+    entered || from_tui
+}
+
 pub struct LineFrontend {
     out: std::sync::mpsc::Sender<String>,
     prompt: Arc<Mutex<(String, Option<Conv>)>>,
@@ -43,18 +48,21 @@ pub struct LineFrontend {
     style: Style,
     /// Has run before, so a later turn came from the TUI.
     entered: bool,
+    /// The program started in the TUI, so even the first turn came from it.
+    from_tui: bool,
 }
 
 impl LineFrontend {
     /// Starts the input thread paused: it shows no prompt (and reads nothing)
     /// until `run` asks, so it never competes with the TUI for the keyboard.
-    pub fn new(style: Style) -> anyhow::Result<Self> {
+    pub fn new(style: Style, from_tui: bool) -> anyhow::Result<Self> {
         let mut editor = DefaultEditor::new()?;
         // The external printer redraws the prompt around output; it needs a real
         // terminal, so piped stdin falls back to plain println.
         let out = match editor.create_external_printer() {
             Ok(mut printer) => spawn_printer(move |s| {
-                let _ = printer.print(s);
+                // Without a trailing newline the next prompt's redraw erases the line.
+                let _ = printer.print(format!("{s}\n"));
             }),
             Err(_) => spawn_printer(|s| println!("{s}")),
         };
@@ -87,7 +95,7 @@ impl LineFrontend {
                 }
             }
         });
-        Ok(LineFrontend { out, prompt, lines, resume: Some(resume_tx), style, entered: false })
+        Ok(LineFrontend { out, prompt, lines, resume: Some(resume_tx), style, entered: false, from_tui })
     }
 
     fn print(&self, s: impl Into<String>) {
@@ -107,7 +115,7 @@ impl LineFrontend {
     /// Owns the terminal until the user quits or switches to the TUI. Returns
     /// only while no prompt is showing, so the terminal is never left raw.
     pub async fn run(&mut self, ctx: &mut Ctx) -> anyhow::Result<Exit> {
-        if self.entered {
+        if banner_due(self.entered, self.from_tui) {
             for line in ctx.session.line_banner() {
                 self.print(line);
             }
@@ -160,6 +168,16 @@ impl LineFrontend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banner_shows_on_every_turn_after_the_tui() {
+        // Started in line mode: no banner on the first turn, one on each later turn.
+        assert!(!banner_due(false, false));
+        assert!(banner_due(true, false));
+        // Started in the TUI: even the first line-mode turn came from it.
+        assert!(banner_due(false, true));
+        assert!(banner_due(true, true));
+    }
 
     #[test]
     fn only_ctrl_c_eof_or_repeated_errors_end_input() {

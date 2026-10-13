@@ -118,7 +118,7 @@ pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<()> {
     let style = Style::detect();
     let start = if opts.line || !std::io::stdout().is_terminal() { Mode::Line } else { Mode::Tui };
     let mut ctx = Ctx { session: Session::new(style), commands, events, notices, notice_tx, updater };
-    let mut line = line::LineFrontend::new(style)?;
+    let mut line = line::LineFrontend::new(style, start == Mode::Tui)?;
     let result = mode_loop(start, &mut ctx, async |ctx: &mut Ctx| line.run(ctx).await, tui::run).await;
     line.shutdown();
     let _ = task.await;
