@@ -8,10 +8,19 @@ pub const HISTORY_MAX: usize = 1000;
 pub enum Input {
     /// Plain text for the current conversation.
     Text(String),
-    Msg { to: String, text: String },
+    Msg {
+        to: String,
+        text: String,
+    },
     ChatDm(String),
-    ChatRoom { name: String, key: Option<String> },
-    Create { base: String, part: String },
+    ChatRoom {
+        name: String,
+        key: Option<String>,
+    },
+    Create {
+        base: String,
+        part: String,
+    },
     Leave(Option<String>),
     Rooms,
     Chats,

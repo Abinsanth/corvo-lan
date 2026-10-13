@@ -9,9 +9,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
-use crate::node::NodeMsg;
 use crate::names;
-use crate::protocol::{Announce, PeerId, PROTOCOL_VERSION};
+use crate::node::NodeMsg;
+use crate::protocol::{Announce, PROTOCOL_VERSION, PeerId};
 
 pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
 pub const PORT: u16 = 4299;

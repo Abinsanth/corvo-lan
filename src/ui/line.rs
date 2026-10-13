@@ -7,7 +7,7 @@ use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, ExternalPrinter as _};
 use tokio::sync::mpsc;
 
-use super::input::{parse_line, Input};
+use super::input::{Input, parse_line};
 use super::render::{self, Style};
 use crate::api::{Command, Conv, Event, Target};
 use crate::convo::Store;
@@ -128,7 +128,10 @@ impl Session {
                 if lines.is_empty() {
                     return Reaction::say("* nothing here yet");
                 }
-                Reaction { print: lines.iter().map(|l| render::line(&conv, l, &self.style)).collect(), ..Default::default() }
+                Reaction {
+                    print: lines.iter().map(|l| render::line(&conv, l, &self.style)).collect(),
+                    ..Default::default()
+                }
             }
         }
     }
@@ -373,8 +376,14 @@ mod tests {
     #[test]
     fn switching_mentions_unread_and_history_shows_them() {
         let mut s = session();
-        s.on_event(&Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "one".into(), ts: 0 }, 0);
-        s.on_event(&Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "two".into(), ts: 0 }, 0);
+        s.on_event(
+            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "one".into(), ts: 0 },
+            0,
+        );
+        s.on_event(
+            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "two".into(), ts: 0 },
+            0,
+        );
         assert_eq!(typed(&mut s, "/chat @bobRoger").print, vec!["* @bobRoger: 2 unread — /history to see them"]);
         let shown = typed(&mut s, "/history 1").print;
         assert_eq!(shown.len(), 1);

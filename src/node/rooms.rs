@@ -13,10 +13,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::debug;
 
-use super::{Node, NodeMsg, MAX_TEXT_LEN};
+use super::{MAX_TEXT_LEN, Node, NodeMsg};
 use crate::api::{Conv, Event};
 use crate::names;
-use crate::protocol::{now_millis, PeerId};
+use crate::protocol::{PeerId, now_millis};
 use crate::room::{self, ReplayGuard, RoomBody, RoomEnvelope, RoomId, RoomKeys};
 
 pub const MAX_ROOMS: usize = 16;
@@ -252,10 +252,10 @@ impl Node {
     }
 
     pub(super) fn on_join_timeout(&mut self, id: RoomId, attempt: Attempt) {
-        if self.rooms.joining.get(&id).is_some_and(|p| p.attempt == attempt && !p.settling) {
-            if let Some(p) = self.rooms.joining.remove(&id) {
-                self.emit(Event::Error(format!("no room #{} with that key", p.name)));
-            }
+        if self.rooms.joining.get(&id).is_some_and(|p| p.attempt == attempt && !p.settling)
+            && let Some(p) = self.rooms.joining.remove(&id)
+        {
+            self.emit(Event::Error(format!("no room #{} with that key", p.name)));
         }
     }
 
@@ -336,7 +336,8 @@ impl Node {
             if !p.replay.accept(nonce, env.ts, now_millis()) {
                 return;
             }
-            let answers_us = matches!(&env.body, RoomBody::Here { name, echo: Some(e) } if *name == p.name && *e == p.probe);
+            let answers_us =
+                matches!(&env.body, RoomBody::Here { name, echo: Some(e) } if *name == p.name && *e == p.probe);
             if answers_us {
                 p.replies.insert(from, env.ts);
                 if !std::mem::replace(&mut p.settling, true) {
@@ -386,22 +387,19 @@ impl Node {
             return;
         }
         // Challenge it (once) and hold its chat until it answers.
-        let challenge = match room.challenges.get_mut(&from) {
-            Some(c) => c,
-            None => {
-                let nonce = fresh_nonce();
-                let probe = RoomBody::Probe { nonce: nonce.clone() };
-                let frame = room::seal(&room.keys, self.id, &RoomEnvelope { ts: now_millis(), body: probe });
-                room.challenges.insert(from, Challenge { nonce, started: now, buffered: Vec::new() });
-                self.send_to(from, frame);
-                match self.rooms.joined.get_mut(&id).and_then(|r| r.challenges.get_mut(&from)) {
-                    Some(c) => c,
-                    None => return,
-                }
-            }
-        };
+        let me = self.id;
+        let mut probe = None;
+        let challenge = room.challenges.entry(from).or_insert_with(|| {
+            let nonce = fresh_nonce();
+            let body = RoomBody::Probe { nonce: nonce.clone() };
+            probe = Some(room::seal(&room.keys, me, &RoomEnvelope { ts: now_millis(), body }));
+            Challenge { nonce, started: now, buffered: Vec::new() }
+        });
         if matches!(env.body, RoomBody::Chat { .. }) && challenge.buffered.len() < MAX_BUFFERED {
             challenge.buffered.push(env);
+        }
+        if let Some(frame) = probe {
+            self.send_to(from, frame);
         }
     }
 
@@ -499,7 +497,7 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{Harness, BOB, CAROL, ME};
+    use super::super::tests::{BOB, CAROL, Harness, ME};
     use super::*;
     use crate::api::{Command, Target};
     use crate::protocol::Frame;
@@ -777,8 +775,11 @@ mod tests {
         deliver(&mut h, BOB, frame_at(BOB, &keys, now - 30_000, RoomBody::Chat { text: "older".into() }));
         deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Chat { text: "fresh".into() }));
         deliver(&mut h, BOB, frame_at(BOB, &keys, now - 10_000, RoomBody::Chat { text: "stale again".into() }));
-        let texts: Vec<String> =
-            h.events().into_iter().filter_map(|e| if let Event::Message { text, .. } = e { Some(text) } else { None }).collect();
+        let texts: Vec<String> = h
+            .events()
+            .into_iter()
+            .filter_map(|e| if let Event::Message { text, .. } = e { Some(text) } else { None })
+            .collect();
         assert_eq!(texts, vec!["fresh".to_string()]);
     }
 

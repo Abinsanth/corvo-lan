@@ -45,9 +45,7 @@ impl TryFrom<String> for PeerId {
         if s.len() != 16 {
             return Err(format!("peer id must be 16 hex chars, got {:?}", s));
         }
-        u64::from_str_radix(&s, 16)
-            .map(PeerId)
-            .map_err(|e| format!("invalid peer id {s:?}: {e}"))
+        u64::from_str_radix(&s, 16).map(PeerId).map_err(|e| format!("invalid peer id {s:?}: {e}"))
     }
 }
 
@@ -74,13 +72,26 @@ impl Announce {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Frame {
-    Hello { v: u8, id: PeerId, nick: String },
+    Hello {
+        v: u8,
+        id: PeerId,
+        nick: String,
+    },
     /// DM. Plaintext until v0.4.
-    Direct { text: String, ts: u64 },
+    Direct {
+        text: String,
+        ts: u64,
+    },
     /// Only sent to settle a same-moment name clash (see node).
-    Nick { nick: String },
+    Nick {
+        nick: String,
+    },
     /// Encrypted room traffic, sent to every peer; see `room`. All fields are lowercase hex.
-    Room { room_id: String, nonce: String, ct: String },
+    Room {
+        room_id: String,
+        nonce: String,
+        ct: String,
+    },
     Ping,
     Bye,
 }
@@ -99,11 +110,7 @@ pub enum DecodeError {
 
 impl From<std::io::Error> for DecodeError {
     fn from(e: std::io::Error) -> Self {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            DecodeError::Eof
-        } else {
-            DecodeError::Io(e)
-        }
+        if e.kind() == std::io::ErrorKind::UnexpectedEof { DecodeError::Eof } else { DecodeError::Io(e) }
     }
 }
 
@@ -132,10 +139,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, Decode
 
 /// Current time as unix milliseconds, for message timestamps.
 pub fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 #[cfg(test)]

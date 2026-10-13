@@ -44,9 +44,13 @@ pub struct RoomEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RoomBody {
-    Chat { text: String },
+    Chat {
+        text: String,
+    },
     /// "Is anyone here?" from someone joining.
-    Probe { nonce: String },
+    Probe {
+        nonce: String,
+    },
     /// Presence. Answers to a probe echo its nonce, which is what proves the
     /// sender is live rather than a replay; periodic heartbeats carry `None`.
     Here {
@@ -68,9 +72,8 @@ pub fn validate_part(part: &str) -> Result<(), String> {
 /// `part-xxxxxx` with the system part drawn from the OS-seeded CSPRNG.
 pub fn make_key(part: &str) -> String {
     let mut rng = rand::rng();
-    let sys: String = (0..SYS_LEN)
-        .map(|_| *SYS_ALPHABET.choose(&mut rng).expect("alphabet is not empty") as char)
-        .collect();
+    let sys: String =
+        (0..SYS_LEN).map(|_| *SYS_ALPHABET.choose(&mut rng).expect("alphabet is not empty") as char).collect();
     format!("{part}-{sys}")
 }
 
@@ -128,9 +131,8 @@ pub fn open(keys: &RoomKeys, sender: PeerId, nonce: &str, ct: &str) -> Option<(R
     let nonce: [u8; 24] = from_hex(nonce)?.try_into().ok()?;
     let ct = from_hex(ct)?;
     let aad = aad(&keys.id, sender);
-    let plain = XChaCha20Poly1305::new(&keys.enc.into())
-        .decrypt(&XNonce::from(nonce), Payload { msg: &ct, aad: &aad })
-        .ok()?;
+    let plain =
+        XChaCha20Poly1305::new(&keys.enc.into()).decrypt(&XNonce::from(nonce), Payload { msg: &ct, aad: &aad }).ok()?;
     Some((serde_json::from_slice(&plain).ok()?, nonce))
 }
 
@@ -147,10 +149,10 @@ impl ReplayGuard {
         if ts.abs_diff(now) > MAX_SKEW_MS || self.seen.contains(&nonce) {
             return false;
         }
-        if self.order.len() == REPLAY_WINDOW {
-            if let Some(old) = self.order.pop_front() {
-                self.seen.remove(&old);
-            }
+        if self.order.len() == REPLAY_WINDOW
+            && let Some(old) = self.order.pop_front()
+        {
+            self.seen.remove(&old);
         }
         self.order.push_back(nonce);
         self.seen.insert(nonce);
@@ -163,13 +165,10 @@ pub fn to_hex(bytes: &[u8]) -> String {
 }
 
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| s.get(i..i + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok()))
-        .collect()
+    (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok())).collect()
 }
 
 pub fn parse_room_id(s: &str) -> Option<RoomId> {

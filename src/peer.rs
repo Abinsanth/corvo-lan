@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 use crate::api::LeaveReason;
 use crate::names;
 use crate::node::{ConnKey, NodeMsg, Verdict};
-use crate::protocol::{read_frame, write_frame, Frame, PeerId, PROTOCOL_VERSION};
+use crate::protocol::{Frame, PROTOCOL_VERSION, PeerId, read_frame, write_frame};
 
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PING_INTERVAL: Duration = Duration::from_secs(3);
@@ -55,12 +55,7 @@ pub fn accept(stream: TcpStream, addr: SocketAddr, me: Me, node_tx: mpsc::Sender
     tokio::spawn(handle(stream, addr, false, None, me, node_tx));
 }
 
-async fn connect_failed(
-    node_tx: &mpsc::Sender<NodeMsg>,
-    addr: SocketAddr,
-    expected: Option<PeerId>,
-    error: String,
-) {
+async fn connect_failed(node_tx: &mpsc::Sender<NodeMsg>, addr: SocketAddr, expected: Option<PeerId>, error: String) {
     let _ = node_tx.send(NodeMsg::ConnectFailed { addr, expected, error }).await;
 }
 
@@ -88,16 +83,8 @@ async fn handle(
     let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
     let (out_tx, out_rx) = mpsc::channel(OUTBOX_SIZE);
     let (accept_tx, accept_rx) = oneshot::channel();
-    let connected = NodeMsg::PeerConnected {
-        conn,
-        id,
-        nick,
-        addr,
-        key,
-        dialed_as: expected,
-        out: out_tx,
-        accept: accept_tx,
-    };
+    let connected =
+        NodeMsg::PeerConnected { conn, id, nick, addr, key, dialed_as: expected, out: out_tx, accept: accept_tx };
     if node_tx.send(connected).await.is_err() {
         return;
     }
@@ -120,13 +107,9 @@ async fn handle(
 /// Exchanges `Hello` frames. Returns the remote peer's id and nick.
 async fn handshake(stream: &mut TcpStream, me: &Me) -> anyhow::Result<(PeerId, String)> {
     let nick = me.nick.borrow().clone();
-    write_frame(stream, &Frame::Hello { v: PROTOCOL_VERSION, id: me.id, nick })
-        .await
-        .context("sending hello")?;
-    let reply = timeout(HANDSHAKE_TIMEOUT, read_frame(stream))
-        .await
-        .context("no hello within 5s")?
-        .context("reading hello")?;
+    write_frame(stream, &Frame::Hello { v: PROTOCOL_VERSION, id: me.id, nick }).await.context("sending hello")?;
+    let reply =
+        timeout(HANDSHAKE_TIMEOUT, read_frame(stream)).await.context("no hello within 5s")?.context("reading hello")?;
     match reply {
         Frame::Hello { v, .. } if v != PROTOCOL_VERSION => bail!("unsupported protocol version {v}"),
         Frame::Hello { id, .. } if id == me.id => bail!("connected to myself"),

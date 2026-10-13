@@ -28,7 +28,8 @@ async fn spawn_node_with_word(base: &str, peers: &[SocketAddr], word: Option<&st
     })
     .await
     .unwrap();
-    let Event::Assigned { nick, .. } = wait_for(&mut node, "a name", |e| matches!(e, Event::Assigned { .. })).await else {
+    let Event::Assigned { nick, .. } = wait_for(&mut node, "a name", |e| matches!(e, Event::Assigned { .. })).await
+    else {
         unreachable!()
     };
     Peer { node, nick }
@@ -52,7 +53,8 @@ async fn wait_for(node: &mut NodeHandle, what: &str, pred: impl Fn(&Event) -> bo
 async fn wait_online(p: &mut Peer, nicks: &[&str]) {
     let mut missing: Vec<String> = nicks.iter().map(|n| n.to_string()).collect();
     while !missing.is_empty() {
-        let event = wait_for(&mut p.node, &format!("{missing:?} online"), |e| matches!(e, Event::PeerJoined { .. })).await;
+        let event =
+            wait_for(&mut p.node, &format!("{missing:?} online"), |e| matches!(e, Event::PeerJoined { .. })).await;
         if let Event::PeerJoined { nick, .. } = event {
             missing.retain(|n| *n != nick);
         }
@@ -119,7 +121,8 @@ async fn a_same_moment_name_clash_is_settled_by_the_higher_id() {
     let mut first = spawn_node_with_word("bob", &[], Some("Roger")).await;
     let mut second = spawn_node_with_word("bob", &[first.node.local_addr], Some("Roger")).await;
     assert_eq!((first.nick.as_str(), second.nick.as_str()), ("bobRoger", "bobRoger"));
-    let (loser, keeper) = if first.node.id > second.node.id { (&mut first, &mut second) } else { (&mut second, &mut first) };
+    let (loser, keeper) =
+        if first.node.id > second.node.id { (&mut first, &mut second) } else { (&mut second, &mut first) };
 
     let renamed = wait_for(&mut loser.node, "re-roll", |e| matches!(e, Event::Assigned { renamed: true, .. })).await;
     let Event::Assigned { nick: new_name, .. } = renamed else { unreachable!() };
@@ -239,7 +242,8 @@ async fn unreachable_manual_peer_is_reported() {
     // Bind then drop a listener to get a port that refuses connections.
     let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     let mut alice = spawn_node("alice", &[addr]).await;
-    wait_for(&mut alice.node, "connect error", |e| matches!(e, Event::Error(msg) if msg.contains("could not connect"))).await;
+    wait_for(&mut alice.node, "connect error", |e| matches!(e, Event::Error(msg) if msg.contains("could not connect")))
+        .await;
 }
 
 #[tokio::test]
