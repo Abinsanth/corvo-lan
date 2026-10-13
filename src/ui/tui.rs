@@ -12,3 +12,4 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<Exit> {
 pub fn install_panic_hook() {}
 
 pub mod state;
+pub mod view;
