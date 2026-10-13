@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         discovery: true,
         manual_peers: args.peers,
         name_wait: node::NAME_WAIT,
+        fixed_word: None,
     })
     .await?;
     ui::line::run(handle).await

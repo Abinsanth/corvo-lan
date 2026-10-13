@@ -14,12 +14,17 @@ struct Peer {
 }
 
 async fn spawn_node(base: &str, peers: &[SocketAddr]) -> Peer {
+    spawn_node_with_word(base, peers, None).await
+}
+
+async fn spawn_node_with_word(base: &str, peers: &[SocketAddr], word: Option<&str>) -> Peer {
     let mut node = node::start(NodeConfig {
         base: base.into(),
         listen: "127.0.0.1:0".parse().unwrap(),
         discovery: false,
         manual_peers: peers.to_vec(),
         name_wait: Duration::ZERO,
+        fixed_word: word.map(String::from),
     })
     .await
     .unwrap();
@@ -109,18 +114,24 @@ async fn names_are_assigned_from_the_base() {
 }
 
 #[tokio::test]
-async fn two_people_with_the_same_base_get_different_names() {
-    let mut first = spawn_node("bob", &[]).await;
-    let mut second = spawn_node("bob", &[first.node.local_addr]).await;
-    // If they drew the same word, one re-rolls; either way both end up distinct.
-    let other = wait_for(&mut first.node, "peer", |e| matches!(e, Event::PeerJoined { .. })).await;
-    let Event::PeerJoined { nick: seen_by_first, .. } = other else { unreachable!() };
-    let renamed = timeout(Duration::from_millis(300), second.node.events.recv()).await;
-    if let Ok(Some(Event::Assigned { nick, renamed: true })) = renamed {
-        second.nick = nick;
-    }
-    assert_ne!(first.nick, second.nick);
-    assert!(seen_by_first.starts_with("bob"));
+async fn a_same_moment_name_clash_is_settled_by_the_higher_id() {
+    // Both draw "bobRoger": exactly one of them, the higher id, must re-roll.
+    let mut first = spawn_node_with_word("bob", &[], Some("Roger")).await;
+    let mut second = spawn_node_with_word("bob", &[first.node.local_addr], Some("Roger")).await;
+    assert_eq!((first.nick.as_str(), second.nick.as_str()), ("bobRoger", "bobRoger"));
+    let (loser, keeper) = if first.node.id > second.node.id { (&mut first, &mut second) } else { (&mut second, &mut first) };
+
+    let renamed = wait_for(&mut loser.node, "re-roll", |e| matches!(e, Event::Assigned { renamed: true, .. })).await;
+    let Event::Assigned { nick: new_name, .. } = renamed else { unreachable!() };
+    assert!(new_name.starts_with("bob") && new_name != "bobRoger", "{new_name}");
+    // The lower id keeps its name and learns the other's new one.
+    let seen = wait_for(&mut keeper.node, "rename", |e| matches!(e, Event::Renamed { .. })).await;
+    assert_eq!(seen, Event::Renamed { old: "bobRoger".into(), new: new_name.clone() });
+    assert_eq!(keeper.nick, "bobRoger");
+
+    // And the new name is addressable.
+    say(keeper, Target::Dm(new_name.clone()), "which bob are you?").await;
+    wait_for(&mut loser.node, "dm", |e| matches!(e, Event::Message { text, .. } if text == "which bob are you?")).await;
 }
 
 #[tokio::test]

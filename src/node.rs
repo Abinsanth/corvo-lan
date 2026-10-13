@@ -47,6 +47,9 @@ pub struct NodeConfig {
     pub manual_peers: Vec<SocketAddr>,
     /// Listen-only discovery time before naming (`NAME_WAIT`; tests use zero).
     pub name_wait: Duration,
+    /// Pin the Word part of our first name instead of drawing one; tests use
+    /// it to force a same-moment clash. `None` (the app) picks at random.
+    pub fixed_word: Option<String>,
 }
 
 pub struct NodeHandle {
@@ -171,6 +174,7 @@ struct Node {
     nick: watch::Sender<String>,
     /// `Some(nicks seen so far)` during the listen-only naming window.
     naming: Option<HashSet<String>>,
+    fixed_word: Option<String>,
     events: mpsc::UnboundedSender<Event>,
     msg_tx: mpsc::Sender<NodeMsg>,
     peers: HashMap<PeerId, PeerEntry>,
@@ -195,6 +199,7 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
     let (msg_tx, msg_rx) = mpsc::channel(256);
     let mut node = Node::new(id, config.base, event_tx, msg_tx.clone());
     node.naming = Some(HashSet::new());
+    node.fixed_word = config.fixed_word;
     node.listener = Some(listener);
     node.manual_peers = config.manual_peers;
 
@@ -241,6 +246,7 @@ impl Node {
             base,
             nick: watch::Sender::new(String::new()),
             naming: None,
+            fixed_word: None,
             events,
             msg_tx,
             peers: HashMap::new(),
@@ -404,7 +410,11 @@ impl Node {
         let Some(seen) = self.naming.take() else {
             return;
         };
-        let Some(nick) = names::pick_nick(&self.base, |n| seen.contains(n)) else {
+        let picked = match &self.fixed_word {
+            Some(word) => Some(format!("{}{word}", self.base)),
+            None => names::pick_nick(&self.base, |n| seen.contains(n)),
+        };
+        let Some(nick) = picked else {
             self.emit(Event::Error(format!("every name for '{}' is taken; restart with another --nick", self.base)));
             return;
         };
