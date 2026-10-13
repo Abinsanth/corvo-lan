@@ -23,11 +23,7 @@ impl Style {
     }
 
     fn paint(&self, code: &str, s: &str) -> String {
-        if self.color {
-            format!("\x1b[{code}m{s}\x1b[0m")
-        } else {
-            s.to_string()
-        }
+        if self.color { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
     }
 
     /// `@nick` in its stable colour (cleaned first).
@@ -58,9 +54,7 @@ pub fn nick_color(nick: &str) -> u8 {
 /// overrides so a peer cannot rewrite our terminal or reverse displayed text.
 /// Zero-width joiners and variation selectors stay, since emoji need them.
 pub fn clean(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() || is_bidi_control(c) { '\u{fffd}' } else { c })
-        .collect()
+    s.chars().map(|c| if c.is_control() || is_bidi_control(c) { '\u{fffd}' } else { c }).collect()
 }
 
 fn is_bidi_control(c: char) -> bool {
@@ -140,7 +134,9 @@ pub fn line(conv: &Conv, l: &Line, style: &Style) -> String {
         (LineKind::Msg { from, text }, Conv::Room(room)) => {
             format!("{} {} {}: {}", stamp(l.ts), s.room(room), s.nick(from), clean(text))
         }
-        (LineKind::Msg { from, text }, Conv::Dm(_)) => format!("{} {} → you: {}", stamp(l.ts), s.nick(from), clean(text)),
+        (LineKind::Msg { from, text }, Conv::Dm(_)) => {
+            format!("{} {} → you: {}", stamp(l.ts), s.nick(from), clean(text))
+        }
         (LineKind::Mine { text }, Conv::Room(room)) => format!("{} {} you: {}", stamp(l.ts), s.room(room), clean(text)),
         (LineKind::Mine { text }, Conv::Dm(to)) => format!("{} you → {}: {}", stamp(l.ts), s.nick(to), clean(text)),
         (LineKind::Notice(text), _) => notice(l.ts, &clean(text), s),
@@ -216,9 +212,11 @@ mod tests {
 
     #[test]
     fn messages_show_time_sigils_and_direction() {
-        let room = Event::Message { conv: Conv::Room("catPieR".into()), from: "bobRoger".into(), text: "hi".into(), ts: 0 };
+        let room =
+            Event::Message { conv: Conv::Room("catPieR".into()), from: "bobRoger".into(), text: "hi".into(), ts: 0 };
         assert_eq!(event(&room, 0, &P).unwrap(), format!("{} #catPieR @bobRoger: hi", t(0)));
-        let dm_in = Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "psst".into(), ts: 0 };
+        let dm_in =
+            Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "psst".into(), ts: 0 };
         assert_eq!(event(&dm_in, 0, &P).unwrap(), format!("{} @bobRoger → you: psst", t(0)));
         let dm_out = Event::Sent { conv: Conv::Dm("bobRoger".into()), text: "yo".into(), ts: 0 };
         assert_eq!(event(&dm_out, 0, &P).unwrap(), format!("{} you → @bobRoger: yo", t(0)));
@@ -238,7 +236,11 @@ mod tests {
         assert_eq!(event(&lost, 0, &P).unwrap(), format!("{} * @bobRoger went offline (connection lost)", t(0)));
         let assigned = Event::Assigned { nick: "annMoon".into(), renamed: false };
         assert_eq!(event(&assigned, 0, &P).unwrap(), "* the system assigned you @annMoon — this name can't be changed");
-        let peers = Event::Peers(vec![PeerInfo { id: PeerId(1), nick: "bobRoger".into(), addr: "10.0.0.2:5000".parse().unwrap() }]);
+        let peers = Event::Peers(vec![PeerInfo {
+            id: PeerId(1),
+            nick: "bobRoger".into(),
+            addr: "10.0.0.2:5000".parse().unwrap(),
+        }]);
         let text = event(&peers, 0, &P).unwrap();
         assert!(text.contains("@bobRoger") && text.contains("10.0.0.2:5000"));
     }
@@ -246,7 +248,12 @@ mod tests {
     #[test]
     fn peer_text_is_cleaned_before_colouring() {
         let color = Style { color: true };
-        let evil = Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "a\u{1b}[2J\nb\u{202E}c".into(), ts: 0 };
+        let evil = Event::Message {
+            conv: Conv::Dm("bobRoger".into()),
+            from: "bobRoger".into(),
+            text: "a\u{1b}[2J\nb\u{202E}c".into(),
+            ts: 0,
+        };
         let out = event(&evil, 0, &color).unwrap();
         assert!(out.ends_with("a\u{fffd}[2J\u{fffd}b\u{fffd}c"), "{out:?}");
         // Our own colour codes are present, the peer's escape is not.
@@ -283,7 +290,10 @@ mod tests {
         assert!(rooms(&store, &P).starts_with("* you're not in any rooms"));
         store.apply(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
         store.switch(Conv::Room("catPieR".into()));
-        store.apply(&Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 }, 0);
+        store.apply(
+            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 },
+            0,
+        );
         let c = chats(&store, &P);
         assert!(c.contains("#catPieR") && c.contains("current"), "{c}");
         assert!(c.contains("@bobRoger") && c.contains("1 new") && c.contains("offline"), "{c}");

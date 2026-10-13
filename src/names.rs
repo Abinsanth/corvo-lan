@@ -9,8 +9,8 @@ pub const MAX_BASE_LEN: usize = 9;
 
 /// Command names and a few words that would read as commands or as "everyone".
 pub const RESERVED: [&str; 16] = [
-    "msg", "chat", "chats", "create", "leave", "rooms", "history", "who", "tui", "line", "help", "quit",
-    "exit", "me", "all", "system",
+    "msg", "chat", "chats", "create", "leave", "rooms", "history", "who", "tui", "line", "help", "quit", "exit", "me",
+    "all", "system",
 ];
 
 /// A base is what the user types: 1–9 ASCII letters or digits, not reserved.
@@ -26,9 +26,7 @@ pub fn validate_base(base: &str) -> Result<(), String> {
 
 /// `bobRoger`: a valid base followed by a listed word.
 pub fn is_valid_nick(name: &str) -> bool {
-    WORDS
-        .iter()
-        .any(|w| name.strip_suffix(w).is_some_and(|base| validate_base(base).is_ok()))
+    WORDS.iter().any(|w| name.strip_suffix(w).is_some_and(|base| validate_base(base).is_ok()))
 }
 
 /// `catPieR`: a valid nick shape followed by `R`.

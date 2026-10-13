@@ -15,7 +15,7 @@ use crate::api::{Command, Conv, Event, LeaveReason, PeerInfo, Target};
 use crate::discovery::{self, Sighting};
 use crate::names;
 use crate::peer::{self, ConnId, Me};
-use crate::protocol::{now_millis, Frame, PeerId, MAX_FRAME_LEN};
+use crate::protocol::{Frame, MAX_FRAME_LEN, PeerId, now_millis};
 use crate::room::{RoomId, RoomKeys};
 
 mod rooms;
@@ -79,13 +79,29 @@ pub enum NodeMsg {
         out: mpsc::Sender<Frame>,
         accept: oneshot::Sender<Verdict>,
     },
-    PeerFrame { conn: ConnId, id: PeerId, frame: Frame },
-    PeerGone { conn: ConnId, id: PeerId, reason: LeaveReason },
-    ConnectFailed { addr: SocketAddr, expected: Option<PeerId>, error: String },
+    PeerFrame {
+        conn: ConnId,
+        id: PeerId,
+        frame: Frame,
+    },
+    PeerGone {
+        conn: ConnId,
+        id: PeerId,
+        reason: LeaveReason,
+    },
+    ConnectFailed {
+        addr: SocketAddr,
+        expected: Option<PeerId>,
+        error: String,
+    },
     /// The listen-only naming window is over.
     NameWaitOver,
     /// A room key finished deriving on a worker thread.
-    Derived { job: rooms::Job, attempt: rooms::Attempt, keys: RoomKeys },
+    Derived {
+        job: rooms::Job,
+        attempt: rooms::Attempt,
+        keys: RoomKeys,
+    },
     JoinSettled(RoomId, rooms::Attempt),
     JoinTimeout(RoomId, rooms::Attempt),
     Tick,
@@ -240,12 +256,7 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
 }
 
 impl Node {
-    fn new(
-        id: PeerId,
-        base: String,
-        events: mpsc::UnboundedSender<Event>,
-        msg_tx: mpsc::Sender<NodeMsg>,
-    ) -> Self {
+    fn new(id: PeerId, base: String, events: mpsc::UnboundedSender<Event>, msg_tx: mpsc::Sender<NodeMsg>) -> Self {
         Node {
             id,
             base,
@@ -349,11 +360,8 @@ impl Node {
             Command::JoinRoom { name, key } => self.join_room(&name, &key),
             Command::LeaveRoom { name } => self.leave_room(&name),
             Command::ListPeers => {
-                let mut peers: Vec<PeerInfo> = self
-                    .peers
-                    .iter()
-                    .map(|(id, p)| PeerInfo { id: *id, nick: p.nick.clone(), addr: p.addr })
-                    .collect();
+                let mut peers: Vec<PeerInfo> =
+                    self.peers.iter().map(|(id, p)| PeerInfo { id: *id, nick: p.nick.clone(), addr: p.addr }).collect();
                 peers.sort_by(|a, b| a.nick.cmp(&b.nick));
                 self.emit(Event::Peers(peers));
             }
@@ -782,7 +790,8 @@ pub(super) mod tests {
         h.node.naming = Some(HashSet::new());
         let taken: Vec<String> = crate::words::WORDS.iter().skip(1).map(|w| format!("ann{w}")).collect();
         for (i, nick) in taken.iter().enumerate() {
-            let s = Sighting { id: PeerId(100 + i as u64), nick: nick.clone(), tcp_addr: "127.0.0.1:1".parse().unwrap() };
+            let s =
+                Sighting { id: PeerId(100 + i as u64), nick: nick.clone(), tcp_addr: "127.0.0.1:1".parse().unwrap() };
             h.node.on_discovered(s);
         }
         assert!(h.node.dialing.is_empty(), "no dialing before we have a name");

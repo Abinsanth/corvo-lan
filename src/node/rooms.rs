@@ -13,10 +13,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::debug;
 
-use super::{Node, NodeMsg, MAX_TEXT_LEN};
+use super::{MAX_TEXT_LEN, Node, NodeMsg};
 use crate::api::{Conv, Event};
 use crate::names;
-use crate::protocol::{now_millis, PeerId};
+use crate::protocol::{PeerId, now_millis};
 use crate::room::{self, ReplayGuard, RoomBody, RoomEnvelope, RoomId, RoomKeys};
 
 pub const MAX_ROOMS: usize = 16;
@@ -336,7 +336,8 @@ impl Node {
             if !p.replay.accept(nonce, env.ts, now_millis()) {
                 return;
             }
-            let answers_us = matches!(&env.body, RoomBody::Here { name, echo: Some(e) } if *name == p.name && *e == p.probe);
+            let answers_us =
+                matches!(&env.body, RoomBody::Here { name, echo: Some(e) } if *name == p.name && *e == p.probe);
             if answers_us {
                 p.replies.insert(from, env.ts);
                 if !std::mem::replace(&mut p.settling, true) {
@@ -499,7 +500,7 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{Harness, BOB, CAROL, ME};
+    use super::super::tests::{BOB, CAROL, Harness, ME};
     use super::*;
     use crate::api::{Command, Target};
     use crate::protocol::Frame;
@@ -777,8 +778,11 @@ mod tests {
         deliver(&mut h, BOB, frame_at(BOB, &keys, now - 30_000, RoomBody::Chat { text: "older".into() }));
         deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Chat { text: "fresh".into() }));
         deliver(&mut h, BOB, frame_at(BOB, &keys, now - 10_000, RoomBody::Chat { text: "stale again".into() }));
-        let texts: Vec<String> =
-            h.events().into_iter().filter_map(|e| if let Event::Message { text, .. } = e { Some(text) } else { None }).collect();
+        let texts: Vec<String> = h
+            .events()
+            .into_iter()
+            .filter_map(|e| if let Event::Message { text, .. } = e { Some(text) } else { None })
+            .collect();
         assert_eq!(texts, vec!["fresh".to_string()]);
     }
 

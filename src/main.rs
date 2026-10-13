@@ -37,10 +37,7 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
-    let base = args
-        .nick
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "anon".into());
+    let base = args.nick.or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "anon".into());
     names::validate_base(&base).map_err(|e| anyhow!("invalid --nick {base:?}: {e}"))?;
 
     let handle = node::start(NodeConfig {
