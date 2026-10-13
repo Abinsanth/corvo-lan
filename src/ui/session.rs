@@ -19,8 +19,36 @@ commands:
   /history [n]           show the last n messages here (default 20)
   /update [yes]          check for a newer version; yes installs it
   /who                   connected people
+  /tui                   switch to the full-screen UI
   /quit                  leave (also Ctrl-C / Ctrl-D)
   //text                 send a message starting with '/'";
+
+pub const MAX_MESSAGE_LINES: usize = 50;
+
+pub const HELP_TUI: &str = "\
+commands:
+  <text>                 send to the current tab
+  /msg @nick <text>      one-off private message
+  /chat @nick            open a private chat
+  /chat #room <key>      join a room (just /chat #room once you're in)
+  /create <name> <key>   create a private room; share its name and key to invite
+  /leave [#room]         leave the current or named room
+  /close [@nick]         close the current or named private chat
+  /rooms  /chats  /who   list rooms, chats, connected people
+  /update [yes]          check for a newer version; yes installs it
+  /line                  switch to line mode
+  /quit                  leave (also Ctrl-C)
+  //text                 send a message starting with '/'
+keys:
+  Enter send · Alt+Enter or Shift+Enter new line · Tab/Shift-Tab or Alt-1..9 switch tabs
+  PgUp/PgDn or mouse wheel scroll · Esc clear input / back to latest · click a name to chat";
+
+/// Which frontend is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Line,
+    Tui,
+}
 
 /// What the UI loop should do after an input line.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -29,6 +57,7 @@ pub struct Reaction {
     pub print: Vec<String>,
     pub quit: bool,
     pub update: Option<UpdateAction>,
+    pub switch: Option<Mode>,
 }
 
 impl Reaction {
@@ -43,12 +72,38 @@ impl Reaction {
 
 pub struct Session {
     pub store: Store,
+    mode: Mode,
+    /// What line mode prints with; the TUI renders plain text and colours it itself.
+    line_style: Style,
     style: Style,
 }
 
 impl Session {
     pub fn new(style: Style) -> Self {
-        Session { store: Store::new(), style }
+        Session { store: Store::new(), mode: Mode::Line, line_style: style, style }
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.style = if mode == Mode::Tui { Style::plain() } else { self.line_style };
+    }
+
+    /// Whether colour is on (`NO_COLOR` and pipes turn it off).
+    pub fn color(&self) -> bool {
+        self.line_style.color
+    }
+
+    /// Printed when line mode takes over from the TUI.
+    pub fn line_banner(&self) -> Vec<String> {
+        let mut out = vec!["* line mode — /tui to switch back".to_string()];
+        if self.store.conversations().iter().any(|c| c.unread > 0) {
+            out.push(render::chats(&self.store, &self.style));
+        }
+        out
     }
 
     pub fn prompt(&self) -> String {
@@ -77,15 +132,21 @@ impl Session {
         match parse_line(line) {
             Input::Empty => Reaction::default(),
             Input::Error(e) => Reaction::say(format!("! {e}")),
-            Input::Help => Reaction::say(HELP_LINE),
+            Input::Help => Reaction::say(if self.mode == Mode::Tui { HELP_TUI } else { HELP_LINE }),
             Input::Quit => Reaction { quit: true, ..Default::default() },
             Input::Who => Reaction::send(Command::ListPeers),
-            Input::Text(text) => match shown.or(self.store.current()) {
-                Some(Conv::Room(n)) => Reaction::send(Command::Send { to: Target::Room(n.clone()), text }),
-                Some(Conv::Dm(n)) => Reaction::send(Command::Send { to: Target::Dm(n.clone()), text }),
-                None => Reaction::say("! no conversation — /chat @nick or /create <name> <key>"),
+            Input::Text(text) => match tidy_message(&text) {
+                Ok(text) => match shown.or(self.store.current()) {
+                    Some(Conv::Room(n)) => Reaction::send(Command::Send { to: Target::Room(n.clone()), text }),
+                    Some(Conv::Dm(n)) => Reaction::send(Command::Send { to: Target::Dm(n.clone()), text }),
+                    None => Reaction::say("! no conversation — /chat @nick or /create <name> <key>"),
+                },
+                Err(e) => Reaction::say(format!("! {e}")),
             },
-            Input::Msg { to, text } => Reaction::send(Command::Send { to: Target::Dm(to), text }),
+            Input::Msg { to, text } => match tidy_message(&text) {
+                Ok(text) => Reaction::send(Command::Send { to: Target::Dm(to), text }),
+                Err(e) => Reaction::say(format!("! {e}")),
+            },
             Input::ChatDm(nick) => {
                 if self.store.me() == Some(nick.as_str()) {
                     return Reaction::say("! that's you");
@@ -116,9 +177,36 @@ impl Session {
                 update: Some(if confirm { UpdateAction::Install } else { UpdateAction::Check }),
                 ..Default::default()
             },
+            Input::Line if self.mode == Mode::Line => Reaction::say("! already in line mode"),
+            Input::Tui if self.mode == Mode::Tui => Reaction::say("! already in the TUI"),
+            Input::Line => Reaction { switch: Some(Mode::Line), ..Default::default() },
+            Input::Tui => Reaction { switch: Some(Mode::Tui), ..Default::default() },
+            Input::Close(target) => {
+                let conv = match target {
+                    Some(nick) => Conv::Dm(nick),
+                    None => match self.store.current() {
+                        Some(conv) => conv.clone(),
+                        None => return Reaction::say("! no chat to close here"),
+                    },
+                };
+                match &conv {
+                    Conv::Room(_) => Reaction::say("! use /leave for rooms"),
+                    Conv::Dm(nick) if self.store.get(&conv).is_none() => {
+                        Reaction::say(format!("! no chat with @{nick}"))
+                    }
+                    Conv::Dm(nick) => {
+                        let text = format!("* closed @{nick}");
+                        self.store.close(&conv);
+                        Reaction::say(text)
+                    }
+                }
+            }
             Input::Rooms => Reaction::say(render::rooms(&self.store, &self.style)),
             Input::Chats => Reaction::say(render::chats(&self.store, &self.style)),
             Input::History(n) => {
+                if self.mode == Mode::Tui {
+                    return Reaction::say("* scroll with PgUp/PgDn");
+                }
                 let Some(conv) = self.store.current().cloned() else {
                     return Reaction::say("! no conversation — /chat @nick or /chat #room");
                 };
@@ -135,6 +223,11 @@ impl Session {
     }
 
     fn switch(&mut self, conv: Conv) -> Reaction {
+        if self.mode == Mode::Tui {
+            // The tab already shows the unread messages.
+            self.store.switch(conv);
+            return Reaction::default();
+        }
         let unread = self.store.get(&conv).map_or(0, |c| c.unread);
         self.store.switch(conv.clone());
         if unread > 0 {
@@ -144,6 +237,19 @@ impl Session {
             Reaction::default()
         }
     }
+}
+
+/// Drops trailing blank lines; refuses a message that's empty or too long.
+pub fn tidy_message(text: &str) -> Result<String, String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let keep = lines.iter().rposition(|l| !l.trim().is_empty()).map_or(0, |i| i + 1);
+    if keep == 0 {
+        return Err("message is empty".into());
+    }
+    if keep > MAX_MESSAGE_LINES {
+        return Err(format!("message has more than {MAX_MESSAGE_LINES} lines"));
+    }
+    Ok(lines[..keep].join("\n"))
 }
 
 #[cfg(test)]
@@ -279,5 +385,82 @@ mod tests {
         assert!(check.commands.is_empty() && check.print.is_empty());
         assert_eq!(typed(&mut s, "/update yes").update, Some(UpdateAction::Install));
         assert!(HELP_LINE.contains("/update [yes]"));
+    }
+
+    #[test]
+    fn mode_switches_are_refused_in_the_mode_you_are_in() {
+        let mut s = session();
+        assert_eq!(typed(&mut s, "/line").print, vec!["! already in line mode"]);
+        assert_eq!(typed(&mut s, "/tui").switch, Some(Mode::Tui));
+        s.set_mode(Mode::Tui);
+        assert_eq!(typed(&mut s, "/tui").print, vec!["! already in the TUI"]);
+        assert_eq!(typed(&mut s, "/line").switch, Some(Mode::Line));
+    }
+
+    #[test]
+    fn close_forgets_a_dm_but_not_a_room() {
+        let mut s = session();
+        typed(&mut s, "/chat @bobRoger");
+        assert_eq!(typed(&mut s, "/close").print, vec!["* closed @bobRoger"]);
+        assert!(s.store.get(&Conv::Dm("bobRoger".into())).is_none());
+        assert_eq!(typed(&mut s, "/close").print, vec!["! no chat to close here"]);
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
+        assert_eq!(typed(&mut s, "/close").print, vec!["! use /leave for rooms"]);
+        assert_eq!(typed(&mut s, "/close @ghostMoon").print, vec!["! no chat with @ghostMoon"]);
+    }
+
+    #[test]
+    fn multi_line_messages_are_tidied_and_capped() {
+        assert_eq!(tidy_message("hi\nthere\n\n  \n"), Ok("hi\nthere".into()));
+        assert_eq!(tidy_message("  \n"), Err("message is empty".into()));
+        let long = vec!["x"; MAX_MESSAGE_LINES + 1].join("\n");
+        assert_eq!(tidy_message(&long), Err(format!("message has more than {MAX_MESSAGE_LINES} lines")));
+        assert!(tidy_message(&vec!["x"; MAX_MESSAGE_LINES].join("\n")).is_ok());
+
+        let mut s = session();
+        typed(&mut s, "/chat @bobRoger");
+        assert_eq!(typed(&mut s, "one\ntwo\n\n"), send(Target::Dm("bobRoger".into()), "one\ntwo"));
+        assert_eq!(typed(&mut s, &long).print, vec![format!("! message has more than {MAX_MESSAGE_LINES} lines")]);
+        assert_eq!(typed(&mut s, "/msg @bobRoger a\nb\n"), send(Target::Dm("bobRoger".into()), "a\nb"));
+    }
+
+    #[test]
+    fn help_and_history_depend_on_the_mode() {
+        let mut s = session();
+        assert_eq!(typed(&mut s, "/help").print, vec![HELP_LINE]);
+        assert!(HELP_LINE.contains("/tui") && !HELP_LINE.contains("/line"));
+        s.set_mode(Mode::Tui);
+        assert_eq!(typed(&mut s, "/help").print, vec![HELP_TUI]);
+        assert!(HELP_TUI.contains("/line") && HELP_TUI.contains("/close") && HELP_TUI.contains("Alt+Enter"));
+        assert_eq!(typed(&mut s, "/history").print, vec!["* scroll with PgUp/PgDn"]);
+    }
+
+    #[test]
+    fn the_tui_renders_plain_and_switching_there_says_nothing() {
+        let mut s = Session::new(Style { color: true });
+        s.set_mode(Mode::Tui);
+        assert!(s.color());
+        let text = s.on_event(&Event::PeerJoined { id: PeerId(3), nick: "daveElk".into() }, 0).unwrap();
+        assert!(!text.contains('\x1b'), "{text:?}");
+        s.on_event(
+            &Event::Message { conv: Conv::Dm("daveElk".into()), from: "daveElk".into(), text: "x".into(), ts: 0 },
+            0,
+        );
+        assert_eq!(typed(&mut s, "/chat @daveElk"), Reaction::default());
+        s.set_mode(Mode::Line);
+        assert!(s.on_event(&Event::PeerJoined { id: PeerId(4), nick: "eveOwl".into() }, 0).unwrap().contains('\x1b'));
+    }
+
+    #[test]
+    fn line_banner_mentions_unread_chats() {
+        let mut s = session();
+        assert_eq!(s.line_banner(), vec!["* line mode — /tui to switch back"]);
+        s.on_event(
+            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 },
+            0,
+        );
+        let banner = s.line_banner();
+        assert_eq!(banner.len(), 2);
+        assert!(banner[1].contains("1 new"), "{banner:?}");
     }
 }

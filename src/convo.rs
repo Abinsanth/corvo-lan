@@ -64,6 +64,19 @@ impl Store {
         self.convs.iter().find(|c| &c.conv == conv)
     }
 
+    /// People online right now, in name order.
+    pub fn online(&self) -> impl Iterator<Item = &String> {
+        self.online.iter()
+    }
+
+    /// Forgets a conversation (the TUI's `/close`); a later message reopens it.
+    pub fn close(&mut self, conv: &Conv) {
+        self.convs.retain(|c| &c.conv != conv);
+        if self.current.as_ref() == Some(conv) {
+            self.current = None;
+        }
+    }
+
     pub fn is_online(&self, nick: &str) -> bool {
         self.online.contains(nick)
     }
@@ -114,9 +127,15 @@ impl Store {
             Event::Sent { conv, text, ts } => {
                 push(self.entry(conv), Line { ts: *ts, kind: LineKind::Mine { text: text.clone() } })
             }
-            Event::RoomCreated { name, .. } => {
+            Event::RoomCreated { name, key } => {
                 let c = self.entry(&Conv::Room(name.clone()));
-                push(c, Line { ts: now, kind: LineKind::Notice(format!("created #{name}")) });
+                push(
+                    c,
+                    Line {
+                        ts: now,
+                        kind: LineKind::Notice(format!("created #{name} — key {key} — share both to invite")),
+                    },
+                );
             }
             Event::RoomJoined { name, members } => {
                 let c = self.entry(&Conv::Room(name.clone()));
@@ -373,5 +392,31 @@ mod tests {
         let mut s = Store::new();
         s.apply(&Event::Assigned { nick: "aliceMoon".into(), renamed: false }, 0);
         assert_eq!(s.me(), Some("aliceMoon"));
+    }
+
+    #[test]
+    fn closing_a_dm_forgets_it_and_a_new_message_reopens_it() {
+        let mut s = Store::new();
+        s.apply(&msg(dm("bobRoger"), "bobRoger", "hi"), 0);
+        s.switch(dm("bobRoger"));
+        s.close(&dm("bobRoger"));
+        assert!(s.get(&dm("bobRoger")).is_none());
+        assert_eq!(s.current(), None);
+        s.apply(&msg(dm("bobRoger"), "bobRoger", "again"), 0);
+        assert_eq!(s.get(&dm("bobRoger")).unwrap().lines.len(), 1);
+    }
+
+    #[test]
+    fn online_people_are_listed_in_order_and_created_rooms_show_their_key() {
+        let mut s = Store::new();
+        s.apply(&Event::PeerJoined { id: PeerId(2), nick: "carolFox".into() }, 0);
+        s.apply(&Event::PeerJoined { id: PeerId(1), nick: "bobRoger".into() }, 0);
+        assert_eq!(s.online().cloned().collect::<Vec<_>>(), vec!["bobRoger", "carolFox"]);
+        s.apply(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
+        let c = s.get(&room("catPieR")).unwrap();
+        assert_eq!(
+            c.lines[0].kind,
+            LineKind::Notice("created #catPieR — key 123-k7m9xq — share both to invite".into())
+        );
     }
 }

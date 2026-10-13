@@ -29,6 +29,12 @@ pub enum Input {
     Update {
         confirm: bool,
     },
+    /// Switch to line mode (from the TUI).
+    Line,
+    /// Switch to the full-screen UI (from line mode).
+    Tui,
+    /// Close the current or named DM.
+    Close(Option<String>),
     Who,
     Help,
     Quit,
@@ -91,6 +97,20 @@ pub fn parse_line(line: &str) -> Input {
             [] => Input::Update { confirm: false },
             ["yes"] => Input::Update { confirm: true },
             _ => Input::Error("usage: /update [yes]".into()),
+        },
+        "line" => match words.as_slice() {
+            [] => Input::Line,
+            _ => Input::Error("usage: /line".into()),
+        },
+        "tui" => match words.as_slice() {
+            [] => Input::Tui,
+            _ => Input::Error("usage: /tui".into()),
+        },
+        "close" => match words.as_slice() {
+            [] => Input::Close(None),
+            [nick] if nick.starts_with('@') => Input::Close(Some(nick[1..].to_string())),
+            [room] if room.starts_with('#') => Input::Error("use /leave for rooms".into()),
+            _ => Input::Error("usage: /close [@nick]".into()),
         },
         "rooms" => Input::Rooms,
         "chats" => Input::Chats,
@@ -173,5 +193,16 @@ mod tests {
         assert_eq!(parse_line("/update yes"), Input::Update { confirm: true });
         assert_eq!(parse_line("/update now"), err("usage: /update [yes]"));
         assert_eq!(parse_line("/update yes please"), err("usage: /update [yes]"));
+    }
+
+    #[test]
+    fn mode_and_close_commands() {
+        assert_eq!(parse_line("/line"), Input::Line);
+        assert_eq!(parse_line("/tui"), Input::Tui);
+        assert_eq!(parse_line("/close"), Input::Close(None));
+        assert_eq!(parse_line("/close @bobRoger"), Input::Close(Some("bobRoger".into())));
+        assert_eq!(parse_line("/close #catPieR"), err("use /leave for rooms"));
+        assert_eq!(parse_line("/close bob"), err("usage: /close [@nick]"));
+        assert_eq!(parse_line("/line now"), err("usage: /line"));
     }
 }
