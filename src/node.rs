@@ -82,9 +82,9 @@ pub enum NodeMsg {
     /// The listen-only naming window is over.
     NameWaitOver,
     /// A room key finished deriving on a worker thread.
-    Derived { job: rooms::Job, keys: RoomKeys },
-    JoinSettled(RoomId),
-    JoinTimeout(RoomId),
+    Derived { job: rooms::Job, attempt: rooms::Attempt, keys: RoomKeys },
+    JoinSettled(RoomId, rooms::Attempt),
+    JoinTimeout(RoomId, rooms::Attempt),
     Tick,
 }
 
@@ -400,9 +400,9 @@ impl Node {
                 None => self.emit(Event::Error(format!("could not connect to {addr}: {error}"))),
             },
             NodeMsg::NameWaitOver => self.assign_name(),
-            NodeMsg::Derived { job, keys } => self.on_derived(job, keys),
-            NodeMsg::JoinSettled(id) => self.on_join_settled(id),
-            NodeMsg::JoinTimeout(id) => self.on_join_timeout(id),
+            NodeMsg::Derived { job, attempt, keys } => self.on_derived(job, attempt, keys),
+            NodeMsg::JoinSettled(id, attempt) => self.on_join_settled(id, attempt),
+            NodeMsg::JoinTimeout(id, attempt) => self.on_join_timeout(id, attempt),
             NodeMsg::Tick => self.on_tick(Instant::now()),
         }
     }
