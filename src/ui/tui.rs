@@ -26,12 +26,17 @@ use self::state::{Action, Hit, TuiState, WHEEL_STEP, action_for, goes_to_status}
 use super::render::{tone_of, tone_of_text};
 use super::session::{Mode, Reaction, Session};
 use super::{Ctx, Exit};
-use crate::api::{Conv, Event};
+use crate::api::{Command, Conv, Event};
 use crate::protocol::now_millis;
 
 const POLL: Duration = Duration::from_millis(100);
 /// Redraws this often anyway, so an error flash goes away on time.
 const TICK: Duration = Duration::from_millis(250);
+
+/// Disambiguated keys (so Shift/Alt+Enter are distinguishable) with shifted
+/// characters reported as typed. Not REPORT_ALL_KEYS: it would send unshifted keys.
+const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
 
 /// Best-effort and idempotent: puts the terminal back the way line mode expects.
 fn restore_terminal() {
@@ -63,9 +68,7 @@ impl TerminalGuard {
         let guard = TerminalGuard;
         execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
         if supports_keyboard_enhancement().unwrap_or(false) {
-            let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
-            execute!(stdout(), PushKeyboardEnhancementFlags(flags))?;
+            execute!(stdout(), PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))?;
         }
         Ok(guard)
     }
@@ -254,7 +257,10 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<Exit> {
         terminal.draw(|f| view::draw(f, &ctx.session, &mut state, now))?;
         tokio::select! {
             ev = input.recv() => {
-                let Some(ev) = ev else { break Exit::Quit };
+                let Some(ev) = ev else {
+                    let _ = ctx.commands.send(Command::Quit).await;
+                    break Exit::Quit;
+                };
                 if let Some(exit) = on_terminal_event(ctx, &mut state, &mut terminal, ev).await? {
                     break exit;
                 }
@@ -424,5 +430,13 @@ mod tests {
         assert_eq!(state.editor.text(), "older");
         apply_key(&mut s, &mut state, Action::Down);
         assert_eq!(state.editor.text(), "hi");
+    }
+
+    #[test]
+    fn keyboard_flags_report_shifted_characters() {
+        use ratatui::crossterm::event::KeyboardEnhancementFlags as F;
+        assert!(KEYBOARD_FLAGS.contains(F::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(KEYBOARD_FLAGS.contains(F::REPORT_ALTERNATE_KEYS));
+        assert!(!KEYBOARD_FLAGS.contains(F::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     }
 }

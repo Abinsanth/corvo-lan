@@ -87,9 +87,17 @@ pub async fn mode_loop(
     let mut mode = start;
     loop {
         ctx.session.set_mode(mode);
-        let exit = match mode {
-            Mode::Line => line(ctx).await?,
-            Mode::Tui => tui(ctx).await?,
+        let result = match mode {
+            Mode::Line => line(ctx).await,
+            Mode::Tui => tui(ctx).await,
+        };
+        let exit = match result {
+            Ok(exit) => exit,
+            Err(e) => {
+                // Without this the node never stops and the process hangs, still on the LAN.
+                let _ = ctx.commands.send(Command::Quit).await;
+                return Err(e);
+            }
         };
         match exit {
             Exit::Quit => return Ok(()),
@@ -194,5 +202,20 @@ mod tests {
         assert_eq!(ctx.act(switch).await.unwrap(), Some(Exit::Switch(Mode::Tui)));
         assert_eq!(cmd_rx.recv().await, Some(Command::ListPeers));
         assert_eq!(Notice::new("! boom").tone, Tone::Bad);
+    }
+
+    #[tokio::test]
+    async fn a_failing_frontend_still_stops_the_node() {
+        let (mut ctx, _event_tx, mut cmd_rx) = ctx();
+        let r = mode_loop(
+            Mode::Line,
+            &mut ctx,
+            async |_: &mut Ctx| Err(anyhow::anyhow!("boom")),
+            async |_: &mut Ctx| Ok(Exit::Quit),
+        )
+        .await;
+        assert!(r.is_err());
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx.recv()).await;
+        assert_eq!(sent, Ok(Some(Command::Quit)));
     }
 }
