@@ -1,0 +1,41 @@
+# Rust build output
+/target
+**/*.rs.bk
+*.pdb
+
+# App runtime output (`lan-chat --debug`)
+lan-chat.log
+*.log
+
+# Secrets and credentials — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+id_rsa*
+id_ed25519*
+*.secret
+secrets/
+credentials*
+# Future v0.3 Noise keypairs
+*.keypair
+keys/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local tooling
+.claude/
+graphify-out/
