@@ -444,6 +444,7 @@ impl Node {
                 let new = self.display(id);
                 self.emit(Event::NickChanged { id, old, new });
             }
+            Frame::Room { .. } => {} // handled from Task 4
             Frame::Hello { .. } | Frame::Ping | Frame::Bye => {} // consumed by the peer task
         }
     }
