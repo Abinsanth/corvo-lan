@@ -557,6 +557,22 @@ mod tests {
         assert_eq!(events[1], Event::Info(format!("nobody else is in #{name} yet")));
     }
 
+    #[tokio::test]
+    async fn escaped_text_is_what_counts_against_the_limit() {
+        let mut h = with_peers();
+        let (name, _) = create(&mut h).await;
+        // Each control character escapes to 6 bytes, and room frames are hex on top.
+        h.node.handle_command(Command::Send { to: Target::Room(name.clone()), text: "\u{1}".repeat(MAX_TEXT_LEN) });
+        assert!(h.sent(BOB).is_empty());
+        assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("too long")));
+
+        let most = "\u{1}".repeat(MAX_TEXT_LEN / 6);
+        h.node.handle_command(Command::Send { to: Target::Room(name), text: most });
+        let sent = h.sent(BOB);
+        assert!(matches!(sent.as_slice(), [Frame::Room { .. }]));
+        assert!(serde_json::to_vec(&sent[0]).unwrap().len() <= crate::protocol::MAX_FRAME_LEN);
+    }
+
     #[test]
     fn bad_room_input_is_rejected_up_front() {
         let mut h = with_peers();

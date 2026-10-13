@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::api::LeaveReason;
 use crate::names;
@@ -230,6 +230,8 @@ async fn write_loop<W: AsyncWrite + Unpin>(wr: &mut W, mut out_rx: mpsc::Receive
         };
         match timeout(WRITE_TIMEOUT, write_frame(wr, &frame)).await {
             Err(_) => return WriterExit::Stalled,
+            // Sending it would make the peer drop us; lose just this frame.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidInput => warn!("not sending frame: {e}"),
             Ok(Err(_)) => return WriterExit::Failed,
             Ok(Ok(())) if frame == Frame::Bye => return WriterExit::Bye,
             Ok(Ok(())) => {}
@@ -240,6 +242,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(wr: &mut W, mut out_rx: mpsc::Receive
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::MAX_FRAME_LEN;
 
     #[tokio::test(start_paused = true)]
     async fn writer_gives_up_on_a_peer_that_stops_reading() {
@@ -261,6 +264,16 @@ mod tests {
         assert_eq!(read_frame(&mut theirs).await.unwrap(), Frame::Direct { text: "hi".into(), ts: 0 });
         assert_eq!(read_frame(&mut theirs).await.unwrap(), Frame::Bye);
         assert!(read_frame(&mut theirs).await.is_err()); // closed, nothing after Bye
+    }
+
+    #[tokio::test]
+    async fn writer_skips_an_oversized_frame_and_keeps_going() {
+        let (mut ours, mut theirs) = tokio::io::duplex(4096);
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(Frame::Direct { text: "x".repeat(MAX_FRAME_LEN), ts: 0 }).await.unwrap();
+        tx.send(Frame::Bye).await.unwrap();
+        assert_eq!(write_loop(&mut ours, rx).await, WriterExit::Bye);
+        assert_eq!(read_frame(&mut theirs).await.unwrap(), Frame::Bye);
     }
 
     #[tokio::test]

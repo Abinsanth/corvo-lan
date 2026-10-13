@@ -22,7 +22,8 @@ mod rooms;
 
 pub use rooms::{HERE_INTERVAL, JOIN_SETTLE, JOIN_WAIT, MAX_ROOMS, MEMBER_TIMEOUT};
 
-/// Longest chat text accepted, leaving headroom under `MAX_FRAME_LEN` for hex and JSON.
+/// Longest chat text accepted, measured JSON-escaped (a control character
+/// becomes 6 bytes), leaving headroom under `MAX_FRAME_LEN` for hex and JSON.
 pub const MAX_TEXT_LEN: usize = MAX_FRAME_LEN / 8;
 /// Connected peers beyond this are refused, so a hostile host can't exhaust file descriptors.
 pub const MAX_PEERS: usize = 64;
@@ -317,7 +318,8 @@ impl Node {
     }
 
     fn check_text(&self, text: &str) -> bool {
-        if text.len() > MAX_TEXT_LEN {
+        let escaped = serde_json::to_string(text).expect("strings always serialize");
+        if escaped.len() - 2 > MAX_TEXT_LEN {
             self.emit(Event::Error(format!("message too long (max {MAX_TEXT_LEN} bytes)")));
             return false;
         }
