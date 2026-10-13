@@ -77,6 +77,11 @@ impl Store {
         }
     }
 
+    /// Views no conversation (the TUI's corvo tab), so every message counts as unread.
+    pub fn clear_current(&mut self) {
+        self.current = None;
+    }
+
     pub fn is_online(&self, nick: &str) -> bool {
         self.online.contains(nick)
     }

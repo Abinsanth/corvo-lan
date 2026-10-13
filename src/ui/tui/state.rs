@@ -392,7 +392,10 @@ impl TuiState {
 
     pub fn select_tab(&mut self, session: &mut Session, idx: usize) {
         match tabs(session).get(idx) {
-            Some(Tab::Status) => self.on_status = true,
+            Some(Tab::Status) => {
+                session.store.clear_current();
+                self.on_status = true;
+            }
             Some(Tab::Conv(conv)) => {
                 session.store.switch(conv.clone());
                 self.on_status = false;
@@ -603,6 +606,19 @@ mod tests {
         assert_eq!(t.current_tab(&s), 2);
         t.select_tab(&mut s, 9);
         assert_eq!(t.current_tab(&s), 2, "out of range does nothing");
+    }
+
+    #[test]
+    fn messages_count_as_unread_while_on_the_corvo_tab() {
+        let mut s = session_with_tabs();
+        let mut t = TuiState::new(false);
+        t.select_tab(&mut s, 2);
+        t.select_tab(&mut s, 0);
+        let bob = Conv::Dm("bobRoger".into());
+        s.on_event(&Event::Message { conv: bob.clone(), from: "bobRoger".into(), text: "hi".into(), ts: 0 }, 0);
+        assert_eq!(s.store.get(&bob).unwrap().unread, 1);
+        assert_eq!(s.store.current(), None);
+        assert_eq!(t.current_tab(&s), 0);
     }
 
     #[test]
