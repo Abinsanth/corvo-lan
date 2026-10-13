@@ -25,6 +25,10 @@ pub enum Input {
     Rooms,
     Chats,
     History(usize),
+    /// `/update` checks; `/update yes` installs the newest release.
+    Update {
+        confirm: bool,
+    },
     Who,
     Help,
     Quit,
@@ -82,6 +86,11 @@ pub fn parse_line(line: &str) -> Input {
                 _ => Input::Error("usage: /history [n]".into()),
             },
             _ => Input::Error("usage: /history [n]".into()),
+        },
+        "update" => match words.as_slice() {
+            [] => Input::Update { confirm: false },
+            ["yes"] => Input::Update { confirm: true },
+            _ => Input::Error("usage: /update [yes]".into()),
         },
         "rooms" => Input::Rooms,
         "chats" => Input::Chats,
@@ -156,5 +165,13 @@ mod tests {
         assert_eq!(parse_line("/exit"), Input::Quit);
         assert_eq!(parse_line("/nick bob"), err("names are assigned by the system and can't be changed"));
         assert_eq!(parse_line("/dance"), err("unknown command /dance, try /help"));
+    }
+
+    #[test]
+    fn update_checks_or_installs() {
+        assert_eq!(parse_line("/update"), Input::Update { confirm: false });
+        assert_eq!(parse_line("/update yes"), Input::Update { confirm: true });
+        assert_eq!(parse_line("/update now"), err("usage: /update [yes]"));
+        assert_eq!(parse_line("/update yes please"), err("usage: /update [yes]"));
     }
 }

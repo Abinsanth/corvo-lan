@@ -49,5 +49,5 @@ async fn main() -> anyhow::Result<()> {
         fixed_word: None,
     })
     .await?;
-    ui::line::run(handle).await
+    ui::line::run(handle, true).await
 }
