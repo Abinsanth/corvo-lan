@@ -1,6 +1,6 @@
 [package]
 name = "lan-chat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -30,3 +30,7 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# Smaller downloads for the release binaries.
+[profile.release]
+strip = true
