@@ -319,10 +319,10 @@ impl Node {
 
     /// Queues `frame` without waiting; a peer whose outbox is full misses it.
     fn send_to(&self, id: PeerId, frame: Frame) {
-        if let Some(p) = self.peers.get(&id) {
-            if let Err(e) = p.out.try_send(frame) {
-                warn!(%id, "dropping frame for slow or closed peer: {e}");
-            }
+        if let Some(p) = self.peers.get(&id)
+            && let Err(e) = p.out.try_send(frame)
+        {
+            warn!(%id, "dropping frame for slow or closed peer: {e}");
         }
     }
 

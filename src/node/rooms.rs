@@ -252,10 +252,10 @@ impl Node {
     }
 
     pub(super) fn on_join_timeout(&mut self, id: RoomId, attempt: Attempt) {
-        if self.rooms.joining.get(&id).is_some_and(|p| p.attempt == attempt && !p.settling) {
-            if let Some(p) = self.rooms.joining.remove(&id) {
-                self.emit(Event::Error(format!("no room #{} with that key", p.name)));
-            }
+        if self.rooms.joining.get(&id).is_some_and(|p| p.attempt == attempt && !p.settling)
+            && let Some(p) = self.rooms.joining.remove(&id)
+        {
+            self.emit(Event::Error(format!("no room #{} with that key", p.name)));
         }
     }
 

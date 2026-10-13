@@ -149,10 +149,10 @@ impl ReplayGuard {
         if ts.abs_diff(now) > MAX_SKEW_MS || self.seen.contains(&nonce) {
             return false;
         }
-        if self.order.len() == REPLAY_WINDOW {
-            if let Some(old) = self.order.pop_front() {
-                self.seen.remove(&old);
-            }
+        if self.order.len() == REPLAY_WINDOW
+            && let Some(old) = self.order.pop_front()
+        {
+            self.seen.remove(&old);
         }
         self.order.push_back(nonce);
         self.seen.insert(nonce);
@@ -165,7 +165,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 }
 
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok())).collect()
