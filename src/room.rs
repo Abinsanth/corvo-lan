@@ -47,8 +47,13 @@ pub enum RoomBody {
     Chat { text: String },
     /// "Is anyone here?" from someone joining.
     Probe { nonce: String },
-    /// Presence: the reply to a probe, and every member's periodic heartbeat.
-    Here { name: String },
+    /// Presence. Answers to a probe echo its nonce, which is what proves the
+    /// sender is live rather than a replay; periodic heartbeats carry `None`.
+    Here {
+        name: String,
+        #[serde(default)]
+        echo: Option<String>,
+    },
     Leave,
 }
 

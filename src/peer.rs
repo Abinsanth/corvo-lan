@@ -130,7 +130,7 @@ async fn handshake(stream: &mut TcpStream, me: &Me) -> anyhow::Result<(PeerId, S
     match reply {
         Frame::Hello { v, .. } if v != PROTOCOL_VERSION => bail!("unsupported protocol version {v}"),
         Frame::Hello { id, .. } if id == me.id => bail!("connected to myself"),
-        Frame::Hello { nick, .. } if names::validate_nick(&nick).is_err() => bail!("invalid nick {nick:?}"),
+        Frame::Hello { nick, .. } if !names::is_valid_nick(&nick) => bail!("invalid nick {nick:?}"),
         Frame::Hello { id, nick, .. } => Ok((id, nick)),
         other => bail!("expected hello, got {other:?}"),
     }
@@ -245,7 +245,7 @@ mod tests {
     async fn writer_gives_up_on_a_peer_that_stops_reading() {
         let (mut ours, _theirs) = tokio::io::duplex(64); // the other end is never read
         let (tx, rx) = mpsc::channel(4);
-        tx.send(Frame::Chat { text: "x".repeat(1000), ts: 0 }).await.unwrap();
+        tx.send(Frame::Direct { text: "x".repeat(1000), ts: 0 }).await.unwrap();
         assert_eq!(write_loop(&mut ours, rx).await, WriterExit::Stalled);
     }
 
@@ -253,12 +253,12 @@ mod tests {
     async fn writer_stops_right_after_bye() {
         let (mut ours, mut theirs) = tokio::io::duplex(4096);
         let (tx, rx) = mpsc::channel(4);
-        tx.send(Frame::Chat { text: "hi".into(), ts: 0 }).await.unwrap();
+        tx.send(Frame::Direct { text: "hi".into(), ts: 0 }).await.unwrap();
         tx.send(Frame::Bye).await.unwrap();
-        tx.send(Frame::Chat { text: "after bye".into(), ts: 0 }).await.unwrap();
+        tx.send(Frame::Direct { text: "after bye".into(), ts: 0 }).await.unwrap();
         assert_eq!(write_loop(&mut ours, rx).await, WriterExit::Bye);
         drop(ours);
-        assert_eq!(read_frame(&mut theirs).await.unwrap(), Frame::Chat { text: "hi".into(), ts: 0 });
+        assert_eq!(read_frame(&mut theirs).await.unwrap(), Frame::Direct { text: "hi".into(), ts: 0 });
         assert_eq!(read_frame(&mut theirs).await.unwrap(), Frame::Bye);
         assert!(read_frame(&mut theirs).await.is_err()); // closed, nothing after Bye
     }
@@ -275,7 +275,7 @@ mod tests {
     async fn read_loop_forwards_frames_until_the_peer_closes() {
         let (mut ours, mut theirs) = tokio::io::duplex(4096);
         let (node_tx, mut node_rx) = mpsc::channel(4);
-        let chat = Frame::Chat { text: "late".into(), ts: 0 };
+        let chat = Frame::Direct { text: "late".into(), ts: 0 };
         write_frame(&mut theirs, &Frame::Ping).await.unwrap();
         write_frame(&mut theirs, &chat).await.unwrap();
         drop(theirs);

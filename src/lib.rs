@@ -1,4 +1,5 @@
 pub mod api;
+pub mod convo;
 pub mod discovery;
 pub mod names;
 pub mod node;

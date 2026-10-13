@@ -11,7 +11,7 @@ use lan_chat::ui;
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// Your display name (default: $USER)
+    /// Base of your name, 1-9 letters or digits (default: $USER); the system adds a word
     #[arg(long)]
     nick: Option<String>,
     /// TCP port to listen on (0 = pick a free one)
@@ -37,17 +37,19 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
-    let nick = args
+    let base = args
         .nick
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "anon".into());
-    names::validate_nick(&nick).map_err(|e| anyhow!("invalid nick {nick:?}: {e} (pass --nick)"))?;
+    names::validate_base(&base).map_err(|e| anyhow!("invalid --nick {base:?}: {e}"))?;
 
     let handle = node::start(NodeConfig {
-        nick,
+        base,
         listen: SocketAddr::from(([0, 0, 0, 0], args.port)),
         discovery: true,
         manual_peers: args.peers,
+        name_wait: node::NAME_WAIT,
+        fixed_word: None,
     })
     .await?;
     ui::line::run(handle).await
