@@ -14,7 +14,7 @@ use tracing::debug;
 
 use crate::api::LeaveReason;
 use crate::names;
-use crate::node::NodeMsg;
+use crate::node::{ConnKey, NodeMsg};
 use crate::protocol::{read_frame, write_frame, Frame, PeerId, PROTOCOL_VERSION};
 
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,6 +80,8 @@ async fn handle(
         }
     };
 
+    let dialer = if outbound { stream.local_addr() } else { stream.peer_addr() };
+    let key = ConnKey { outbound, dialer_port: dialer.map(|a| a.port()).unwrap_or(0) };
     let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
     let (out_tx, out_rx) = mpsc::channel(OUTBOX_SIZE);
     let (accept_tx, accept_rx) = oneshot::channel();
@@ -88,7 +90,7 @@ async fn handle(
         id,
         nick,
         addr,
-        outbound,
+        key,
         dialed_as: expected,
         out: out_tx,
         accept: accept_tx,

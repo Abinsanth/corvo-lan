@@ -52,7 +52,7 @@ pub enum NodeMsg {
         id: PeerId,
         nick: String,
         addr: SocketAddr,
-        outbound: bool,
+        key: ConnKey,
         dialed_as: Option<PeerId>,
         out: mpsc::Sender<Frame>,
         /// Node replies `true` to keep the connection, `false` to close it.
@@ -68,18 +68,31 @@ pub fn should_dial(me: PeerId, them: PeerId) -> bool {
     me < them
 }
 
+/// What both ends of a TCP connection know about it, used to break duplicate ties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnKey {
+    /// We dialed this connection.
+    pub outbound: bool,
+    /// Source port of the dialing side; the same number on both ends.
+    pub dialer_port: u16,
+}
+
 /// When two connections to the same peer exist, both sides keep the one
-/// dialed by the lower id. `outbound` = we dialed that connection.
-pub fn keep_new_connection(me: PeerId, them: PeerId, existing_outbound: bool, new_outbound: bool) -> bool {
+/// dialed by the lower id. If both were dialed the same way, both keep the
+/// lower dialer port, so the choice never depends on arrival order.
+pub fn keep_new_connection(me: PeerId, them: PeerId, existing: ConnKey, new: ConnKey) -> bool {
+    if existing.outbound == new.outbound {
+        return new.dialer_port < existing.dialer_port;
+    }
     let preferred_outbound = me < them;
-    new_outbound == preferred_outbound && existing_outbound != preferred_outbound
+    new.outbound == preferred_outbound
 }
 
 struct PeerEntry {
     conn: ConnId,
     nick: String,
     addr: SocketAddr,
-    outbound: bool,
+    key: ConnKey,
     out: mpsc::Sender<Frame>,
 }
 
@@ -277,12 +290,12 @@ impl Node {
     fn handle_msg(&mut self, msg: NodeMsg) {
         match msg {
             NodeMsg::Discovered(s) => self.on_discovered(s),
-            NodeMsg::PeerConnected { conn, id, nick, addr, outbound, dialed_as, out, accept } => {
+            NodeMsg::PeerConnected { conn, id, nick, addr, key, dialed_as, out, accept } => {
                 if let Some(expected) = dialed_as {
                     self.dialing.remove(&expected);
                     self.backoff.remove(&expected);
                 }
-                let keep = self.on_connected(PeerEntry { conn, nick, addr, outbound, out }, id);
+                let keep = self.on_connected(PeerEntry { conn, nick, addr, key, out }, id);
                 let _ = accept.send(keep);
             }
             NodeMsg::PeerFrame { conn, id, frame } => self.on_frame(conn, id, frame),
@@ -338,7 +351,7 @@ impl Node {
                 true
             }
             Some(existing) => {
-                if keep_new_connection(self.id, id, existing.outbound, entry.outbound) {
+                if keep_new_connection(self.id, id, existing.key, entry.key) {
                     // Dropping the old sender closes the old connection quietly.
                     self.peers.insert(id, entry);
                     true
@@ -415,10 +428,15 @@ mod tests {
 
         /// Simulates a peer task completing its handshake; returns the Node's verdict.
         fn connect(&mut self, id: PeerId, nick: &str, outbound: bool) -> bool {
+            let port = 40000 + self.next_conn as u16;
+            self.connect_key(id, nick, ConnKey { outbound, dialer_port: port })
+        }
+
+        fn connect_key(&mut self, id: PeerId, nick: &str, key: ConnKey) -> bool {
             let (out, rx) = mpsc::channel(8);
             let conn = self.next_conn;
             self.next_conn += 1;
-            let entry = PeerEntry { conn, nick: nick.into(), addr: "127.0.0.1:1".parse().unwrap(), outbound, out };
+            let entry = PeerEntry { conn, nick: nick.into(), addr: "127.0.0.1:1".parse().unwrap(), key, out };
             let keep = self.node.on_connected(entry, id);
             if keep {
                 self.outboxes.insert(id, rx);
@@ -442,23 +460,38 @@ mod tests {
         assert!(!should_dial(BOB, ME));
     }
 
+    fn out(dialer_port: u16) -> ConnKey {
+        ConnKey { outbound: true, dialer_port }
+    }
+
+    fn inb(dialer_port: u16) -> ConnKey {
+        ConnKey { outbound: false, dialer_port }
+    }
+
     #[test]
-    fn both_sides_agree_on_which_duplicate_to_keep() {
+    fn opposite_direction_duplicates_keep_the_lower_ids_dial() {
         // ME < BOB, so the connection ME dialed (outbound for ME, inbound for BOB) wins.
-        assert!(keep_new_connection(ME, BOB, false, true));
-        assert!(!keep_new_connection(ME, BOB, true, false));
-        assert!(keep_new_connection(BOB, ME, true, false));
-        assert!(!keep_new_connection(BOB, ME, false, true));
-        // Same direction twice: keep the existing one.
-        assert!(!keep_new_connection(ME, BOB, true, true));
+        assert!(keep_new_connection(ME, BOB, inb(1), out(2)));
+        assert!(!keep_new_connection(ME, BOB, out(2), inb(1)));
+        assert!(keep_new_connection(BOB, ME, out(1), inb(2)));
+        assert!(!keep_new_connection(BOB, ME, inb(2), out(1)));
+    }
+
+    #[test]
+    fn same_direction_duplicates_agree_even_when_seen_in_opposite_order() {
+        // ME dialed BOB twice (e.g. --peer racing discovery) from ports 5000 and 6000.
+        // ME finished 5000 first; BOB finished 6000 first. Both must settle on 5000.
+        assert!(!keep_new_connection(ME, BOB, out(5000), out(6000)));
+        assert!(keep_new_connection(BOB, ME, inb(6000), inb(5000)));
     }
 
     #[test]
     fn duplicate_connection_does_not_rejoin() {
         let mut h = Harness::new();
-        assert!(h.connect(BOB, "bob", false));
-        assert!(h.connect(BOB, "bob", true)); // preferred direction replaces
-        assert!(!h.connect(BOB, "bob", true)); // same direction rejected
+        assert!(h.connect_key(BOB, "bob", inb(7000)));
+        assert!(h.connect_key(BOB, "bob", out(9000))); // preferred direction replaces
+        assert!(h.connect_key(BOB, "bob", out(8000))); // same direction, lower port replaces
+        assert!(!h.connect_key(BOB, "bob", out(8500))); // same direction, higher port rejected
         let joins = h.events().into_iter().filter(|e| matches!(e, Event::PeerJoined { .. })).count();
         assert_eq!(joins, 1);
     }
