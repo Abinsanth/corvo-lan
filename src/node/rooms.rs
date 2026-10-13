@@ -1,6 +1,11 @@
 //! Private-room state and handlers. Knowing a room's name and key is
 //! membership: every room frame goes to every peer, and only members can
 //! recognise (`room_id`) and read it. See `crate::room` for the crypto.
+//!
+//! Peer ids are self-claimed until v0.4, so a non-member could replay frames
+//! it captured under a member's id. A sender therefore only becomes a member
+//! after answering a fresh probe (its `Here` echoes our nonce), and from then
+//! on frames older than that sender's floor are dropped.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -22,6 +27,15 @@ pub const JOIN_SETTLE: Duration = Duration::from_millis(300);
 pub const HERE_INTERVAL: Duration = Duration::from_secs(5);
 /// A member silent this long is considered gone.
 pub const MEMBER_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long an unknown sender has to answer our challenge.
+pub const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Frames from an unproven sender held while we wait for its answer.
+const MAX_BUFFERED: usize = 32;
+/// At proof time, accept that sender's frames stamped up to this much earlier
+/// (its first messages race its answer to our challenge).
+const PROOF_GRACE_MS: u64 = 3_000;
+/// After that, a sender's floor trails its newest frame by this much.
+const REORDER_GRACE_MS: u64 = 2_000;
 
 /// What a worker thread was deriving keys for.
 pub enum Job {
@@ -29,11 +43,25 @@ pub enum Job {
     Join { name: String },
 }
 
+struct Member {
+    seen: Instant,
+    /// Frames from this member stamped earlier than this are replays.
+    floor: u64,
+}
+
+/// We asked an unknown sender to prove it's live; its frames wait here.
+struct Challenge {
+    nonce: String,
+    started: Instant,
+    buffered: Vec<RoomEnvelope>,
+}
+
 struct Room {
     name: String,
     keys: RoomKeys,
-    /// Other members and when we last heard from them.
-    members: HashMap<PeerId, Instant>,
+    /// Other members, all proven.
+    members: HashMap<PeerId, Member>,
+    challenges: HashMap<PeerId, Challenge>,
     replay: ReplayGuard,
     told_alone: bool,
 }
@@ -41,7 +69,10 @@ struct Room {
 struct PendingJoin {
     name: String,
     keys: RoomKeys,
-    replies: HashSet<PeerId>,
+    /// Our probe; only answers echoing it count.
+    probe: String,
+    /// Who answered, and the timestamp of their answer.
+    replies: HashMap<PeerId, u64>,
     settling: bool,
     replay: ReplayGuard,
 }
@@ -71,6 +102,14 @@ impl Rooms {
     fn id_of(&self, name: &str) -> Option<RoomId> {
         self.joined.iter().find(|(_, r)| r.name == name).map(|(id, _)| *id)
     }
+}
+
+fn fresh_nonce() -> String {
+    room::to_hex(&rand::random::<[u8; 16]>())
+}
+
+fn skewed(ts: u64) -> bool {
+    ts.abs_diff(now_millis()) > room::MAX_SKEW_MS
 }
 
 impl Node {
@@ -147,6 +186,7 @@ impl Node {
                     name: name.clone(),
                     keys: keys.clone(),
                     members: HashMap::new(),
+                    challenges: HashMap::new(),
                     replay: ReplayGuard::default(),
                     told_alone: false,
                 };
@@ -154,11 +194,17 @@ impl Node {
                 self.emit(Event::RoomCreated { name, key });
             }
             Job::Join { name } => {
-                let probe = RoomBody::Probe { nonce: room::to_hex(&rand::random::<[u8; 16]>()) };
-                self.broadcast(self.seal(&keys, probe));
+                let probe = fresh_nonce();
+                self.broadcast(self.seal(&keys, RoomBody::Probe { nonce: probe.clone() }));
                 let id = keys.id;
-                let pending =
-                    PendingJoin { name, keys, replies: HashSet::new(), settling: false, replay: ReplayGuard::default() };
+                let pending = PendingJoin {
+                    name,
+                    keys,
+                    probe,
+                    replies: HashMap::new(),
+                    settling: false,
+                    replay: ReplayGuard::default(),
+                };
                 self.rooms.joining.insert(id, pending);
                 self.after(JOIN_WAIT, NodeMsg::JoinTimeout(id));
             }
@@ -170,16 +216,21 @@ impl Node {
             return;
         };
         let now = Instant::now();
-        let mut members: Vec<String> = p.replies.iter().filter_map(|m| self.nick_of(*m)).collect();
+        let mut members: Vec<String> = p.replies.keys().filter_map(|m| self.nick_of(*m)).collect();
         members.sort();
         let room = Room {
             name: p.name.clone(),
             keys: p.keys,
-            members: p.replies.into_iter().map(|m| (m, now)).collect(),
+            members: p
+                .replies
+                .into_iter()
+                .map(|(m, ts)| (m, Member { seen: now, floor: ts.saturating_sub(PROOF_GRACE_MS) }))
+                .collect(),
+            challenges: HashMap::new(),
             replay: p.replay,
             told_alone: false,
         };
-        self.broadcast(self.seal(&room.keys, RoomBody::Here { name: room.name.clone() }));
+        self.broadcast(self.seal(&room.keys, RoomBody::Here { name: room.name.clone(), echo: None }));
         self.rooms.joined.insert(id, room);
         self.emit(Event::RoomJoined { name: p.name, members });
     }
@@ -243,26 +294,10 @@ impl Node {
                 return;
             }
             if !room.replay.accept(nonce, env.ts, now_millis()) {
-                debug!(%from, "stale or replayed room frame");
+                debug!(%from, "replayed room frame");
                 return;
             }
-            let name = room.name.clone();
-            match env.body {
-                RoomBody::Chat { text } if text.len() > MAX_TEXT_LEN => {}
-                RoomBody::Chat { text } => {
-                    self.mark_present(id, from, now);
-                    if let Some(nick) = self.nick_of(from) {
-                        self.emit(Event::Message { conv: Conv::Room(name), from: nick, text, ts: now_millis() });
-                    }
-                }
-                RoomBody::Probe { .. } => {
-                    let keys = self.rooms.joined[&id].keys.clone();
-                    self.send_to(from, self.seal(&keys, RoomBody::Here { name }));
-                }
-                RoomBody::Here { name: claimed } if claimed == name => self.mark_present(id, from, now),
-                RoomBody::Here { .. } => {}
-                RoomBody::Leave => self.drop_member(id, from),
-            }
+            self.on_room_envelope(id, from, env, now);
         } else if let Some(p) = self.rooms.joining.get_mut(&id) {
             let Some((env, nonce)) = room::open(&p.keys, from, nonce, ct) else {
                 return;
@@ -274,12 +309,98 @@ impl Node {
             if !p.replay.accept(nonce, env.ts, now_millis()) {
                 return;
             }
-            if matches!(&env.body, RoomBody::Here { name } if *name == p.name) {
-                p.replies.insert(from);
+            let answers_us = matches!(&env.body, RoomBody::Here { name, echo: Some(e) } if *name == p.name && *e == p.probe);
+            if answers_us {
+                p.replies.insert(from, env.ts);
                 if !std::mem::replace(&mut p.settling, true) {
-                    self.after(super::JOIN_SETTLE, NodeMsg::JoinSettled(id));
+                    self.after(JOIN_SETTLE, NodeMsg::JoinSettled(id));
                 }
             }
+        }
+    }
+
+    /// An opened, fresh, non-duplicate envelope for joined room `id`.
+    fn on_room_envelope(&mut self, id: RoomId, from: PeerId, env: RoomEnvelope, now: Instant) {
+        let Some(room) = self.rooms.joined.get_mut(&id) else {
+            return;
+        };
+        // Anyone may probe, member or not: answer privately, echoing their nonce.
+        if let RoomBody::Probe { nonce } = &env.body {
+            let reply = RoomBody::Here { name: room.name.clone(), echo: Some(nonce.clone()) };
+            let keys = room.keys.clone();
+            self.send_to(from, self.seal(&keys, reply));
+            return;
+        }
+        if room.members.contains_key(&from) {
+            self.on_member_envelope(id, from, env, now);
+            return;
+        }
+        // Unknown sender: is this the answer to our challenge?
+        let proven = matches!(
+            (&env.body, room.challenges.get(&from)),
+            (RoomBody::Here { name, echo: Some(e) }, Some(c)) if *name == room.name && *e == c.nonce
+        );
+        if proven {
+            let mut buffered = room.challenges.remove(&from).map(|c| c.buffered).unwrap_or_default();
+            room.members.insert(from, Member { seen: now, floor: env.ts.saturating_sub(PROOF_GRACE_MS) });
+            let name = room.name.clone();
+            if let Some(nick) = self.nick_of(from) {
+                self.emit(Event::MemberJoined { room: name, nick });
+            }
+            buffered.sort_by_key(|e| e.ts);
+            for env in buffered {
+                self.on_member_envelope(id, from, env, now);
+            }
+            return;
+        }
+        if matches!(env.body, RoomBody::Leave) {
+            room.challenges.remove(&from);
+            return;
+        }
+        // Challenge it (once) and hold its chat until it answers.
+        let challenge = match room.challenges.get_mut(&from) {
+            Some(c) => c,
+            None => {
+                let nonce = fresh_nonce();
+                let probe = RoomBody::Probe { nonce: nonce.clone() };
+                let frame = room::seal(&room.keys, self.id, &RoomEnvelope { ts: now_millis(), body: probe });
+                room.challenges.insert(from, Challenge { nonce, started: now, buffered: Vec::new() });
+                self.send_to(from, frame);
+                match self.rooms.joined.get_mut(&id).and_then(|r| r.challenges.get_mut(&from)) {
+                    Some(c) => c,
+                    None => return,
+                }
+            }
+        };
+        if matches!(env.body, RoomBody::Chat { .. }) && challenge.buffered.len() < MAX_BUFFERED {
+            challenge.buffered.push(env);
+        }
+    }
+
+    /// An envelope from a proven member: enforce its floor, then act on it.
+    fn on_member_envelope(&mut self, id: RoomId, from: PeerId, env: RoomEnvelope, now: Instant) {
+        let Some(room) = self.rooms.joined.get_mut(&id) else {
+            return;
+        };
+        let Some(member) = room.members.get_mut(&from) else {
+            return;
+        };
+        if env.ts < member.floor {
+            debug!(%from, "room frame older than the sender's floor");
+            return;
+        }
+        member.floor = member.floor.max(env.ts.saturating_sub(REORDER_GRACE_MS));
+        member.seen = now;
+        let name = room.name.clone();
+        match env.body {
+            RoomBody::Chat { text } if text.len() > MAX_TEXT_LEN => {}
+            RoomBody::Chat { text } => {
+                if let Some(nick) = self.nick_of(from) {
+                    self.emit(Event::Message { conv: Conv::Room(name), from: nick, text, ts: now_millis() });
+                }
+            }
+            RoomBody::Leave => self.drop_member(id, from),
+            RoomBody::Here { .. } | RoomBody::Probe { .. } => {}
         }
     }
 
@@ -295,23 +416,11 @@ impl Node {
         }
     }
 
-    fn mark_present(&mut self, id: RoomId, member: PeerId, now: Instant) {
-        let Some(nick) = self.nick_of(member) else {
-            return;
-        };
-        let Some(room) = self.rooms.joined.get_mut(&id) else {
-            return;
-        };
-        if room.members.insert(member, now).is_none() {
-            let room = room.name.clone();
-            self.emit(Event::MemberJoined { room, nick });
-        }
-    }
-
     fn drop_member(&mut self, id: RoomId, member: PeerId) {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
+        room.challenges.remove(&member);
         if room.members.remove(&member).is_some() {
             let room = room.name.clone();
             if let Some(nick) = self.nick_of(member) {
@@ -331,7 +440,8 @@ impl Node {
         }
     }
 
-    /// Every second: expire silent members; every `HERE_INTERVAL`: announce presence.
+    /// Every second: expire silent members and unanswered challenges; every
+    /// `HERE_INTERVAL`: announce presence.
     pub(super) fn on_tick(&mut self, now: Instant) {
         let expired: Vec<(RoomId, PeerId)> = self
             .rooms
@@ -340,29 +450,28 @@ impl Node {
             .flat_map(|(id, r)| {
                 r.members
                     .iter()
-                    .filter(|(_, seen)| now.saturating_duration_since(**seen) >= MEMBER_TIMEOUT)
-                    .map(|(m, _)| (*id, *m))
+                    .filter(|(_, m)| now.saturating_duration_since(m.seen) >= MEMBER_TIMEOUT)
+                    .map(|(p, _)| (*id, *p))
             })
             .collect();
         for (id, member) in expired {
             self.drop_member(id, member);
         }
+        for room in self.rooms.joined.values_mut() {
+            room.challenges.retain(|_, c| now.saturating_duration_since(c.started) < CHALLENGE_TIMEOUT);
+        }
         if self.rooms.last_here.is_none_or(|t| now.saturating_duration_since(t) >= HERE_INTERVAL) {
             self.rooms.last_here = Some(now);
             for room in self.rooms.joined.values() {
-                self.broadcast(self.seal(&room.keys, RoomBody::Here { name: room.name.clone() }));
+                self.broadcast(self.seal(&room.keys, RoomBody::Here { name: room.name.clone(), echo: None }));
             }
         }
     }
 }
 
-fn skewed(ts: u64) -> bool {
-    ts.abs_diff(now_millis()) > room::MAX_SKEW_MS
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{Harness, BOB, CAROL};
+    use super::super::tests::{Harness, BOB, CAROL, ME};
     use super::*;
     use crate::api::{Command, Target};
     use crate::protocol::Frame;
@@ -374,9 +483,17 @@ mod tests {
         room::derive(NAME, KEY)
     }
 
-    /// A room frame as `from` would send it.
+    fn here(name: &str, echo: Option<&str>) -> RoomBody {
+        RoomBody::Here { name: name.into(), echo: echo.map(String::from) }
+    }
+
+    /// A room frame as `from` would send it, stamped `ts`.
+    fn frame_at(from: PeerId, keys: &RoomKeys, ts: u64, body: RoomBody) -> Frame {
+        room::seal(keys, from, &RoomEnvelope { ts, body })
+    }
+
     fn frame_from(from: PeerId, keys: &RoomKeys, body: RoomBody) -> Frame {
-        room::seal(keys, from, &RoomEnvelope { ts: now_millis(), body })
+        frame_at(from, keys, now_millis(), body)
     }
 
     fn deliver(h: &mut Harness, from: PeerId, frame: Frame) {
@@ -384,9 +501,16 @@ mod tests {
         h.node.on_frame(conn, from, frame);
     }
 
-    fn open_body(keys: &RoomKeys, sender: PeerId, frame: &Frame) -> RoomBody {
+    fn open_body(keys: &RoomKeys, frame: &Frame) -> RoomBody {
         let Frame::Room { nonce, ct, .. } = frame else { panic!("not a room frame: {frame:?}") };
-        room::open(keys, sender, nonce, ct).expect("opens").0.body
+        room::open(keys, ME, nonce, ct).expect("opens").0.body
+    }
+
+    fn probe_nonce(keys: &RoomKeys, frame: &Frame) -> String {
+        match open_body(keys, frame) {
+            RoomBody::Probe { nonce } => nonce,
+            other => panic!("expected a probe, got {other:?}"),
+        }
     }
 
     fn with_peers() -> Harness {
@@ -397,23 +521,33 @@ mod tests {
         h
     }
 
-    async fn create(h: &mut Harness) -> String {
+    async fn create(h: &mut Harness) -> (String, RoomKeys) {
         h.node.handle_command(Command::CreateRoom { base: "cat".into(), key_part: "123".into() });
         h.pump().await;
-        match h.events().as_slice() {
+        let name = match h.events().as_slice() {
             [Event::RoomCreated { name, key }] => {
                 assert!(name.starts_with("cat") && names::is_valid_room(name), "{name}");
                 assert!(key.starts_with("123-") && room::validate_key(key).is_ok(), "{key}");
                 name.clone()
             }
             other => panic!("expected RoomCreated, got {other:?}"),
-        }
+        };
+        let id = h.node.rooms.id_of(&name).unwrap();
+        let keys = h.node.rooms.joined[&id].keys.clone();
+        (name, keys)
+    }
+
+    /// `member` announces itself, answers our challenge, and becomes a member.
+    fn verify(h: &mut Harness, member: PeerId, name: &str, keys: &RoomKeys) {
+        deliver(h, member, frame_from(member, keys, here(name, None)));
+        let challenge = probe_nonce(keys, h.sent(member).last().expect("challenge sent"));
+        deliver(h, member, frame_from(member, keys, here(name, Some(&challenge))));
     }
 
     #[tokio::test]
     async fn creating_a_room_makes_us_its_only_member() {
         let mut h = with_peers();
-        let name = create(&mut h).await;
+        let (name, _) = create(&mut h).await;
         h.node.handle_command(Command::Send { to: Target::Room(name.clone()), text: "anyone?".into() });
         // Sent to everyone (only members can read it), recorded, and we're told we're alone.
         assert!(matches!(h.sent(BOB).as_slice(), [Frame::Room { .. }]));
@@ -444,23 +578,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn joining_collects_members_then_announces_itself() {
+    async fn joining_collects_members_that_answer_our_probe() {
         let mut h = with_peers();
         let keys = keys();
         h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: KEY.into() });
         h.pump().await; // Derived
-        // The probe goes to everyone.
-        assert!(matches!(open_body(&keys, crate::node::tests::ME, &h.sent(BOB)[0]), RoomBody::Probe { .. }));
+        let nonce = probe_nonce(&keys, &h.sent(BOB)[0]);
         h.sent(CAROL);
-        // Both are members and answer.
-        deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Here { name: NAME.into() }));
-        deliver(&mut h, CAROL, frame_from(CAROL, &keys, RoomBody::Here { name: NAME.into() }));
+        // Both are members and answer, echoing our probe.
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(NAME, Some(&nonce))));
+        deliver(&mut h, CAROL, frame_from(CAROL, &keys, here(NAME, Some(&nonce))));
         h.pump().await; // JoinSettled (the JoinTimeout comes later and is ignored)
         assert_eq!(
             h.events(),
             vec![Event::RoomJoined { name: NAME.into(), members: vec!["bobRoger".into(), "carolFox".into()] }]
         );
-        assert!(matches!(open_body(&keys, crate::node::tests::ME, &h.sent(BOB)[0]), RoomBody::Here { .. }));
+        assert!(matches!(open_body(&keys, &h.sent(BOB)[0]), RoomBody::Here { echo: None, .. }));
         h.pump().await; // JoinTimeout: no effect now
         assert!(h.events().is_empty());
 
@@ -473,31 +606,48 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn replayed_presence_cannot_fake_a_member_for_a_joiner() {
+        let mut h = with_peers();
+        let keys = keys();
+        h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: KEY.into() });
+        h.pump().await; // Derived
+        // Captured Here frames: a heartbeat (no echo) and an answer to someone else's probe.
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(NAME, None)));
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(NAME, Some("00112233"))));
+        h.pump().await; // JoinTimeout
+        assert_eq!(h.events(), vec![Event::Error(format!("no room #{NAME} with that key"))]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn joining_with_a_wrong_key_times_out() {
         let mut h = with_peers();
         h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: "999-k7m9xq".into() });
         h.pump().await; // Derived
         // bob is in the real room; his Here is under the real key, so we can't read it.
-        deliver(&mut h, BOB, frame_from(BOB, &keys(), RoomBody::Here { name: NAME.into() }));
+        deliver(&mut h, BOB, frame_from(BOB, &keys(), here(NAME, None)));
         h.pump().await; // JoinTimeout
         assert_eq!(h.events(), vec![Event::Error(format!("no room #{NAME} with that key"))]);
     }
 
     #[tokio::test]
-    async fn members_answer_probes_privately_and_track_presence() {
+    async fn members_answer_probes_privately_and_newcomers_must_prove_themselves() {
         let mut h = with_peers();
-        let name = create(&mut h).await;
-        let id = h.node.rooms.id_of(&name).unwrap();
-        let keys = h.node.rooms.joined[&id].keys.clone();
+        let (name, keys) = create(&mut h).await;
 
         deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Probe { nonce: "00".into() }));
-        assert!(matches!(open_body(&keys, crate::node::tests::ME, &h.sent(BOB)[0]), RoomBody::Here { name: n } if n == name));
+        assert_eq!(open_body(&keys, &h.sent(BOB)[0]), here(&name, Some("00")));
         assert!(h.sent(CAROL).is_empty(), "the reply goes only to the prober");
         assert!(h.events().is_empty(), "probing doesn't make you a member");
 
-        deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Here { name: name.clone() }));
+        // A heartbeat from someone we don't know yet gets a private challenge, not membership.
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, None)));
+        let challenge = probe_nonce(&keys, &h.sent(BOB)[0]);
+        assert!(h.events().is_empty());
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, Some("wrong"))));
+        assert!(h.events().is_empty(), "a wrong echo proves nothing");
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, Some(&challenge))));
         assert_eq!(h.events(), vec![Event::MemberJoined { room: name.clone(), nick: "bobRoger".into() }]);
-        deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Here { name: name.clone() }));
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, None)));
         assert!(h.events().is_empty(), "already a member");
 
         deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Leave));
@@ -505,21 +655,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_newcomers_first_messages_wait_for_its_proof() {
+        let mut h = with_peers();
+        let (name, keys) = create(&mut h).await;
+        deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Chat { text: "early".into() }));
+        assert!(h.events().is_empty());
+        let challenge = probe_nonce(&keys, &h.sent(BOB)[0]);
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, Some(&challenge))));
+        let events = h.events();
+        assert_eq!(events[0], Event::MemberJoined { room: name.clone(), nick: "bobRoger".into() });
+        assert!(matches!(&events[1], Event::Message { text, .. } if text == "early"), "{events:?}");
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn replayed_old_messages_are_dropped_even_with_fresh_nonces() {
+        let mut h = with_peers();
+        let (name, keys) = create(&mut h).await;
+        let now = now_millis();
+        // Captured a minute ago and replayed before bob is verified: buffered...
+        deliver(&mut h, BOB, frame_at(BOB, &keys, now - 60_000, RoomBody::Chat { text: "old".into() }));
+        let challenge = probe_nonce(&keys, &h.sent(BOB)[0]);
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, Some(&challenge))));
+        // ...but older than his proof, so it's dropped once he's verified.
+        assert_eq!(h.events(), vec![Event::MemberJoined { room: name.clone(), nick: "bobRoger".into() }]);
+        // After verification: old frames are below his floor, new ones go through.
+        deliver(&mut h, BOB, frame_at(BOB, &keys, now - 30_000, RoomBody::Chat { text: "older".into() }));
+        deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Chat { text: "fresh".into() }));
+        deliver(&mut h, BOB, frame_at(BOB, &keys, now - 10_000, RoomBody::Chat { text: "stale again".into() }));
+        let texts: Vec<String> =
+            h.events().into_iter().filter_map(|e| if let Event::Message { text, .. } = e { Some(text) } else { None }).collect();
+        assert_eq!(texts, vec!["fresh".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn unanswered_challenges_expire_with_their_buffer() {
+        let mut h = with_peers();
+        let (name, keys) = create(&mut h).await;
+        deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Chat { text: "spoofed".into() }));
+        let challenge = probe_nonce(&keys, &h.sent(BOB)[0]);
+        h.node.on_tick(Instant::now() + CHALLENGE_TIMEOUT);
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, Some(&challenge))));
+        assert!(!h.events().iter().any(|e| matches!(e, Event::MemberJoined { .. } | Event::Message { .. })));
+    }
+
+    #[tokio::test]
     async fn silent_members_expire_and_presence_is_announced() {
         let mut h = with_peers();
-        let name = create(&mut h).await;
+        let (name, keys) = create(&mut h).await;
         let id = h.node.rooms.id_of(&name).unwrap();
-        let keys = h.node.rooms.joined[&id].keys.clone();
+        h.node.on_room_frame(BOB, &room::to_hex(&id), "", "", Instant::now()); // junk: ignored
+        verify(&mut h, BOB, &name, &keys);
         let t0 = Instant::now();
-        h.node.on_room_frame(BOB, &room::to_hex(&id), "", "", t0); // junk: ignored
-        let Frame::Room { room_id, nonce, ct } = frame_from(BOB, &keys, RoomBody::Here { name: name.clone() }) else {
-            unreachable!()
-        };
-        h.node.on_room_frame(BOB, &room_id, &nonce, &ct, t0);
         h.events();
+        h.sent(CAROL);
 
         h.node.on_tick(t0 + Duration::from_secs(1)); // first tick announces
-        assert!(matches!(open_body(&keys, crate::node::tests::ME, &h.sent(CAROL)[0]), RoomBody::Here { .. }));
+        assert!(matches!(open_body(&keys, &h.sent(CAROL)[0]), RoomBody::Here { echo: None, .. }));
         h.node.on_tick(t0 + Duration::from_secs(2)); // too soon to announce again
         assert!(h.sent(CAROL).is_empty());
         assert!(h.events().is_empty());
@@ -530,9 +722,9 @@ mod tests {
     #[tokio::test]
     async fn replays_unknown_rooms_and_wrong_senders_are_dropped() {
         let mut h = with_peers();
-        let name = create(&mut h).await;
-        let id = h.node.rooms.id_of(&name).unwrap();
-        let keys = h.node.rooms.joined[&id].keys.clone();
+        let (name, keys) = create(&mut h).await;
+        verify(&mut h, BOB, &name, &keys);
+        h.events();
 
         let chat = frame_from(BOB, &keys, RoomBody::Chat { text: "once".into() });
         deliver(&mut h, BOB, chat.clone());
@@ -550,13 +742,10 @@ mod tests {
     #[tokio::test]
     async fn a_peer_whose_clock_is_off_is_named_once() {
         let mut h = with_peers();
-        let name = create(&mut h).await;
-        let id = h.node.rooms.id_of(&name).unwrap();
-        let keys = h.node.rooms.joined[&id].keys.clone();
+        let (_, keys) = create(&mut h).await;
         let ten_min_ago = now_millis() - 10 * 60 * 1000;
         for text in ["one", "two"] {
-            let env = RoomEnvelope { ts: ten_min_ago, body: RoomBody::Chat { text: text.into() } };
-            deliver(&mut h, BOB, room::seal(&keys, BOB, &env));
+            deliver(&mut h, BOB, frame_at(BOB, &keys, ten_min_ago, RoomBody::Chat { text: text.into() }));
         }
         assert_eq!(
             h.events(),
@@ -567,18 +756,17 @@ mod tests {
     #[tokio::test]
     async fn leaving_tells_members_and_disconnects_drop_members() {
         let mut h = with_peers();
-        let name = create(&mut h).await;
-        let id = h.node.rooms.id_of(&name).unwrap();
-        let keys = h.node.rooms.joined[&id].keys.clone();
-        deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Here { name: name.clone() }));
+        let (name, keys) = create(&mut h).await;
+        verify(&mut h, BOB, &name, &keys);
         h.events();
 
         let conn = h.node.peers[&BOB].conn;
         h.node.handle_msg(NodeMsg::PeerGone { conn, id: BOB, reason: crate::api::LeaveReason::Lost });
         assert!(h.events().contains(&Event::MemberLeft { room: name.clone(), nick: "bobRoger".into() }));
 
+        h.sent(CAROL);
         h.node.handle_command(Command::LeaveRoom { name: name.clone() });
-        assert!(matches!(open_body(&keys, crate::node::tests::ME, &h.sent(CAROL)[0]), RoomBody::Leave));
+        assert!(matches!(open_body(&keys, &h.sent(CAROL)[0]), RoomBody::Leave));
         assert_eq!(h.events(), vec![Event::RoomLeft { name: name.clone() }]);
         assert!(h.node.rooms.id_of(&name).is_none());
     }

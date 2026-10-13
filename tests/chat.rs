@@ -182,6 +182,8 @@ async fn a_room_is_gone_once_its_last_member_leaves() {
     let (mut alice, mut bob, mut carol) = trio().await;
     let (room, key) = create_room(&mut alice, "cat", "123").await;
     join_room(&mut bob, &room, &key).await;
+    // alice counts bob as a member once he has answered her challenge.
+    wait_for(&mut alice.node, "member joined", |e| matches!(e, Event::MemberJoined { .. })).await;
 
     send(&bob, Command::LeaveRoom { name: room.clone() }).await;
     wait_for(&mut bob.node, "left", |e| matches!(e, Event::RoomLeft { .. })).await;
