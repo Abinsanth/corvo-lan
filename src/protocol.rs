@@ -108,8 +108,12 @@ impl From<std::io::Error> for DecodeError {
 }
 
 /// Writes `frame` as a 4-byte big-endian length followed by its JSON body.
+/// Refuses (`InvalidInput`, nothing written) a frame the peer would reject as too large.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> std::io::Result<()> {
     let body = serde_json::to_vec(frame).expect("Frame always serializes");
+    if body.len() > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, DecodeError::TooLarge(body.len())));
+    }
     w.write_u32(body.len() as u32).await?;
     w.write_all(&body).await?;
     w.flush().await
@@ -176,6 +180,15 @@ mod tests {
         buf.extend_from_slice(b"{}");
         let mut reader: &[u8] = &buf;
         assert!(matches!(read_frame(&mut reader).await, Err(DecodeError::TooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_is_refused_without_writing() {
+        let mut buf: Vec<u8> = Vec::new();
+        let big = Frame::Direct { text: "x".repeat(MAX_FRAME_LEN), ts: 0 };
+        let err = write_frame(&mut buf, &big).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(buf.is_empty());
     }
 
     #[tokio::test]

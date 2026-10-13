@@ -22,10 +22,14 @@ mod rooms;
 
 pub use rooms::{HERE_INTERVAL, JOIN_SETTLE, JOIN_WAIT, MAX_ROOMS, MEMBER_TIMEOUT};
 
-/// Longest chat text accepted, leaving headroom under `MAX_FRAME_LEN` for hex and JSON.
+/// Longest chat text accepted, measured JSON-escaped (a control character
+/// becomes 6 bytes), leaving headroom under `MAX_FRAME_LEN` for hex and JSON.
 pub const MAX_TEXT_LEN: usize = MAX_FRAME_LEN / 8;
 /// Connected peers beyond this are refused, so a hostile host can't exhaust file descriptors.
 pub const MAX_PEERS: usize = 64;
+/// Name changes accepted from one peer. A real one follows a same-moment
+/// clash and happens once; more is a peer churning names.
+pub const MAX_RENAMES: u8 = 3;
 /// Messages a peer may send in a burst before being throttled to `RATE_PER_SEC`.
 pub const RATE_BURST: u32 = 30;
 const RATE_PER_SEC: f64 = 10.0;
@@ -81,9 +85,9 @@ pub enum NodeMsg {
     /// The listen-only naming window is over.
     NameWaitOver,
     /// A room key finished deriving on a worker thread.
-    Derived { job: rooms::Job, keys: RoomKeys },
-    JoinSettled(RoomId),
-    JoinTimeout(RoomId),
+    Derived { job: rooms::Job, attempt: rooms::Attempt, keys: RoomKeys },
+    JoinSettled(RoomId, rooms::Attempt),
+    JoinTimeout(RoomId, rooms::Attempt),
     Tick,
 }
 
@@ -132,6 +136,7 @@ struct PeerEntry {
     key: ConnKey,
     out: mpsc::Sender<Frame>,
     limit: RateLimit,
+    renames: u8,
 }
 
 /// Token bucket for frames from one peer, so a flood can't outrun the terminal
@@ -317,7 +322,8 @@ impl Node {
     }
 
     fn check_text(&self, text: &str) -> bool {
-        if text.len() > MAX_TEXT_LEN {
+        let escaped = serde_json::to_string(text).expect("strings always serialize");
+        if escaped.len() - 2 > MAX_TEXT_LEN {
             self.emit(Event::Error(format!("message too long (max {MAX_TEXT_LEN} bytes)")));
             return false;
         }
@@ -373,7 +379,7 @@ impl Node {
                     self.dialing.remove(&expected);
                     self.backoff.remove(&expected);
                 }
-                let entry = PeerEntry { conn, nick, addr, key, out, limit: RateLimit::new(Instant::now()) };
+                let entry = PeerEntry { conn, nick, addr, key, out, limit: RateLimit::new(Instant::now()), renames: 0 };
                 let verdict = self.on_connected(entry, id);
                 let _ = accept.send(verdict);
             }
@@ -398,9 +404,9 @@ impl Node {
                 None => self.emit(Event::Error(format!("could not connect to {addr}: {error}"))),
             },
             NodeMsg::NameWaitOver => self.assign_name(),
-            NodeMsg::Derived { job, keys } => self.on_derived(job, keys),
-            NodeMsg::JoinSettled(id) => self.on_join_settled(id),
-            NodeMsg::JoinTimeout(id) => self.on_join_timeout(id),
+            NodeMsg::Derived { job, attempt, keys } => self.on_derived(job, attempt, keys),
+            NodeMsg::JoinSettled(id, attempt) => self.on_join_settled(id, attempt),
+            NodeMsg::JoinTimeout(id, attempt) => self.on_join_timeout(id, attempt),
             NodeMsg::Tick => self.on_tick(Instant::now()),
         }
     }
@@ -463,13 +469,14 @@ impl Node {
         peer::dial(s.tcp_addr, Some(id), self.me(), self.msg_tx.clone());
     }
 
-    fn on_connected(&mut self, entry: PeerEntry, id: PeerId) -> Verdict {
+    fn on_connected(&mut self, mut entry: PeerEntry, id: PeerId) -> Verdict {
         if id == self.id {
             return Verdict::Close;
         }
         if let Some(existing) = self.peers.get(&id) {
             return if keep_new_connection(self.id, id, existing.key, entry.key) {
                 // Dropping the old sender retires the old connection.
+                entry.renames = existing.renames;
                 self.peers.insert(id, entry);
                 Verdict::Keep
             } else {
@@ -533,12 +540,14 @@ impl Node {
             Frame::Room { room_id, nonce, ct } => self.on_room_frame(id, &room_id, &nonce, &ct, Instant::now()),
             Frame::Nick { nick: new } => {
                 let taken = new == self.my_nick() || self.peer_by_nick(&new).is_some_and(|other| other != id);
-                if !names::is_valid_nick(&new) || taken {
+                let used_up = self.peers.get(&id).is_some_and(|p| p.renames >= MAX_RENAMES);
+                if !names::is_valid_nick(&new) || taken || used_up {
                     debug!(%id, "ignoring rename to {new:?}");
                     return;
                 }
                 if let Some(p) = self.peers.get_mut(&id) {
                     p.nick = new.clone();
+                    p.renames += 1;
                 }
                 self.emit(Event::Renamed { old: nick, new });
             }
@@ -615,6 +624,7 @@ pub(super) mod tests {
                 key,
                 out,
                 limit: RateLimit::new(Instant::now()),
+                renames: 0,
             };
             let verdict = self.node.on_connected(entry, id);
             if verdict == Verdict::Keep {
@@ -737,6 +747,27 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_peer_can_only_rename_a_few_times() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bobRoger", false);
+        h.events();
+        let words = ["Pie", "Fox", "Owl", "Elk", "Bee"];
+        for w in &words[..2] {
+            let conn = h.node.peers[&BOB].conn;
+            h.node.on_frame(conn, BOB, Frame::Nick { nick: format!("bob{w}") });
+        }
+        // A duplicate connection replacing the first doesn't reset the count.
+        h.connect(BOB, "bobFox", true);
+        for w in &words[2..] {
+            let conn = h.node.peers[&BOB].conn;
+            h.node.on_frame(conn, BOB, Frame::Nick { nick: format!("bob{w}") });
+        }
+        let renames = h.events().into_iter().filter(|e| matches!(e, Event::Renamed { .. })).count();
+        assert_eq!(renames, MAX_RENAMES as usize);
+        assert_eq!(h.node.peers[&BOB].nick, "bobOwl");
+    }
+
+    #[test]
     fn commands_wait_for_a_name() {
         let mut h = Harness::new();
         h.node.naming = Some(HashSet::new());
@@ -772,6 +803,7 @@ pub(super) mod tests {
             key: out_key(),
             out,
             limit: RateLimit::new(Instant::now()),
+            renames: 0,
         };
         assert_eq!(h.node.on_connected(entry, BOB), Verdict::Keep);
         for i in 0..8 {

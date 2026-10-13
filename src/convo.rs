@@ -102,11 +102,7 @@ impl Store {
                     c.offline = true;
                 }
             }
-            Event::Renamed { old, new } => {
-                if self.online.remove(old) {
-                    self.online.insert(new.clone());
-                }
-            }
+            Event::Renamed { old, new } => self.rename(old, new),
             Event::Message { conv, from, text, ts } => {
                 let unread = self.current.as_ref() != Some(conv);
                 let c = self.entry(conv);
@@ -147,6 +143,43 @@ impl Store {
                 }
             }
             Event::Peers(_) | Event::Error(_) | Event::Info(_) => {}
+        }
+    }
+
+    /// A peer re-rolled its name: follow it in room member lists and move its
+    /// DM, merging into any older conversation already under the new name.
+    fn rename(&mut self, old: &str, new: &str) {
+        if self.online.remove(old) {
+            self.online.insert(new.to_string());
+        }
+        for c in &mut self.convs {
+            if c.members.remove(old) {
+                c.members.insert(new.to_string());
+            }
+        }
+        let (from, to) = (Conv::Dm(old.to_string()), Conv::Dm(new.to_string()));
+        if self.current.as_ref() == Some(&from) {
+            self.current = Some(to.clone());
+        }
+        let Some(i) = self.convs.iter().position(|c| c.conv == from) else {
+            return;
+        };
+        let mut moved = self.convs.remove(i);
+        let offline = !self.online.contains(new);
+        match self.find_mut(&to) {
+            Some(c) => {
+                c.lines.extend(moved.lines);
+                c.lines.make_contiguous().sort_by_key(|l| l.ts);
+                let excess = c.lines.len().saturating_sub(MAX_LINES);
+                c.lines.drain(..excess);
+                c.unread += moved.unread;
+                c.offline = offline;
+            }
+            None => {
+                moved.conv = to;
+                moved.offline = offline;
+                self.convs.insert(i, moved);
+            }
         }
     }
 
@@ -297,6 +330,42 @@ mod tests {
         assert_eq!(s.conversations().len(), MAX_CONVS);
         assert!(s.get(&dm("keepFox")).is_none());
         assert!(s.get(&room("catPieR")).is_some());
+    }
+
+    #[test]
+    fn a_renamed_peer_keeps_its_dm_and_room_membership() {
+        let mut s = Store::new();
+        s.apply(&Event::PeerJoined { id: PeerId(1), nick: "bobRoger".into() }, 0);
+        s.apply(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
+        s.apply(&msg(dm("bobRoger"), "bobRoger", "psst"), 0);
+        s.switch(dm("bobRoger"));
+        s.apply(&Event::Renamed { old: "bobRoger".into(), new: "bobPie".into() }, 0);
+
+        assert!(s.get(&dm("bobRoger")).is_none());
+        let c = s.get(&dm("bobPie")).unwrap();
+        assert_eq!(c.lines[0].kind, LineKind::Msg { from: "bobRoger".into(), text: "psst".into() });
+        assert!(!c.offline);
+        assert_eq!(s.current(), Some(&dm("bobPie")));
+        assert!(s.is_online("bobPie") && !s.is_online("bobRoger"));
+        let members: Vec<_> = s.get(&room("catPieR")).unwrap().members.iter().cloned().collect();
+        assert_eq!(members, vec!["bobPie".to_string()]);
+    }
+
+    #[test]
+    fn a_rename_onto_an_old_conversation_merges_them_in_order() {
+        let mut s = Store::new();
+        let at = |conv, text: &str, ts| Event::Message { conv, from: "x".into(), text: text.into(), ts };
+        s.apply(&at(dm("bobPie"), "older bobPie", 1), 0); // someone who went offline
+        s.apply(&Event::PeerJoined { id: PeerId(1), nick: "bobRoger".into() }, 0);
+        s.apply(&at(dm("bobRoger"), "from bobRoger", 2), 0);
+        s.apply(&Event::Renamed { old: "bobRoger".into(), new: "bobPie".into() }, 0);
+
+        assert!(s.get(&dm("bobRoger")).is_none());
+        let c = s.get(&dm("bobPie")).unwrap();
+        let ts: Vec<u64> = c.lines.iter().map(|l| l.ts).collect();
+        assert_eq!(ts, vec![1, 2]);
+        assert_eq!(c.unread, 2);
+        assert!(!c.offline);
     }
 
     #[test]

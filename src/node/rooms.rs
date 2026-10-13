@@ -37,6 +37,10 @@ const PROOF_GRACE_MS: u64 = 3_000;
 /// After that, a sender's floor trails its newest frame by this much.
 const REORDER_GRACE_MS: u64 = 2_000;
 
+/// Numbers each create or join, so a timer or key derivation left over from
+/// an earlier (left or failed) attempt at the same room is recognised and ignored.
+pub type Attempt = u64;
+
 /// What a worker thread was deriving keys for.
 pub enum Job {
     Create { name: String, key: String },
@@ -67,6 +71,7 @@ struct Room {
 }
 
 struct PendingJoin {
+    attempt: Attempt,
     name: String,
     keys: RoomKeys,
     /// Our probe; only answers echoing it count.
@@ -81,8 +86,9 @@ struct PendingJoin {
 pub(super) struct Rooms {
     joined: HashMap<RoomId, Room>,
     joining: HashMap<RoomId, PendingJoin>,
-    /// Names whose keys are being derived right now.
-    deriving: HashSet<String>,
+    /// Names whose keys are being derived right now, and for which attempt.
+    deriving: HashMap<String, Attempt>,
+    last_attempt: Attempt,
     /// Peers we've already told the user have a skewed clock.
     skew_warned: HashSet<PeerId>,
     last_here: Option<Instant>,
@@ -94,7 +100,7 @@ impl Rooms {
     }
 
     fn holds(&self, name: &str) -> bool {
-        self.deriving.contains(name)
+        self.deriving.contains_key(name)
             || self.joined.values().any(|r| r.name == name)
             || self.joining.values().any(|p| p.name == name)
     }
@@ -118,12 +124,14 @@ impl Node {
     }
 
     fn spawn_derive(&mut self, job: Job, name: String, key: String) {
-        self.rooms.deriving.insert(name.clone());
+        self.rooms.last_attempt += 1;
+        let attempt = self.rooms.last_attempt;
+        self.rooms.deriving.insert(name.clone(), attempt);
         let tx = self.msg_tx.clone();
         tokio::spawn(async move {
             let keys = tokio::task::spawn_blocking(move || room::derive(&name, &key)).await;
             if let Ok(keys) = keys {
-                let _ = tx.send(NodeMsg::Derived { job, keys }).await;
+                let _ = tx.send(NodeMsg::Derived { job, attempt, keys }).await;
             }
         });
     }
@@ -171,10 +179,14 @@ impl Node {
         self.spawn_derive(Job::Join { name: name.to_string() }, name.to_string(), key.to_string());
     }
 
-    pub(super) fn on_derived(&mut self, job: Job, keys: RoomKeys) {
+    pub(super) fn on_derived(&mut self, job: Job, attempt: Attempt, keys: RoomKeys) {
         let name = match &job {
             Job::Create { name, .. } | Job::Join { name } => name.clone(),
         };
+        // Otherwise the user left (or left and retried) while we were deriving.
+        if self.rooms.deriving.get(&name) != Some(&attempt) {
+            return;
+        }
         self.rooms.deriving.remove(&name);
         if self.rooms.joined.contains_key(&keys.id) || self.rooms.joining.contains_key(&keys.id) {
             self.emit(Event::Error(format!("you're already in #{name}")));
@@ -198,6 +210,7 @@ impl Node {
                 self.broadcast(self.seal(&keys, RoomBody::Probe { nonce: probe.clone() }));
                 let id = keys.id;
                 let pending = PendingJoin {
+                    attempt,
                     name,
                     keys,
                     probe,
@@ -206,12 +219,15 @@ impl Node {
                     replay: ReplayGuard::default(),
                 };
                 self.rooms.joining.insert(id, pending);
-                self.after(JOIN_WAIT, NodeMsg::JoinTimeout(id));
+                self.after(JOIN_WAIT, NodeMsg::JoinTimeout(id, attempt));
             }
         }
     }
 
-    pub(super) fn on_join_settled(&mut self, id: RoomId) {
+    pub(super) fn on_join_settled(&mut self, id: RoomId, attempt: Attempt) {
+        if self.rooms.joining.get(&id).is_none_or(|p| p.attempt != attempt) {
+            return;
+        }
         let Some(p) = self.rooms.joining.remove(&id) else {
             return;
         };
@@ -235,15 +251,26 @@ impl Node {
         self.emit(Event::RoomJoined { name: p.name, members });
     }
 
-    pub(super) fn on_join_timeout(&mut self, id: RoomId) {
-        if self.rooms.joining.get(&id).is_some_and(|p| !p.settling) {
+    pub(super) fn on_join_timeout(&mut self, id: RoomId, attempt: Attempt) {
+        if self.rooms.joining.get(&id).is_some_and(|p| p.attempt == attempt && !p.settling) {
             if let Some(p) = self.rooms.joining.remove(&id) {
                 self.emit(Event::Error(format!("no room #{} with that key", p.name)));
             }
         }
     }
 
+    /// Also cancels a join of `name` that hasn't finished yet.
     pub(super) fn leave_room(&mut self, name: &str) {
+        let pending = self.rooms.joining.iter().find(|(_, p)| p.name == name).map(|(id, _)| *id);
+        if let Some(id) = pending {
+            self.rooms.joining.remove(&id);
+            self.emit(Event::RoomLeft { name: name.to_string() });
+            return;
+        }
+        if self.rooms.deriving.remove(name).is_some() {
+            self.emit(Event::RoomLeft { name: name.to_string() });
+            return;
+        }
         let Some(id) = self.rooms.id_of(name) else {
             self.emit(Event::Error(format!("you're not in #{name}")));
             return;
@@ -313,7 +340,8 @@ impl Node {
             if answers_us {
                 p.replies.insert(from, env.ts);
                 if !std::mem::replace(&mut p.settling, true) {
-                    self.after(JOIN_SETTLE, NodeMsg::JoinSettled(id));
+                    let attempt = p.attempt;
+                    self.after(JOIN_SETTLE, NodeMsg::JoinSettled(id, attempt));
                 }
             }
         }
@@ -557,6 +585,22 @@ mod tests {
         assert_eq!(events[1], Event::Info(format!("nobody else is in #{name} yet")));
     }
 
+    #[tokio::test]
+    async fn escaped_text_is_what_counts_against_the_limit() {
+        let mut h = with_peers();
+        let (name, _) = create(&mut h).await;
+        // Each control character escapes to 6 bytes, and room frames are hex on top.
+        h.node.handle_command(Command::Send { to: Target::Room(name.clone()), text: "\u{1}".repeat(MAX_TEXT_LEN) });
+        assert!(h.sent(BOB).is_empty());
+        assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("too long")));
+
+        let most = "\u{1}".repeat(MAX_TEXT_LEN / 6);
+        h.node.handle_command(Command::Send { to: Target::Room(name), text: most });
+        let sent = h.sent(BOB);
+        assert!(matches!(sent.as_slice(), [Frame::Room { .. }]));
+        assert!(serde_json::to_vec(&sent[0]).unwrap().len() <= crate::protocol::MAX_FRAME_LEN);
+    }
+
     #[test]
     fn bad_room_input_is_rejected_up_front() {
         let mut h = with_peers();
@@ -627,6 +671,56 @@ mod tests {
         deliver(&mut h, BOB, frame_from(BOB, &keys(), here(NAME, None)));
         h.pump().await; // JoinTimeout
         assert_eq!(h.events(), vec![Event::Error(format!("no room #{NAME} with that key"))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_earlier_attempts_timer_does_not_cancel_a_rejoin() {
+        let mut h = with_peers();
+        let keys = keys();
+        h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: KEY.into() });
+        h.pump().await; // Derived
+        let nonce = probe_nonce(&keys, &h.sent(BOB)[0]);
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(NAME, Some(&nonce))));
+        h.pump().await; // JoinSettled
+        h.node.handle_command(Command::LeaveRoom { name: NAME.into() });
+        h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: KEY.into() });
+        h.pump().await; // Derived
+        h.events();
+        h.pump().await; // the first attempt's JoinTimeout: not ours any more
+        assert!(h.events().is_empty());
+
+        let nonce = probe_nonce(&keys, h.sent(BOB).last().unwrap());
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(NAME, Some(&nonce))));
+        h.pump().await; // JoinSettled and this attempt's JoinTimeout, due about together
+        h.pump().await;
+        assert_eq!(h.events(), vec![Event::RoomJoined { name: NAME.into(), members: vec!["bobRoger".into()] }]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leaving_cancels_a_join_still_deriving() {
+        let mut h = with_peers();
+        h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: KEY.into() });
+        h.node.handle_command(Command::LeaveRoom { name: NAME.into() });
+        assert_eq!(h.events(), vec![Event::RoomLeft { name: NAME.into() }]);
+        h.pump().await; // Derived: dropped
+        assert!(h.sent(BOB).is_empty(), "no probe for a cancelled join");
+        assert!(h.events().is_empty());
+        assert_eq!(h.node.rooms.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leaving_cancels_a_join_waiting_for_answers() {
+        let mut h = with_peers();
+        let keys = keys();
+        h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: KEY.into() });
+        h.pump().await; // Derived
+        let nonce = probe_nonce(&keys, &h.sent(BOB)[0]);
+        h.node.handle_command(Command::LeaveRoom { name: NAME.into() });
+        assert_eq!(h.events(), vec![Event::RoomLeft { name: NAME.into() }]);
+        deliver(&mut h, BOB, frame_from(BOB, &keys, here(NAME, Some(&nonce))));
+        h.pump().await; // JoinTimeout: nothing to time out
+        assert!(h.events().is_empty());
+        assert_eq!(h.node.rooms.count(), 0);
     }
 
     #[tokio::test]
