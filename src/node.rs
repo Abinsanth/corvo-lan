@@ -18,6 +18,8 @@ use crate::protocol::{now_millis, Frame, PeerId, MAX_FRAME_LEN};
 
 /// Longest chat text accepted, leaving headroom under `MAX_FRAME_LEN` for JSON escaping.
 pub const MAX_TEXT_LEN: usize = MAX_FRAME_LEN / 8;
+/// Connected peers beyond this are refused, so a hostile host can't exhaust file descriptors.
+pub const MAX_PEERS: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -310,6 +312,7 @@ impl Node {
         if id == self.id
             || self.peers.contains_key(&id)
             || self.dialing.contains(&id)
+            || self.peers.len() >= MAX_PEERS
             || !should_dial(self.id, id)
             || self.backoff.get(&id).is_some_and(|b| Instant::now() < b.next_try)
         {
@@ -325,6 +328,10 @@ impl Node {
             return false;
         }
         match self.peers.get(&id) {
+            None if self.peers.len() >= MAX_PEERS => {
+                warn!(%id, "refusing peer: already at {MAX_PEERS} peers");
+                false
+            }
             None => {
                 self.peers.insert(id, entry);
                 self.emit(Event::PeerJoined { id, nick: self.display(id) });
@@ -454,6 +461,16 @@ mod tests {
         assert!(!h.connect(BOB, "bob", true)); // same direction rejected
         let joins = h.events().into_iter().filter(|e| matches!(e, Event::PeerJoined { .. })).count();
         assert_eq!(joins, 1);
+    }
+
+    #[test]
+    fn peer_count_is_capped() {
+        let mut h = Harness::new();
+        for i in 0..MAX_PEERS as u64 {
+            assert!(h.connect(PeerId(0x4000_0000_0000_0000 + i), "p", true));
+        }
+        assert!(!h.connect(PeerId(0x5000_0000_0000_0000), "late", true));
+        assert_eq!(h.node.peers.len(), MAX_PEERS);
     }
 
     #[test]
