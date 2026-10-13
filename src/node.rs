@@ -238,9 +238,13 @@ impl Node {
         self.peers.iter().map(|(id, p)| (*id, p.nick.as_str())).collect()
     }
 
+    /// Display name for a peer; our own nick counts as a clash too.
     fn display(&self, id: PeerId) -> String {
+        let me = self.nick.borrow();
+        let mut everyone = self.roster();
+        everyone.push((self.id, me.as_str()));
         match self.peers.get(&id) {
-            Some(p) => names::display_name(id, &p.nick, &self.roster()),
+            Some(p) => names::display_name(id, &p.nick, &everyone),
             None => id.short(),
         }
     }
@@ -622,6 +626,16 @@ mod tests {
         let warnings = events.iter().filter(|e| matches!(e, Event::Info(m) if m.contains("too fast"))).count();
         assert_eq!(messages, RATE_BURST as usize);
         assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn peer_sharing_my_nick_gets_a_suffix() {
+        let mut h = Harness::new(); // our nick is "me"
+        h.connect(BOB, "me", true);
+        assert_eq!(h.events(), vec![Event::PeerJoined { id: BOB, nick: "me#2000".into() }]);
+        // It's still addressable by the plain nick, since we can't DM ourselves.
+        h.node.handle_command(Command::Direct { to: "me".into(), text: "hi".into() });
+        assert_eq!(h.events(), vec![Event::DirectSent { to: "me#2000".into(), text: "hi".into() }]);
     }
 
     #[test]
