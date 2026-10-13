@@ -14,6 +14,7 @@ commands:
   /chat #room <key>      join a room (just /chat #room once you're in)
   /create <name> <key>   create a private room; share its name and key to invite
   /leave [#room]         leave the current or named room
+  /close [@nick]         close the current or named private chat
   /rooms                 your rooms and who's in them
   /chats                 your conversations, with unread counts
   /history [n]           show the last n messages here (default 20)
@@ -429,6 +430,7 @@ mod tests {
         let mut s = session();
         assert_eq!(typed(&mut s, "/help").print, vec![HELP_LINE]);
         assert!(HELP_LINE.contains("/tui") && !HELP_LINE.contains("/line"));
+        assert!(HELP_LINE.contains("/close [@nick]"), "/close works in line mode too");
         s.set_mode(Mode::Tui);
         assert_eq!(typed(&mut s, "/help").print, vec![HELP_TUI]);
         assert!(HELP_TUI.contains("/line") && HELP_TUI.contains("/close") && HELP_TUI.contains("Alt+Enter"));

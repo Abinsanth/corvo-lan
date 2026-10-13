@@ -48,8 +48,8 @@ After about two seconds you get a name, and you're connected to everyone else ru
 /msg @bobRoger hi          # one-off private message
 /who                       # who's connected
 /update [yes]              # check for and install a newer version
-/close [@nick]          # close a private chat (TUI)
-/line  /tui              # switch between the full-screen view and a plain prompt
+/close [@nick]             # close a private chat (TUI)
+/line  /tui                # switch between the full-screen view and a plain prompt
 /help                      # all commands
 ```
 
@@ -58,7 +58,8 @@ people in the room and everyone online on the right. `Tab` / `Shift-Tab` or
 `Alt-1..9` switch tabs, `Alt+Enter` (or `Shift+Enter` where your terminal
 supports it) adds a new line, `PgUp`/`PgDn` or the mouse wheel scroll, and
 clicking a name opens a private chat. Command output and errors appear in the
-`corvo` tab.
+`corvo` tab. To select text (say, a room key), hold Shift (Option on macOS)
+while dragging, or switch to `/line`.
 
 Prefer a plain prompt? Start with `--line`, or type `/line` (and `/tui` to come
 back). Line mode is also used automatically when output isn't a terminal.
