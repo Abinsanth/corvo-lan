@@ -20,6 +20,9 @@ use crate::protocol::{now_millis, Frame, PeerId, MAX_FRAME_LEN};
 pub const MAX_TEXT_LEN: usize = MAX_FRAME_LEN / 8;
 /// Connected peers beyond this are refused, so a hostile host can't exhaust file descriptors.
 pub const MAX_PEERS: usize = 64;
+/// Messages a peer may send in a burst before being throttled to `RATE_PER_SEC`.
+pub const RATE_BURST: u32 = 30;
+const RATE_PER_SEC: f64 = 10.0;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -94,6 +97,34 @@ struct PeerEntry {
     addr: SocketAddr,
     key: ConnKey,
     out: mpsc::Sender<Frame>,
+    limit: RateLimit,
+}
+
+/// Token bucket for frames from one peer, so a flood can't outrun the terminal
+/// and pile up in memory.
+struct RateLimit {
+    tokens: f64,
+    last: Instant,
+    /// Already told the user about the current flood.
+    warned: bool,
+}
+
+impl RateLimit {
+    fn new(now: Instant) -> Self {
+        RateLimit { tokens: RATE_BURST as f64, last: now, warned: false }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * RATE_PER_SEC).min(RATE_BURST as f64);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct Backoff {
@@ -295,7 +326,7 @@ impl Node {
                     self.dialing.remove(&expected);
                     self.backoff.remove(&expected);
                 }
-                let keep = self.on_connected(PeerEntry { conn, nick, addr, key, out }, id);
+                let keep = self.on_connected(PeerEntry { conn, nick, addr, key, out, limit: RateLimit::new(Instant::now()) }, id);
                 let _ = accept.send(keep);
             }
             NodeMsg::PeerFrame { conn, id, frame } => self.on_frame(conn, id, frame),
@@ -363,9 +394,17 @@ impl Node {
     }
 
     fn on_frame(&mut self, conn: ConnId, id: PeerId, frame: Frame) {
-        if !self.peers.get(&id).is_some_and(|p| p.conn == conn) {
+        let Some(peer) = self.peers.get_mut(&id).filter(|p| p.conn == conn) else {
             return; // stale duplicate connection
+        };
+        if !peer.limit.allow(Instant::now()) {
+            if !std::mem::replace(&mut peer.limit.warned, true) {
+                let nick = self.display(id);
+                self.emit(Event::Info(format!("{nick} is sending too fast; dropping messages")));
+            }
+            return;
         }
+        peer.limit.warned = false;
         match frame {
             Frame::Chat { text, ts } | Frame::Direct { text, ts } if text.len() > MAX_TEXT_LEN => {
                 debug!(%id, ts, "dropping oversized message ({} bytes)", text.len());
@@ -445,7 +484,14 @@ mod tests {
             let (out, rx) = mpsc::channel(8);
             let conn = self.next_conn;
             self.next_conn += 1;
-            let entry = PeerEntry { conn, nick: nick.into(), addr: "127.0.0.1:1".parse().unwrap(), key, out };
+            let entry = PeerEntry {
+                conn,
+                nick: nick.into(),
+                addr: "127.0.0.1:1".parse().unwrap(),
+                key,
+                out,
+                limit: RateLimit::new(Instant::now()),
+            };
             let keep = self.node.on_connected(entry, id);
             if keep {
                 self.outboxes.insert(id, rx);
@@ -550,6 +596,32 @@ mod tests {
         let got = drain.await.unwrap();
         assert_eq!(got.len(), 9);
         assert_eq!(got.last(), Some(&Frame::Bye));
+    }
+
+    #[test]
+    fn rate_limit_allows_a_burst_then_refills() {
+        let t0 = Instant::now();
+        let mut limit = RateLimit::new(t0);
+        let allowed = (0..100).filter(|_| limit.allow(t0)).count();
+        assert_eq!(allowed, RATE_BURST as usize);
+        assert!(!limit.allow(t0));
+        assert!(limit.allow(t0 + Duration::from_millis(150))); // refills 10/s
+    }
+
+    #[test]
+    fn flooding_peer_is_throttled_with_one_warning() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bob", true);
+        h.events();
+        let conn = h.node.peers[&BOB].conn;
+        for i in 0..100 {
+            h.node.on_frame(conn, BOB, Frame::Chat { text: format!("spam {i}"), ts: 0 });
+        }
+        let events = h.events();
+        let messages = events.iter().filter(|e| matches!(e, Event::Message { .. })).count();
+        let warnings = events.iter().filter(|e| matches!(e, Event::Info(m) if m.contains("too fast"))).count();
+        assert_eq!(messages, RATE_BURST as usize);
+        assert_eq!(warnings, 1);
     }
 
     #[test]
