@@ -12,7 +12,17 @@ setup.
 
 ## Install
 
-You need a Rust toolchain ([rustup.rs](https://rustup.rs)).
+On macOS or Linux (x86_64 or ARM):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Abinsanth/lan-chat/release/install.sh | sh
+```
+
+This downloads the latest release, checks its SHA-256, and installs it to
+`~/.local/bin` (set `LAN_CHAT_INSTALL_DIR` to change that). It never uses sudo.
+Run the same command again to update.
+
+Or build from source with a Rust toolchain ([rustup.rs](https://rustup.rs)):
 
 ```bash
 git clone https://github.com/Abinsanth/lan-chat.git
@@ -62,3 +72,11 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 CI runs all three on every pull request.
+
+## Releasing
+
+Work happens on `main`. To ship, bump `version` in `Cargo.toml`, then merge
+`main` into the `release` branch. That builds macOS and Linux binaries,
+tags `v<version>`, and publishes them as a GitHub Release, which is what the
+install script downloads. A version that's already released is refused, so
+bump it first.
