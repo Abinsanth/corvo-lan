@@ -1,5 +1,5 @@
 [package]
-name = "lan-chat"
+name = "corvo-lan"
 version = "0.3.0"
 edition = "2024"
 

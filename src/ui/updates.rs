@@ -22,7 +22,7 @@ pub enum UpdateAction {
 /// What `/update` prints for `newer` (newest first).
 pub fn format_check(current: Version, newer: &[Release]) -> Vec<String> {
     let Some(latest) = newer.first() else {
-        return vec![format!("* lan-chat {current} is the latest")];
+        return vec![format!("* corvo-lan {current} is the latest")];
     };
     let mut lines = vec![format!("* you have {current}. Newer:")];
     for r in newer.iter().take(MAX_LISTED) {
@@ -109,11 +109,11 @@ async fn run(action: UpdateAction, out: &Sender<String>) {
     };
     let target = match std::env::current_exe().and_then(|p| p.canonicalize()) {
         Ok(path) => path,
-        Err(e) => return say(format!("! can't find the running lan-chat: {e}")),
+        Err(e) => return say(format!("! can't find the running corvo-lan: {e}")),
     };
     say(format!("* downloading v{latest}…"));
     match update::install(latest, &target).await {
-        Ok(()) => say(format!("* installed v{latest}. Restart lan-chat to use it.")),
+        Ok(()) => say(format!("* installed v{latest}. Restart corvo-lan to use it.")),
         Err(e) => say(format!("! {e}")),
     }
 }
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn up_to_date() {
-        assert_eq!(format_check(NOW, &[]), vec!["* lan-chat 0.2.0 is the latest"]);
+        assert_eq!(format_check(NOW, &[]), vec!["* corvo-lan 0.2.0 is the latest"]);
         assert_eq!(format_notice(&[]), None);
     }
 

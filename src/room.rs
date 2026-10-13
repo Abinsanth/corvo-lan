@@ -92,6 +92,8 @@ pub fn validate_key(key: &str) -> Result<(), String> {
 /// Slow on purpose (Argon2id, ~19 MiB): call it off the async actor.
 pub fn derive(name: &str, key: &str) -> RoomKeys {
     let params = Params::new(19_456, 2, 1, Some(32)).expect("valid Argon2 params");
+    // These labels predate the rename to corvo-lan. Changing them changes every
+    // room's keys, so it waits for the next protocol version.
     let salt = format!("lan-chat room v2:{name}");
     let mut secret = [0u8; 32];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)

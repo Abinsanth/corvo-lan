@@ -4,8 +4,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use lan_chat::api::{Command, Conv, Event, LeaveReason, Target};
-use lan_chat::node::{self, NodeConfig, NodeHandle};
+use corvo_lan::api::{Command, Conv, Event, LeaveReason, Target};
+use corvo_lan::node::{self, NodeConfig, NodeHandle};
 use tokio::time::timeout;
 
 struct Peer {
@@ -111,8 +111,8 @@ async fn join_room(p: &mut Peer, name: &str, key: &str) -> Vec<String> {
 #[tokio::test]
 async fn names_are_assigned_from_the_base() {
     let (alice, bob) = pair().await;
-    assert!(alice.nick.starts_with("alice") && lan_chat::names::is_valid_nick(&alice.nick));
-    assert!(bob.nick.starts_with("bob") && lan_chat::names::is_valid_nick(&bob.nick));
+    assert!(alice.nick.starts_with("alice") && corvo_lan::names::is_valid_nick(&alice.nick));
+    assert!(bob.nick.starts_with("bob") && corvo_lan::names::is_valid_nick(&bob.nick));
 }
 
 #[tokio::test]

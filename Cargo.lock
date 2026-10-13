@@ -281,6 +281,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "corvo-lan"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "chacha20poly1305",
+ "chrono",
+ "clap",
+ "hkdf",
+ "rand",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -481,28 +503,6 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "lan-chat"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "argon2",
- "chacha20poly1305",
- "chrono",
- "clap",
- "hkdf",
- "rand",
- "rustyline",
- "serde",
- "serde_json",
- "sha2",
- "socket2",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
