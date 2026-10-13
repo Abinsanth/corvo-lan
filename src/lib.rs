@@ -7,4 +7,5 @@ pub mod peer;
 pub mod protocol;
 pub mod room;
 pub mod ui;
+pub mod update;
 pub mod words;
