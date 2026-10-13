@@ -396,8 +396,17 @@ impl Node {
         for task in &self.background {
             task.abort();
         }
-        self.broadcast(Frame::Bye);
+        // Queue Bye everywhere first, then wait (within the grace period) only
+        // for peers whose outbox was full, so one slow peer can't starve the rest.
         let deadline = Instant::now() + SHUTDOWN_GRACE;
+        let full: Vec<&PeerEntry> = self
+            .peers
+            .values()
+            .filter(|p| matches!(p.out.try_send(Frame::Bye), Err(mpsc::error::TrySendError::Full(_))))
+            .collect();
+        for p in full {
+            let _ = tokio::time::timeout_at(deadline, p.out.send(Frame::Bye)).await;
+        }
         for p in self.peers.values() {
             let _ = tokio::time::timeout_at(deadline, p.out.closed()).await;
         }
@@ -515,6 +524,32 @@ mod tests {
         for id in [BOB, CAROL] {
             assert!(matches!(h.sent(id).as_slice(), [Frame::Chat { text, .. }] if text == "hi all"));
         }
+    }
+
+    #[tokio::test]
+    async fn bye_waits_for_room_in_a_full_outbox() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bob", true);
+        for i in 0..8 {
+            h.node.handle_command(Command::Say(format!("msg {i}"))); // fills the 8-slot outbox
+        }
+        let mut rx = h.outboxes.remove(&BOB).unwrap();
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut got = Vec::new();
+            while let Some(frame) = rx.recv().await {
+                let bye = frame == Frame::Bye;
+                got.push(frame);
+                if bye {
+                    break; // like the writer: stop after Bye, dropping the receiver
+                }
+            }
+            got
+        });
+        h.node.shutdown().await;
+        let got = drain.await.unwrap();
+        assert_eq!(got.len(), 9);
+        assert_eq!(got.last(), Some(&Frame::Bye));
     }
 
     #[test]
