@@ -54,10 +54,17 @@ pub fn parse_line(line: &str) -> Input {
     }
 }
 
-/// Replaces control characters (including newlines and ANSI escapes) so a peer
-/// cannot rewrite our terminal.
+/// Replaces control characters (including newlines and ANSI escapes) and bidi
+/// overrides so a peer cannot rewrite our terminal or reverse displayed text.
+/// Zero-width joiners and variation selectors stay, since emoji need them.
 pub fn clean(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect()
+    s.chars()
+        .map(|c| if c.is_control() || is_bidi_control(c) { '\u{fffd}' } else { c })
+        .collect()
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 pub fn format_event(event: &Event) -> String {
@@ -86,17 +93,32 @@ pub fn format_event(event: &Event) -> String {
     }
 }
 
+/// Runs `print` on its own thread. Sending never blocks, so the UI task can't
+/// stall on rustyline's printer (which blocks while a prompt isn't being read).
+pub fn spawn_printer(mut print: impl FnMut(String) + Send + 'static) -> std::sync::mpsc::Sender<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for msg in rx {
+            print(msg);
+        }
+    });
+    tx
+}
+
 /// Runs the frontend until the user quits, then waits for the Node to say goodbye.
 pub async fn run(handle: NodeHandle) -> anyhow::Result<()> {
     let NodeHandle { commands, mut events, task, .. } = handle;
     let mut editor = DefaultEditor::new()?;
     // The external printer redraws the prompt around output; it needs a real
     // terminal, so piped stdin falls back to plain println.
-    let mut print: Box<dyn FnMut(String) + Send> = match editor.create_external_printer() {
-        Ok(mut printer) => Box::new(move |s| {
+    let out = match editor.create_external_printer() {
+        Ok(mut printer) => spawn_printer(move |s| {
             let _ = printer.print(s);
         }),
-        Err(_) => Box::new(|s| println!("{s}")),
+        Err(_) => spawn_printer(|s| println!("{s}")),
+    };
+    let print = |s: String| {
+        let _ = out.send(s);
     };
 
     // rustyline blocks, so it lives on its own thread. It waits for `resume`
@@ -186,6 +208,34 @@ mod tests {
         assert_eq!(parse_line("/exit"), Input::Command(Command::Quit));
         assert_eq!(parse_line("/help"), Input::Help);
         assert_eq!(parse_line("/dance"), Input::Error("unknown command /dance, try /help".into()));
+    }
+
+    #[test]
+    fn clean_strips_bidi_overrides_but_keeps_emoji() {
+        assert_eq!(clean("a\u{202E}b\u{2067}c"), "a\u{fffd}b\u{fffd}c");
+        assert_eq!(clean("\u{2764}\u{FE0F} \u{1F468}\u{200D}\u{1F469}"), "\u{2764}\u{FE0F} \u{1F468}\u{200D}\u{1F469}");
+    }
+
+    #[test]
+    fn printer_never_blocks_the_caller_and_keeps_order() {
+        use std::time::{Duration, Instant};
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
+        // A sink that blocks until released, like rustyline's printer in raw mode.
+        let out = spawn_printer(move |s| {
+            let _ = gate_rx.recv();
+            let _ = seen_tx.send(s);
+        });
+        let start = Instant::now();
+        for i in 0..100 {
+            out.send(i.to_string()).unwrap();
+        }
+        assert!(start.elapsed() < Duration::from_millis(100));
+        for _ in 0..100 {
+            gate_tx.send(()).unwrap();
+        }
+        let got: Vec<String> = (0..100).map(|_| seen_rx.recv_timeout(Duration::from_secs(1)).unwrap()).collect();
+        assert_eq!(got, (0..100).map(|i| i.to_string()).collect::<Vec<_>>());
     }
 
     #[test]

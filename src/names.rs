@@ -12,10 +12,21 @@ pub fn validate_nick(nick: &str) -> Result<(), String> {
     if nick.chars().count() > MAX_NICK_LEN {
         return Err(format!("nick must be at most {MAX_NICK_LEN} characters"));
     }
-    if nick.chars().any(|c| c.is_whitespace() || c.is_control() || c == '#') {
-        return Err("nick cannot contain spaces, '#' or control characters".into());
+    if nick.chars().any(|c| c.is_whitespace() || c.is_control() || is_invisible(c) || c == '#') {
+        return Err("nick cannot contain spaces, '#', control or invisible characters".into());
     }
     Ok(())
+}
+
+/// Unicode default-ignorable characters (zero-width, bidi controls, tags, ...),
+/// which would let `bob\u{200B}` pass as a second, identical-looking `bob`.
+pub fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}'
+        | '\u{FFF0}'..='\u{FFF8}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0000}'..='\u{E0FFF}')
 }
 
 /// `nick` if no other peer in `roster` shares it, otherwise `nick#abcd`.
@@ -88,6 +99,13 @@ mod tests {
         assert!(validate_nick("bad\u{1b}[31m").is_err());
         assert!(validate_nick(&"x".repeat(33)).is_err());
         assert!(validate_nick(&"x".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn invisible_characters_are_rejected_in_nicks() {
+        for nick in ["bob\u{200B}", "\u{202E}evil", "\u{FEFF}x", "a\u{00AD}b", "a\u{2066}b", "ab\u{E0041}"] {
+            assert!(validate_nick(nick).is_err(), "{nick:?} should be rejected");
+        }
     }
 
     #[test]
