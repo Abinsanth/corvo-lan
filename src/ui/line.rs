@@ -78,6 +78,7 @@ impl Session {
 
     /// Handles a typed line. `shown` is the conversation its prompt showed:
     /// plain text goes there even if a join switched us while the user typed.
+    /// If the prompt showed none, the user means where they've just arrived.
     pub fn on_line(&mut self, line: &str, shown: Option<&Conv>) -> Reaction {
         match parse_line(line) {
             Input::Empty => Reaction::default(),
@@ -85,7 +86,7 @@ impl Session {
             Input::Help => Reaction::say(HELP),
             Input::Quit => Reaction { quit: true, ..Default::default() },
             Input::Who => Reaction::send(Command::ListPeers),
-            Input::Text(text) => match shown {
+            Input::Text(text) => match shown.or(self.store.current()) {
                 Some(Conv::Room(n)) => Reaction::send(Command::Send { to: Target::Room(n.clone()), text }),
                 Some(Conv::Dm(n)) => Reaction::send(Command::Send { to: Target::Dm(n.clone()), text }),
                 None => Reaction::say("! no conversation — /chat @nick or /create <name> <key>"),
@@ -337,6 +338,18 @@ mod tests {
         s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
         assert_eq!(s.on_line("for bob only", shown.as_ref()), send(Target::Dm("bobRoger".into()), "for bob only"));
         assert_eq!(s.prompt(), "#catPieR> ", "the next prompt shows the room");
+    }
+
+    #[test]
+    fn text_typed_right_after_creating_a_room_goes_to_it() {
+        let mut s = session();
+        // The prompt after /create still shows no conversation...
+        typed(&mut s, "/create cat 123");
+        let shown = s.store.current().cloned();
+        assert_eq!(shown, None);
+        // ...the room arrives while the user types, and that's where they mean.
+        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
+        assert_eq!(s.on_line("first!", shown.as_ref()), send(Target::Room("catPieR".into()), "first!"));
     }
 
     #[test]
