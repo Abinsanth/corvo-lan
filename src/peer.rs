@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
@@ -15,7 +15,7 @@ use tracing::debug;
 
 use crate::api::LeaveReason;
 use crate::names;
-use crate::node::{ConnKey, NodeMsg};
+use crate::node::{ConnKey, NodeMsg, Verdict};
 use crate::protocol::{read_frame, write_frame, Frame, PeerId, PROTOCOL_VERSION};
 
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -98,8 +98,19 @@ async fn handle(
         out: out_tx,
         accept: accept_tx,
     };
-    if node_tx.send(connected).await.is_err() || accept_rx.await != Ok(true) {
-        return; // Node gone, or it kept another connection to this peer.
+    if node_tx.send(connected).await.is_err() {
+        return;
+    }
+    match accept_rx.await {
+        Ok(Verdict::Keep) => {}
+        Ok(Verdict::Retire) => {
+            // Keep the write half open (no FIN) so the other side doesn't
+            // read this as us leaving while it still uses this connection.
+            let (mut rd, _wr) = stream.into_split();
+            read_loop(&mut rd, conn, id, &node_tx).await;
+            return;
+        }
+        Ok(Verdict::Close) | Err(_) => return,
     }
 
     let reason = run(stream, conn, id, out_rx, &node_tx).await;
@@ -133,45 +144,63 @@ async fn run(
     out_rx: mpsc::Receiver<Frame>,
     node_tx: &mpsc::Sender<NodeMsg>,
 ) -> LeaveReason {
-    let (mut rd, wr) = stream.into_split();
-    let mut writer = tokio::spawn(write_loop(wr, out_rx));
-
-    let read = async {
-        loop {
-            match timeout(IDLE_TIMEOUT, read_frame(&mut rd)).await {
-                Err(_) => {
-                    debug!(%id, "idle timeout");
-                    return LeaveReason::Lost;
-                }
-                Ok(Err(e)) => {
-                    debug!(%id, "read failed: {e}");
-                    return LeaveReason::Lost;
-                }
-                Ok(Ok(Frame::Bye)) => return LeaveReason::Quit,
-                Ok(Ok(Frame::Ping | Frame::Hello { .. })) => {}
-                Ok(Ok(frame)) => {
-                    if node_tx.send(NodeMsg::PeerFrame { conn, id, frame }).await.is_err() {
-                        return LeaveReason::Lost;
-                    }
-                }
-            }
-        }
-    };
+    let (mut rd, mut wr) = stream.into_split();
+    // The writer hands the write half back so a retired connection can stay half-open.
+    let mut writer = tokio::spawn(async move {
+        let exit = write_loop(&mut wr, out_rx).await;
+        (exit, wr)
+    });
+    let read = read_loop(&mut rd, conn, id, node_tx);
     tokio::pin!(read);
 
     let reason = tokio::select! {
         reason = &mut read => reason,
-        exit = &mut writer => match exit {
+        done = &mut writer => match done {
             // We said goodbye; keep reading until the peer closes its side.
-            Ok(WriterExit::Bye) => read.await,
+            Ok((WriterExit::Bye, _wr)) => read.await,
+            // The Node swapped us out for a duplicate: retire like a rejected one.
+            Ok((WriterExit::Closed, wr)) if !node_tx.is_closed() => {
+                let reason = read.await;
+                drop(wr);
+                reason
+            }
             other => {
-                debug!(%id, "writer stopped: {other:?}");
+                debug!(%id, "writer stopped: {:?}", other.map(|(exit, _)| exit));
                 LeaveReason::Lost
             }
         },
     };
     writer.abort();
     reason
+}
+
+/// Forwards frames from `rd` to the Node until EOF, an error, `Bye`, or
+/// `IDLE_TIMEOUT` of silence.
+async fn read_loop<R: AsyncRead + Unpin>(
+    rd: &mut R,
+    conn: ConnId,
+    id: PeerId,
+    node_tx: &mpsc::Sender<NodeMsg>,
+) -> LeaveReason {
+    loop {
+        match timeout(IDLE_TIMEOUT, read_frame(rd)).await {
+            Err(_) => {
+                debug!(%id, "idle timeout");
+                return LeaveReason::Lost;
+            }
+            Ok(Err(e)) => {
+                debug!(%id, "read failed: {e}");
+                return LeaveReason::Lost;
+            }
+            Ok(Ok(Frame::Bye)) => return LeaveReason::Quit,
+            Ok(Ok(Frame::Ping | Frame::Hello { .. })) => {}
+            Ok(Ok(frame)) => {
+                if node_tx.send(NodeMsg::PeerFrame { conn, id, frame }).await.is_err() {
+                    return LeaveReason::Lost;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -186,8 +215,9 @@ pub enum WriterExit {
 }
 
 /// Writes queued frames plus a `Ping` every `PING_INTERVAL`. Dropping `out_rx`
-/// on return is what `Sender::closed()` in Node shutdown waits for.
-async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut out_rx: mpsc::Receiver<Frame>) -> WriterExit {
+/// on return is what `Sender::closed()` in Node shutdown waits for. The caller
+/// keeps `wr`, so returning doesn't close the write half by itself.
+async fn write_loop<W: AsyncWrite + Unpin>(wr: &mut W, mut out_rx: mpsc::Receiver<Frame>) -> WriterExit {
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await; // first tick fires immediately
     loop {
@@ -198,7 +228,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut out_rx: mpsc::Receiver
             },
             _ = ping.tick() => Frame::Ping,
         };
-        match timeout(WRITE_TIMEOUT, write_frame(&mut wr, &frame)).await {
+        match timeout(WRITE_TIMEOUT, write_frame(wr, &frame)).await {
             Err(_) => return WriterExit::Stalled,
             Ok(Err(_)) => return WriterExit::Failed,
             Ok(Ok(())) if frame == Frame::Bye => return WriterExit::Bye,
@@ -213,20 +243,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn writer_gives_up_on_a_peer_that_stops_reading() {
-        let (ours, _theirs) = tokio::io::duplex(64); // the other end is never read
+        let (mut ours, _theirs) = tokio::io::duplex(64); // the other end is never read
         let (tx, rx) = mpsc::channel(4);
         tx.send(Frame::Chat { text: "x".repeat(1000), ts: 0 }).await.unwrap();
-        assert_eq!(write_loop(ours, rx).await, WriterExit::Stalled);
+        assert_eq!(write_loop(&mut ours, rx).await, WriterExit::Stalled);
     }
 
     #[tokio::test]
     async fn writer_stops_right_after_bye() {
-        let (ours, mut theirs) = tokio::io::duplex(4096);
+        let (mut ours, mut theirs) = tokio::io::duplex(4096);
         let (tx, rx) = mpsc::channel(4);
         tx.send(Frame::Chat { text: "hi".into(), ts: 0 }).await.unwrap();
         tx.send(Frame::Bye).await.unwrap();
         tx.send(Frame::Chat { text: "after bye".into(), ts: 0 }).await.unwrap();
-        assert_eq!(write_loop(ours, rx).await, WriterExit::Bye);
+        assert_eq!(write_loop(&mut ours, rx).await, WriterExit::Bye);
+        drop(ours);
         assert_eq!(read_frame(&mut theirs).await.unwrap(), Frame::Chat { text: "hi".into(), ts: 0 });
         assert_eq!(read_frame(&mut theirs).await.unwrap(), Frame::Bye);
         assert!(read_frame(&mut theirs).await.is_err()); // closed, nothing after Bye
@@ -234,9 +265,25 @@ mod tests {
 
     #[tokio::test]
     async fn writer_stops_when_the_node_drops_its_sender() {
-        let (ours, _theirs) = tokio::io::duplex(4096);
+        let (mut ours, _theirs) = tokio::io::duplex(4096);
         let (tx, rx) = mpsc::channel::<Frame>(4);
         drop(tx);
-        assert_eq!(write_loop(ours, rx).await, WriterExit::Closed);
+        assert_eq!(write_loop(&mut ours, rx).await, WriterExit::Closed);
+    }
+
+    #[tokio::test]
+    async fn read_loop_forwards_frames_until_the_peer_closes() {
+        let (mut ours, mut theirs) = tokio::io::duplex(4096);
+        let (node_tx, mut node_rx) = mpsc::channel(4);
+        let chat = Frame::Chat { text: "late".into(), ts: 0 };
+        write_frame(&mut theirs, &Frame::Ping).await.unwrap();
+        write_frame(&mut theirs, &chat).await.unwrap();
+        drop(theirs);
+        assert_eq!(read_loop(&mut ours, 7, PeerId(9), &node_tx).await, LeaveReason::Lost);
+        match node_rx.try_recv() {
+            Ok(NodeMsg::PeerFrame { conn: 7, id: PeerId(9), frame }) => assert_eq!(frame, chat),
+            _ => panic!("expected the chat frame to be forwarded"),
+        }
+        assert!(node_rx.try_recv().is_err()); // Ping is swallowed
     }
 }

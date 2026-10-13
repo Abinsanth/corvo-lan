@@ -58,8 +58,7 @@ pub enum NodeMsg {
         key: ConnKey,
         dialed_as: Option<PeerId>,
         out: mpsc::Sender<Frame>,
-        /// Node replies `true` to keep the connection, `false` to close it.
-        accept: oneshot::Sender<bool>,
+        accept: oneshot::Sender<Verdict>,
     },
     PeerFrame { conn: ConnId, id: PeerId, frame: Frame },
     PeerGone { conn: ConnId, id: PeerId, reason: LeaveReason },
@@ -78,6 +77,19 @@ pub struct ConnKey {
     pub outbound: bool,
     /// Source port of the dialing side; the same number on both ends.
     pub dialer_port: u16,
+}
+
+/// The Node's answer to a finished handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Use this connection.
+    Keep,
+    /// A duplicate that lost the tie-break. The other side may not have
+    /// noticed yet, so stop writing but keep reading until it drops it,
+    /// instead of losing frames it already sent.
+    Retire,
+    /// Refused (ourselves, or at the peer limit): close now.
+    Close,
 }
 
 /// When two connections to the same peer exist, both sides keep the one
@@ -330,8 +342,8 @@ impl Node {
                     self.dialing.remove(&expected);
                     self.backoff.remove(&expected);
                 }
-                let keep = self.on_connected(PeerEntry { conn, nick, addr, key, out, limit: RateLimit::new(Instant::now()) }, id);
-                let _ = accept.send(keep);
+                let verdict = self.on_connected(PeerEntry { conn, nick, addr, key, out, limit: RateLimit::new(Instant::now()) }, id);
+                let _ = accept.send(verdict);
             }
             NodeMsg::PeerFrame { conn, id, frame } => self.on_frame(conn, id, frame),
             NodeMsg::PeerGone { conn, id, reason } => {
@@ -370,36 +382,37 @@ impl Node {
         peer::dial(s.tcp_addr, Some(id), self.me(), self.msg_tx.clone());
     }
 
-    /// Returns whether to keep the new connection.
-    fn on_connected(&mut self, entry: PeerEntry, id: PeerId) -> bool {
+    fn on_connected(&mut self, entry: PeerEntry, id: PeerId) -> Verdict {
         if id == self.id {
-            return false;
+            return Verdict::Close;
         }
         match self.peers.get(&id) {
             None if self.peers.len() >= MAX_PEERS => {
                 warn!(%id, "refusing peer: already at {MAX_PEERS} peers");
-                false
+                Verdict::Close
             }
             None => {
                 self.peers.insert(id, entry);
                 self.emit(Event::PeerJoined { id, nick: self.display(id) });
-                true
+                Verdict::Keep
             }
             Some(existing) => {
                 if keep_new_connection(self.id, id, existing.key, entry.key) {
-                    // Dropping the old sender closes the old connection quietly.
+                    // Dropping the old sender retires the old connection.
                     self.peers.insert(id, entry);
-                    true
+                    Verdict::Keep
                 } else {
-                    false
+                    Verdict::Retire
                 }
             }
         }
     }
 
-    fn on_frame(&mut self, conn: ConnId, id: PeerId, frame: Frame) {
-        let Some(peer) = self.peers.get_mut(&id).filter(|p| p.conn == conn) else {
-            return; // stale duplicate connection
+    /// Frames count from any connection to a known peer, including one being
+    /// retired after a duplicate race; it may carry messages sent before the swap.
+    fn on_frame(&mut self, _conn: ConnId, id: PeerId, frame: Frame) {
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return;
         };
         if !peer.limit.allow(Instant::now()) {
             if !std::mem::replace(&mut peer.limit.warned, true) {
@@ -485,6 +498,10 @@ mod tests {
         }
 
         fn connect_key(&mut self, id: PeerId, nick: &str, key: ConnKey) -> bool {
+            self.connect_verdict(id, nick, key) == Verdict::Keep
+        }
+
+        fn connect_verdict(&mut self, id: PeerId, nick: &str, key: ConnKey) -> Verdict {
             let (out, rx) = mpsc::channel(8);
             let conn = self.next_conn;
             self.next_conn += 1;
@@ -496,11 +513,11 @@ mod tests {
                 out,
                 limit: RateLimit::new(Instant::now()),
             };
-            let keep = self.node.on_connected(entry, id);
-            if keep {
+            let verdict = self.node.on_connected(entry, id);
+            if verdict == Verdict::Keep {
                 self.outboxes.insert(id, rx);
             }
-            keep
+            verdict
         }
 
         fn sent(&mut self, id: PeerId) -> Vec<Frame> {
@@ -561,7 +578,7 @@ mod tests {
         for i in 0..MAX_PEERS as u64 {
             assert!(h.connect(PeerId(0x4000_0000_0000_0000 + i), "p", true));
         }
-        assert!(!h.connect(PeerId(0x5000_0000_0000_0000), "late", true));
+        assert_eq!(h.connect_verdict(PeerId(0x5000_0000_0000_0000), "late", out(1)), Verdict::Close);
         assert_eq!(h.node.peers.len(), MAX_PEERS);
     }
 
@@ -696,15 +713,27 @@ mod tests {
     }
 
     #[test]
-    fn frames_from_stale_connection_are_ignored() {
+    fn frames_from_a_replaced_connection_still_arrive_but_its_close_is_silent() {
         let mut h = Harness::new();
         h.connect(BOB, "bob", false); // conn 1
         h.connect(BOB, "bob", true); // conn 2 replaces it
         h.events();
-        h.node.on_frame(1, BOB, Frame::Chat { text: "old".into(), ts: 0 });
+        // bob may have sent this before he switched over too.
+        h.node.on_frame(1, BOB, Frame::Chat { text: "in flight".into(), ts: 0 });
         h.node.handle_msg(NodeMsg::PeerGone { conn: 1, id: BOB, reason: LeaveReason::Lost });
-        assert!(h.events().is_empty());
+        assert_eq!(
+            h.events(),
+            vec![Event::Message { from_id: BOB, from_nick: "bob".into(), text: "in flight".into(), direct: false, ts: 0 }]
+        );
         assert!(h.node.peers.contains_key(&BOB));
+    }
+
+    #[test]
+    fn losing_duplicates_are_retired_and_other_refusals_closed() {
+        let mut h = Harness::new();
+        assert_eq!(h.connect_verdict(BOB, "bob", out(5000)), Verdict::Keep);
+        assert_eq!(h.connect_verdict(BOB, "bob", out(6000)), Verdict::Retire);
+        assert_eq!(h.connect_verdict(ME, "me", out(7000)), Verdict::Close);
     }
 
     #[test]
