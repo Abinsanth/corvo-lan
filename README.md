@@ -91,3 +91,7 @@ Work happens on `main`. To ship, bump `version` in `Cargo.toml`, then merge
 tags `v<version>`, and publishes them as a GitHub Release, which is what the
 install script downloads. A version that's already released is refused, so
 bump it first.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
