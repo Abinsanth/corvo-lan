@@ -4,7 +4,7 @@
 pub mod state;
 pub mod view;
 
-use std::io::{Stdout, stdout};
+use std::io::{IsTerminal, Stdout, stdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -18,7 +18,8 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use tokio::sync::mpsc;
 
@@ -51,10 +52,15 @@ fn restore_terminal() {
 }
 
 /// Restores the terminal before a panic message prints, so it stays usable.
+/// Only for a panic on the installing (UI) thread: one in a tokio task is caught
+/// there, and the TUI keeps running on the terminal it set up.
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
+    let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
+        if std::thread::current().id() == ui_thread {
+            restore_terminal();
+        }
         previous(info);
     }));
 }
@@ -235,17 +241,38 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
     follow_current(state, before, session);
 }
 
+/// The full-screen UI writes escape codes, so without a terminal it hands back to line mode.
+fn without_terminal(ctx: &Ctx, is_terminal: bool) -> Option<Exit> {
+    if is_terminal {
+        return None;
+    }
+    ctx.notify("! the full-screen UI needs a terminal");
+    Some(Exit::Switch(Mode::Line))
+}
+
+type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// A ratatui terminal on a cleared screen. Never `Terminal::clear`: it asks the
+/// terminal for the cursor position and fails after a timeout if there's no answer.
+fn open_terminal() -> std::io::Result<Term> {
+    let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    execute!(stdout(), Clear(ClearType::All))?;
+    Ok(terminal)
+}
+
 pub async fn run(ctx: &mut Ctx) -> anyhow::Result<Exit> {
-    let guard = match TerminalGuard::enter() {
-        Ok(guard) => guard,
+    if let Some(exit) = without_terminal(ctx, stdout().is_terminal()) {
+        return Ok(exit);
+    }
+    // Any setup failure drops the guard (restoring the terminal) and falls back to line mode.
+    let (mut terminal, guard) = match TerminalGuard::enter().and_then(|guard| Ok((open_terminal()?, guard))) {
+        Ok(setup) => setup,
         Err(e) => {
             restore_terminal();
             ctx.notify(format!("* couldn't start the full-screen UI ({e}); using line mode"));
             return Ok(Exit::Switch(Mode::Line));
         }
     };
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    terminal.clear()?;
     let (tx, mut input) = mpsc::unbounded_channel();
     let reader = InputThread::start(tx);
     let mut state = TuiState::new(ctx.session.color());
@@ -291,7 +318,7 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<Exit> {
 async fn on_terminal_event(
     ctx: &mut Ctx,
     state: &mut TuiState,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Term,
     ev: TermEvent,
 ) -> anyhow::Result<Option<Exit>> {
     let now = Instant::now();
@@ -300,7 +327,11 @@ async fn on_terminal_event(
             Some(KeyOutcome::Send(text)) => on_send(&mut ctx.session, state, text, now),
             Some(KeyOutcome::Quit) => Some(Reaction { quit: true, ..Default::default() }),
             Some(KeyOutcome::Redraw) => {
-                terminal.clear()?;
+                // A fresh terminal has an empty back buffer, so the next draw repaints
+                // everything on the cleared screen; if it can't be built, keep the old one.
+                if let Ok(fresh) = open_terminal() {
+                    *terminal = fresh;
+                }
                 None
             }
             Some(KeyOutcome::Stay) | None => None,
@@ -430,6 +461,25 @@ mod tests {
         assert_eq!(state.editor.text(), "older");
         apply_key(&mut s, &mut state, Action::Down);
         assert_eq!(state.editor.text(), "hi");
+    }
+
+    #[test]
+    fn without_a_terminal_it_stays_in_line_mode() {
+        let (commands, _cmd_rx) = mpsc::channel(1);
+        let (_event_tx, events) = mpsc::unbounded_channel();
+        let (notice_tx, mut notices) = mpsc::unbounded_channel();
+        let ctx = Ctx {
+            session: session(),
+            commands,
+            events,
+            notices: mpsc::unbounded_channel().1,
+            notice_tx: notice_tx.clone(),
+            updater: crate::ui::updates::Updater::new(notice_tx),
+        };
+        assert_eq!(without_terminal(&ctx, true), None);
+        assert!(notices.try_recv().is_err(), "nothing to say on a terminal");
+        assert_eq!(without_terminal(&ctx, false), Some(Exit::Switch(Mode::Line)));
+        assert_eq!(notices.try_recv().unwrap().text, "! the full-screen UI needs a terminal");
     }
 
     #[test]
