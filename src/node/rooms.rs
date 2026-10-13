@@ -52,6 +52,8 @@ pub(super) struct Rooms {
     joining: HashMap<RoomId, PendingJoin>,
     /// Names whose keys are being derived right now.
     deriving: HashSet<String>,
+    /// Peers we've already told the user have a skewed clock.
+    skew_warned: HashSet<PeerId>,
     last_here: Option<Instant>,
 }
 
@@ -236,6 +238,10 @@ impl Node {
                 debug!(%from, "room frame failed to open");
                 return;
             };
+            if skewed(env.ts) {
+                self.warn_skew(from, env.ts);
+                return;
+            }
             if !room.replay.accept(nonce, env.ts, now_millis()) {
                 debug!(%from, "stale or replayed room frame");
                 return;
@@ -261,6 +267,10 @@ impl Node {
             let Some((env, nonce)) = room::open(&p.keys, from, nonce, ct) else {
                 return;
             };
+            if skewed(env.ts) {
+                self.warn_skew(from, env.ts);
+                return;
+            }
             if !p.replay.accept(nonce, env.ts, now_millis()) {
                 return;
             }
@@ -270,6 +280,18 @@ impl Node {
                     self.after(super::JOIN_SETTLE, NodeMsg::JoinSettled(id));
                 }
             }
+        }
+    }
+
+    /// A frame that opened proves its sender has the key, so a stale one means
+    /// their clock is off, not a wrong key; say so once instead of failing silently.
+    fn warn_skew(&mut self, from: PeerId, ts: u64) {
+        if !self.rooms.skew_warned.insert(from) {
+            return;
+        }
+        if let Some(nick) = self.nick_of(from) {
+            let minutes = ts.abs_diff(now_millis()) / 60_000;
+            self.emit(Event::Info(format!("@{nick}'s clock is {minutes} min off; their room messages are ignored")));
         }
     }
 
@@ -332,6 +354,10 @@ impl Node {
             }
         }
     }
+}
+
+fn skewed(ts: u64) -> bool {
+    ts.abs_diff(now_millis()) > room::MAX_SKEW_MS
 }
 
 #[cfg(test)]
@@ -519,6 +545,23 @@ mod tests {
         // A room we're not in.
         deliver(&mut h, BOB, frame_from(BOB, &room::derive("dogPieR", KEY), RoomBody::Chat { text: "x".into() }));
         assert!(h.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_clock_is_off_is_named_once() {
+        let mut h = with_peers();
+        let name = create(&mut h).await;
+        let id = h.node.rooms.id_of(&name).unwrap();
+        let keys = h.node.rooms.joined[&id].keys.clone();
+        let ten_min_ago = now_millis() - 10 * 60 * 1000;
+        for text in ["one", "two"] {
+            let env = RoomEnvelope { ts: ten_min_ago, body: RoomBody::Chat { text: text.into() } };
+            deliver(&mut h, BOB, room::seal(&keys, BOB, &env));
+        }
+        assert_eq!(
+            h.events(),
+            vec![Event::Info("@bobRoger's clock is 10 min off; their room messages are ignored".into())]
+        );
     }
 
     #[tokio::test]
