@@ -1,15 +1,15 @@
 #!/bin/sh
-# Installs the latest lan-chat release (https://github.com/Abinsanth/lan-chat):
+# Installs the latest corvo-lan release (https://github.com/Abinsanth/corvo-lan):
 #
-#   curl -fsSL https://raw.githubusercontent.com/Abinsanth/lan-chat/release/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Abinsanth/corvo-lan/release/install.sh | sh
 #
-# Installs to ~/.local/bin, or to $LAN_CHAT_INSTALL_DIR if set. Never uses sudo.
+# Installs to ~/.local/bin, or to $CORVO_LAN_INSTALL_DIR if set. Never uses sudo.
 set -eu
 
-REPO="Abinsanth/lan-chat"
+REPO="Abinsanth/corvo-lan"
 
 fail() {
-    echo "lan-chat install: $*" >&2
+    echo "corvo-lan install: $*" >&2
     exit 1
 }
 
@@ -31,9 +31,9 @@ sha256() {
 main() {
     need curl
     need tar
-    install_dir="${LAN_CHAT_INSTALL_DIR:-$HOME/.local/bin}"
+    install_dir="${CORVO_LAN_INSTALL_DIR:-$HOME/.local/bin}"
     # Overridable only to test this script against a local copy of a release.
-    base_url="${LAN_CHAT_BASE_URL:-https://github.com/$REPO/releases/latest/download}"
+    base_url="${CORVO_LAN_BASE_URL:-https://github.com/$REPO/releases/latest/download}"
 
     case "$(uname -s)" in
         Darwin) os=apple-darwin ;;
@@ -50,7 +50,7 @@ main() {
         arch=aarch64
     fi
 
-    asset="lan-chat-$arch-$os.tar.gz"
+    asset="corvo-lan-$arch-$os.tar.gz"
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
 
@@ -63,14 +63,14 @@ main() {
 
     tar -xzf "$tmp/$asset" -C "$tmp"
     mkdir -p "$install_dir"
-    # Copy then rename, so replacing a running lan-chat is safe.
-    cp "$tmp/lan-chat" "$install_dir/.lan-chat.new"
-    chmod 755 "$install_dir/.lan-chat.new"
-    mv -f "$install_dir/.lan-chat.new" "$install_dir/lan-chat"
+    # Copy then rename, so replacing a running corvo-lan is safe.
+    cp "$tmp/corvo-lan" "$install_dir/.corvo-lan.new"
+    chmod 755 "$install_dir/.corvo-lan.new"
+    mv -f "$install_dir/.corvo-lan.new" "$install_dir/corvo-lan"
 
-    echo "installed $("$install_dir/lan-chat" --version) to $install_dir"
+    echo "installed $("$install_dir/corvo-lan" --version) to $install_dir"
     case ":$PATH:" in
-        *":$install_dir:"*) echo "run: lan-chat" ;;
+        *":$install_dir:"*) echo "run: corvo-lan" ;;
         *)
             echo
             echo "$install_dir isn't on your PATH. Add this line to your shell profile"

@@ -13,10 +13,10 @@ use sha2::{Digest, Sha256};
 
 use crate::room::to_hex;
 
-pub const REPO: &str = "Abinsanth/lan-chat";
-pub const INSTALL_URL: &str = "https://raw.githubusercontent.com/Abinsanth/lan-chat/release/install.sh";
+pub const REPO: &str = "Abinsanth/corvo-lan";
+pub const INSTALL_URL: &str = "https://raw.githubusercontent.com/Abinsanth/corvo-lan/release/install.sh";
 /// Names the temp dir an install works in, beside the binary it replaces.
-const TMP_PREFIX: &str = ".lan-chat-update-";
+const TMP_PREFIX: &str = ".corvo-lan-update-";
 /// Most PR titles shown per release.
 const SUMMARY_LINES: usize = 3;
 
@@ -113,10 +113,10 @@ pub fn asset_name(os: &str, arch: &str) -> Option<String> {
         "x86_64" | "aarch64" => arch,
         _ => return None,
     };
-    Some(format!("lan-chat-{arch}-{os}.tar.gz"))
+    Some(format!("corvo-lan-{arch}-{os}.tar.gz"))
 }
 
-/// Whether `LAN_CHAT_NO_UPDATE_CHECK=<value>` turns the startup check off.
+/// Whether `CORVO_LAN_NO_UPDATE_CHECK=<value>` turns the startup check off.
 pub fn check_disabled_by(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
 }
@@ -142,7 +142,7 @@ pub async fn check() -> Result<Vec<Release>, String> {
 }
 
 pub async fn check_with(urls: &Urls, current: Version) -> Result<Vec<Release>, String> {
-    let agent = format!("User-Agent: lan-chat/{current}");
+    let agent = format!("User-Agent: corvo-lan/{current}");
     let accept = "Accept: application/vnd.github+json";
     let body = curl(["-fsSL", "--max-time", "10", "-H", accept, "-H", &agent, &urls.api]).await?;
     let json = String::from_utf8(body).map_err(|_| "unexpected reply from GitHub".to_string())?;
@@ -201,9 +201,9 @@ async fn install_in(tmp: &Path, urls: &Urls, version: Version, asset: &str, targ
         Err(e) if e.kind() == ErrorKind::NotFound => return Err("/update needs tar, which isn't installed".into()),
         Err(e) => return Err(format!("couldn't run tar: {e}")),
     }
-    let new = tmp.join("lan-chat");
+    let new = tmp.join("corvo-lan");
     if !new.is_file() {
-        return Err("the download didn't contain lan-chat; nothing changed".into());
+        return Err("the download didn't contain corvo-lan; nothing changed".into());
     }
     std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
     // The running process keeps its open copy of the old file; restarting picks up the new one.
@@ -276,7 +276,7 @@ mod tests {
 
     const API: &str = r###"[
       {"tag_name": "v0.2.1", "draft": false, "prerelease": false, "published_at": "2026-10-20T09:00:00Z",
-       "body": "## What's Changed\n* Fix long names wrapping by @Abinsanth in https://github.com/Abinsanth/lan-chat/pull/12\n\n**Full Changelog**: x"},
+       "body": "## What's Changed\n* Fix long names wrapping by @Abinsanth in https://github.com/Abinsanth/corvo-lan/pull/12\n\n**Full Changelog**: x"},
       {"tag_name": "v0.10.0", "draft": false, "prerelease": false, "published_at": "2026-12-01T09:00:00Z",
        "body": "* TUI by @a in u\n* Room expiry by @a in u\n* Update command by @a in u\n* Fourth by @a in u"},
       {"tag_name": "v0.9.0", "draft": true, "prerelease": false, "published_at": null, "body": ""},
@@ -336,10 +336,10 @@ mod tests {
 
     #[test]
     fn asset_names_match_the_release_workflow() {
-        assert_eq!(asset_name("macos", "aarch64").as_deref(), Some("lan-chat-aarch64-apple-darwin.tar.gz"));
-        assert_eq!(asset_name("macos", "x86_64").as_deref(), Some("lan-chat-x86_64-apple-darwin.tar.gz"));
-        assert_eq!(asset_name("linux", "x86_64").as_deref(), Some("lan-chat-x86_64-unknown-linux-musl.tar.gz"));
-        assert_eq!(asset_name("linux", "aarch64").as_deref(), Some("lan-chat-aarch64-unknown-linux-musl.tar.gz"));
+        assert_eq!(asset_name("macos", "aarch64").as_deref(), Some("corvo-lan-aarch64-apple-darwin.tar.gz"));
+        assert_eq!(asset_name("macos", "x86_64").as_deref(), Some("corvo-lan-x86_64-apple-darwin.tar.gz"));
+        assert_eq!(asset_name("linux", "x86_64").as_deref(), Some("corvo-lan-x86_64-unknown-linux-musl.tar.gz"));
+        assert_eq!(asset_name("linux", "aarch64").as_deref(), Some("corvo-lan-aarch64-unknown-linux-musl.tar.gz"));
         assert_eq!(asset_name("windows", "x86_64"), None);
         assert_eq!(asset_name("linux", "riscv64"), None);
     }
@@ -361,27 +361,27 @@ mod tests {
     fn scratch(name: &str) -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("lan-chat-test-{}-{n}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("corvo-lan-test-{}-{n}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    /// A fake release `v<version>` under `root`: a tarball holding a `lan-chat`
+    /// A fake release `v<version>` under `root`: a tarball holding a `corvo-lan`
     /// script that prints `marker`, and its checksum file.
     fn fake_release(root: &Path, version: &str, asset: &str, marker: &str) -> Urls {
         let dir = root.join(format!("v{version}"));
         std::fs::create_dir_all(&dir).unwrap();
         let src = root.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("lan-chat"), format!("#!/bin/sh\necho {marker}\n")).unwrap();
+        std::fs::write(src.join("corvo-lan"), format!("#!/bin/sh\necho {marker}\n")).unwrap();
         let archive = dir.join(asset);
         let ok = std::process::Command::new("tar")
             .arg("-czf")
             .arg(&archive)
             .arg("-C")
             .arg(&src)
-            .arg("lan-chat")
+            .arg("corvo-lan")
             .status()
             .unwrap();
         assert!(ok.success());
@@ -391,7 +391,7 @@ mod tests {
     }
 
     fn old_binary(dir: &Path) -> PathBuf {
-        let target = dir.join("lan-chat");
+        let target = dir.join("corvo-lan");
         std::fs::write(&target, "old").unwrap();
         target
     }
@@ -400,11 +400,11 @@ mod tests {
         std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n != "lan-chat")
+            .filter(|n| n != "corvo-lan")
             .collect()
     }
 
-    const ASSET: &str = "lan-chat-test.tar.gz";
+    const ASSET: &str = "corvo-lan-test.tar.gz";
 
     #[tokio::test]
     async fn check_reads_the_api_and_keeps_newer_releases() {
@@ -474,11 +474,11 @@ mod tests {
         let urls = fake_release(&root, "0.3.0", ASSET, "new");
         let target = old_binary(&bin);
         // Left by earlier runs (other process ids): one quit mid-download, one odd file.
-        let stale = bin.join(".lan-chat-update-1");
+        let stale = bin.join(".corvo-lan-update-1");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("junk"), "x").unwrap();
-        std::fs::write(bin.join(".lan-chat-update-2"), "x").unwrap();
-        std::fs::write(bin.join(format!(".lan-chat-update-{}", std::process::id())), "x").unwrap();
+        std::fs::write(bin.join(".corvo-lan-update-2"), "x").unwrap();
+        std::fs::write(bin.join(format!(".corvo-lan-update-{}", std::process::id())), "x").unwrap();
         install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
         assert!(leftovers(&bin).is_empty(), "{:?}", leftovers(&bin));
     }

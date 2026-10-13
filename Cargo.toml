@@ -1,7 +1,12 @@
 [package]
-name = "lan-chat"
+name = "corvo-lan"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Serverless peer-to-peer chat for your local network"
+license = "Apache-2.0"
+repository = "https://github.com/Abinsanth/corvo-lan"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"

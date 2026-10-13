@@ -3,10 +3,10 @@ use std::net::SocketAddr;
 use anyhow::anyhow;
 use clap::Parser;
 
-use lan_chat::names;
-use lan_chat::node::{self, NodeConfig};
-use lan_chat::ui;
-use lan_chat::update;
+use corvo_lan::names;
+use corvo_lan::node::{self, NodeConfig};
+use corvo_lan::ui;
+use corvo_lan::update;
 
 /// Serverless peer-to-peer chat for your local network.
 #[derive(Parser)]
@@ -21,10 +21,10 @@ struct Args {
     /// Connect to a peer directly, e.g. 192.168.1.20:54321 (repeatable)
     #[arg(long = "peer", value_name = "IP:PORT")]
     peers: Vec<SocketAddr>,
-    /// Write debug logs to ./lan-chat.log
+    /// Write debug logs to ./corvo-lan.log
     #[arg(long)]
     debug: bool,
-    /// Don't check GitHub for a newer version at startup (or set LAN_CHAT_NO_UPDATE_CHECK=1)
+    /// Don't check GitHub for a newer version at startup (or set CORVO_LAN_NO_UPDATE_CHECK=1)
     #[arg(long)]
     no_update_check: bool,
 }
@@ -33,7 +33,7 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     if args.debug {
-        let file = std::fs::File::create("lan-chat.log")?;
+        let file = std::fs::File::create("corvo-lan.log")?;
         tracing_subscriber::fmt()
             .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
@@ -53,6 +53,6 @@ async fn main() -> anyhow::Result<()> {
         fixed_word: None,
     })
     .await?;
-    let env_off = update::check_disabled_by(std::env::var("LAN_CHAT_NO_UPDATE_CHECK").ok().as_deref());
+    let env_off = update::check_disabled_by(std::env::var("CORVO_LAN_NO_UPDATE_CHECK").ok().as_deref());
     ui::line::run(handle, !args.no_update_check && !env_off).await
 }
