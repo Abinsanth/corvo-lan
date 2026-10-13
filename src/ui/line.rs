@@ -105,6 +105,14 @@ pub fn spawn_printer(mut print: impl FnMut(String) + Send + 'static) -> std::syn
     tx
 }
 
+/// Consecutive non-fatal readline errors tolerated before giving up on input.
+const MAX_READ_ERRORS: u32 = 3;
+
+/// Whether the input thread should stop after `err` (the `consecutive`-th in a row).
+fn readline_gives_up(err: &ReadlineError, consecutive: u32) -> bool {
+    matches!(err, ReadlineError::Interrupted | ReadlineError::Eof) || consecutive >= MAX_READ_ERRORS
+}
+
 /// Runs the frontend until the user quits, then waits for the Node to say goodbye.
 pub async fn run(handle: NodeHandle) -> anyhow::Result<()> {
     let NodeHandle { commands, mut events, task, .. } = handle;
@@ -123,53 +131,75 @@ pub async fn run(handle: NodeHandle) -> anyhow::Result<()> {
 
     // rustyline blocks, so it lives on its own thread. It waits for `resume`
     // before each prompt so we never exit while the terminal is in raw mode.
-    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<Option<String>>();
+    let (line_tx, mut lines) = mpsc::unbounded_channel::<Option<String>>();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
+        let mut errors = 0;
         loop {
             match editor.readline("> ") {
                 Ok(line) => {
+                    errors = 0;
                     let _ = editor.add_history_entry(line.as_str());
                     if line_tx.send(Some(line)).is_err() || resume_rx.recv().is_err() {
                         break;
                     }
                 }
-                Err(ReadlineError::Interrupted | ReadlineError::Eof) | Err(_) => {
-                    let _ = line_tx.send(None);
-                    break;
+                Err(e) => {
+                    errors += 1;
+                    if readline_gives_up(&e, errors) {
+                        let _ = line_tx.send(None);
+                        break;
+                    }
                 }
             }
         }
     });
 
+    let result = event_loop(&commands, &mut events, &mut lines, &resume_tx, print).await;
+    drop(resume_tx);
+    let _ = task.await;
+    result
+}
+
+/// Routes input lines to the Node and events to `print` until the user quits.
+/// Returns only while no prompt is active, so the terminal is never left raw.
+async fn event_loop(
+    commands: &mpsc::Sender<Command>,
+    events: &mut mpsc::UnboundedReceiver<Event>,
+    lines: &mut mpsc::UnboundedReceiver<Option<String>>,
+    resume: &std::sync::mpsc::Sender<()>,
+    print: impl Fn(String),
+) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             event = events.recv() => match event {
                 Some(event) => print(format_event(&event)),
-                None => break,
+                None => {
+                    // A prompt is showing; wait for it to return before exiting.
+                    print("! chat core stopped unexpectedly; press Enter to exit".into());
+                    lines.recv().await;
+                    return Ok(());
+                }
             },
-            line = line_rx.recv() => {
+            line = lines.recv() => {
                 let Some(line) = line.flatten() else {
                     let _ = commands.send(Command::Quit).await;
-                    break;
+                    return Ok(());
                 };
                 match parse_line(&line) {
                     Input::Command(Command::Quit) => {
                         let _ = commands.send(Command::Quit).await;
-                        break;
+                        return Ok(());
                     }
                     Input::Command(cmd) => commands.send(cmd).await?,
                     Input::Help => print(HELP.to_string()),
                     Input::Empty => {}
                     Input::Error(e) => print(format!("! {e}")),
                 }
-                let _ = resume_tx.send(());
+                let _ = resume.send(());
             }
         }
     }
-    drop(resume_tx);
-    let _ = task.await;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -179,6 +209,39 @@ mod tests {
 
     fn say(s: &str) -> Input {
         Input::Command(Command::Say(s.into()))
+    }
+
+    #[test]
+    fn only_ctrl_c_eof_or_repeated_errors_end_input() {
+        assert!(readline_gives_up(&ReadlineError::Interrupted, 1));
+        assert!(readline_gives_up(&ReadlineError::Eof, 1));
+        let glitch = || ReadlineError::Io(std::io::Error::other("glitch"));
+        assert!(!readline_gives_up(&glitch(), 1));
+        assert!(!readline_gives_up(&glitch(), 2));
+        assert!(readline_gives_up(&glitch(), 3));
+    }
+
+    #[tokio::test]
+    async fn when_the_core_stops_we_wait_for_the_prompt_before_exiting() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let (line_tx, mut lines) = mpsc::unbounded_channel();
+        let (resume_tx, _resume_rx) = std::sync::mpsc::channel();
+        let printed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = printed.clone();
+        drop(event_tx); // the Node is gone
+        let ui = tokio::spawn(async move {
+            let print = move |s: String| log.lock().unwrap().push(s);
+            event_loop(&cmd_tx, &mut events, &mut lines, &resume_tx, print).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Exiting now would leave rustyline's prompt (and raw mode) behind.
+        assert!(!ui.is_finished());
+        assert!(printed.lock().unwrap().iter().any(|s| s.contains("press Enter")));
+        line_tx.send(Some(String::new())).unwrap(); // user presses Enter
+        tokio::time::timeout(Duration::from_secs(1), ui).await.unwrap().unwrap().unwrap();
     }
 
     #[test]
