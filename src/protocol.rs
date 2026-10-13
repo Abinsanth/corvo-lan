@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 /// Largest JSON body accepted in a single TCP frame.
 pub const MAX_FRAME_LEN: usize = 64 * 1024;
 
@@ -75,8 +75,9 @@ impl Announce {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Frame {
     Hello { v: u8, id: PeerId, nick: String },
-    Chat { text: String, ts: u64 },
+    /// DM. Plaintext until v0.4.
     Direct { text: String, ts: u64 },
+    /// Only sent to settle a same-moment name clash (see node).
     Nick { nick: String },
     /// Encrypted room traffic, sent to every peer; see `room`. All fields are lowercase hex.
     Room { room_id: String, nonce: String, ct: String },
@@ -125,7 +126,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, Decode
     Ok(serde_json::from_slice(&body)?)
 }
 
-/// Current time as unix milliseconds, for `Frame::Chat`/`Frame::Direct` timestamps.
+/// Current time as unix milliseconds, for message timestamps.
 pub fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -148,11 +149,10 @@ mod tests {
     async fn every_frame_variant_round_trips() {
         let id = PeerId(0x7f3a_9c0d_12e4_5b68);
         let frames = vec![
-            Frame::Hello { v: PROTOCOL_VERSION, id, nick: "alice".into() },
-            Frame::Chat { text: "hello".into(), ts: 1 },
+            Frame::Hello { v: PROTOCOL_VERSION, id, nick: "aliceMoon".into() },
+            Frame::Room { room_id: "ab".repeat(16), nonce: "cd".repeat(24), ct: "ef".repeat(20) },
             Frame::Direct { text: "psst".into(), ts: 2 },
             Frame::Nick { nick: "bob".into() },
-            Frame::Room { room_id: "ab".repeat(16), nonce: "cd".repeat(24), ct: "ef".repeat(20) },
             Frame::Ping,
             Frame::Bye,
         ];
@@ -200,9 +200,9 @@ mod tests {
 
     #[test]
     fn announce_round_trips() {
-        let a = Announce { v: 1, id: PeerId(42), nick: "alice".into(), tcp_port: 54321 };
+        let a = Announce { v: 2, id: PeerId(42), nick: "aliceMoon".into(), tcp_port: 54321 };
         let json = String::from_utf8(a.to_bytes()).unwrap();
-        assert_eq!(json, r#"{"v":1,"id":"000000000000002a","nick":"alice","tcp_port":54321}"#);
+        assert_eq!(json, r#"{"v":2,"id":"000000000000002a","nick":"aliceMoon","tcp_port":54321}"#);
         assert_eq!(Announce::from_bytes(json.as_bytes()).unwrap(), a);
     }
 

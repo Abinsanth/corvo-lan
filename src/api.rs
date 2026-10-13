@@ -1,17 +1,41 @@
 //! The boundary between the networking core (`node`) and any frontend.
 //! A frontend sends `Command`s and renders `Event`s; it never touches sockets.
+//! Names here never carry the `@`/`#` sigils.
 
 use std::net::SocketAddr;
 
 pub use crate::protocol::PeerId;
 
+/// Where a message goes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Target {
+    Dm(String),
+    Room(String),
+}
+
+/// Which conversation a message belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Conv {
+    Dm(String),
+    Room(String),
+}
+
+impl From<Target> for Conv {
+    fn from(t: Target) -> Conv {
+        match t {
+            Target::Dm(n) => Conv::Dm(n),
+            Target::Room(n) => Conv::Room(n),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Room message to every connected peer.
-    Say(String),
-    /// Private message; `to` is a nick or `nick#abcd`.
-    Direct { to: String, text: String },
-    SetNick(String),
+    Send { to: Target, text: String },
+    /// `base` and `key_part` are what the user typed; the node adds the rest.
+    CreateRoom { base: String, key_part: String },
+    JoinRoom { name: String, key: String },
+    LeaveRoom { name: String },
     ListPeers,
     Quit,
 }
@@ -27,23 +51,30 @@ pub enum LeaveReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
     pub id: PeerId,
-    /// Display name (`nick` or `nick#abcd`).
     pub nick: String,
     pub addr: SocketAddr,
 }
 
-/// All nick fields are display names (`nick`, or `nick#abcd` on a clash).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// Our system-assigned name. `renamed` means a same-moment clash forced a new one.
+    Assigned { nick: String, renamed: bool },
     PeerJoined { id: PeerId, nick: String },
     PeerLeft { id: PeerId, nick: String, reason: LeaveReason },
-    NickChanged { id: PeerId, old: String, new: String },
-    Message { from_id: PeerId, from_nick: String, text: String, direct: bool, ts: u64 },
-    /// Confirms a DM we sent, so the UI can echo it.
-    DirectSent { to: String, text: String },
+    /// A peer re-rolled its name after a same-moment clash.
+    Renamed { old: String, new: String },
+    /// `ts` is when we received it (unix millis).
+    Message { conv: Conv, from: String, text: String, ts: u64 },
+    /// Something we sent, so the conversation store can record it.
+    Sent { conv: Conv, text: String, ts: u64 },
+    RoomCreated { name: String, key: String },
+    RoomJoined { name: String, members: Vec<String> },
+    RoomLeft { name: String },
+    MemberJoined { room: String, nick: String },
+    MemberLeft { room: String, nick: String },
     Peers(Vec<PeerInfo>),
-    /// User-facing problem, e.g. unknown `/msg` target.
+    /// User-facing problem, e.g. a wrong room key.
     Error(String),
-    /// User-facing notice, e.g. startup banner.
+    /// User-facing notice.
     Info(String),
 }

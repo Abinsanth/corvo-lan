@@ -1,0 +1,308 @@
+//! Conversations (rooms and DMs) built purely from `Event`s. UI-independent:
+//! the line UI uses it now and the v0.3 TUI will reuse it unchanged.
+
+use std::collections::{BTreeSet, VecDeque};
+
+use crate::api::{Conv, Event};
+
+/// Lines kept per conversation.
+pub const MAX_LINES: usize = 1000;
+pub const MAX_CONVS: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineKind {
+    Msg { from: String, text: String },
+    Mine { text: String },
+    Notice(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    /// Unix millis.
+    pub ts: u64,
+    pub kind: LineKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversation {
+    pub conv: Conv,
+    pub lines: VecDeque<Line>,
+    pub unread: u32,
+    /// DM partner is no longer connected.
+    pub offline: bool,
+    /// Room members other than us.
+    pub members: BTreeSet<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct Store {
+    me: Option<String>,
+    /// Oldest first.
+    convs: Vec<Conversation>,
+    current: Option<Conv>,
+    online: BTreeSet<String>,
+}
+
+impl Store {
+    pub fn new() -> Self {
+        Store::default()
+    }
+
+    pub fn me(&self) -> Option<&str> {
+        self.me.as_deref()
+    }
+
+    pub fn current(&self) -> Option<&Conv> {
+        self.current.as_ref()
+    }
+
+    pub fn conversations(&self) -> &[Conversation] {
+        &self.convs
+    }
+
+    pub fn get(&self, conv: &Conv) -> Option<&Conversation> {
+        self.convs.iter().find(|c| &c.conv == conv)
+    }
+
+    pub fn is_online(&self, nick: &str) -> bool {
+        self.online.contains(nick)
+    }
+
+    /// Makes `conv` current (creating it if needed) and marks it read.
+    pub fn switch(&mut self, conv: Conv) {
+        let c = self.entry(&conv);
+        c.unread = 0;
+        self.current = Some(conv);
+    }
+
+    /// The last `n` lines of the current conversation, oldest first; marks it read.
+    pub fn history(&mut self, n: usize) -> Vec<Line> {
+        let Some(conv) = self.current.clone() else {
+            return Vec::new();
+        };
+        let c = self.entry(&conv);
+        c.unread = 0;
+        let skip = c.lines.len().saturating_sub(n);
+        c.lines.iter().skip(skip).cloned().collect()
+    }
+
+    /// Folds one event into the store. `now` (unix millis) stamps notices.
+    pub fn apply(&mut self, event: &Event, now: u64) {
+        match event {
+            Event::Assigned { nick, .. } => self.me = Some(nick.clone()),
+            Event::PeerJoined { nick, .. } => {
+                self.online.insert(nick.clone());
+                if let Some(c) = self.find_mut(&Conv::Dm(nick.clone())) {
+                    c.offline = false;
+                }
+            }
+            Event::PeerLeft { nick, .. } => {
+                self.online.remove(nick);
+                if let Some(c) = self.find_mut(&Conv::Dm(nick.clone())) {
+                    c.offline = true;
+                }
+            }
+            Event::Renamed { old, new } => {
+                if self.online.remove(old) {
+                    self.online.insert(new.clone());
+                }
+            }
+            Event::Message { conv, from, text, ts } => {
+                let unread = self.current.as_ref() != Some(conv);
+                let c = self.entry(conv);
+                push(c, Line { ts: *ts, kind: LineKind::Msg { from: from.clone(), text: text.clone() } });
+                if unread {
+                    c.unread += 1;
+                }
+            }
+            Event::Sent { conv, text, ts } => {
+                push(self.entry(conv), Line { ts: *ts, kind: LineKind::Mine { text: text.clone() } })
+            }
+            Event::RoomCreated { name, .. } => {
+                let c = self.entry(&Conv::Room(name.clone()));
+                push(c, Line { ts: now, kind: LineKind::Notice(format!("created #{name}")) });
+            }
+            Event::RoomJoined { name, members } => {
+                let c = self.entry(&Conv::Room(name.clone()));
+                c.members = members.iter().cloned().collect();
+                push(c, Line { ts: now, kind: LineKind::Notice(format!("joined #{name}")) });
+            }
+            Event::RoomLeft { name } => {
+                let conv = Conv::Room(name.clone());
+                self.convs.retain(|c| c.conv != conv);
+                if self.current.as_ref() == Some(&conv) {
+                    self.current = None;
+                }
+            }
+            Event::MemberJoined { room, nick } => {
+                if let Some(c) = self.find_mut(&Conv::Room(room.clone())) {
+                    c.members.insert(nick.clone());
+                    push(c, Line { ts: now, kind: LineKind::Notice(format!("@{nick} joined")) });
+                }
+            }
+            Event::MemberLeft { room, nick } => {
+                if let Some(c) = self.find_mut(&Conv::Room(room.clone())) {
+                    c.members.remove(nick);
+                    push(c, Line { ts: now, kind: LineKind::Notice(format!("@{nick} left")) });
+                }
+            }
+            Event::Peers(_) | Event::Error(_) | Event::Info(_) => {}
+        }
+    }
+
+    fn find_mut(&mut self, conv: &Conv) -> Option<&mut Conversation> {
+        self.convs.iter_mut().find(|c| &c.conv == conv)
+    }
+
+    fn entry(&mut self, conv: &Conv) -> &mut Conversation {
+        if let Some(i) = self.convs.iter().position(|c| &c.conv == conv) {
+            return &mut self.convs[i];
+        }
+        if self.convs.len() >= MAX_CONVS {
+            self.evict();
+        }
+        let offline = matches!(conv, Conv::Dm(n) if !self.online.contains(n));
+        self.convs.push(Conversation {
+            conv: conv.clone(),
+            lines: VecDeque::new(),
+            unread: 0,
+            offline,
+            members: BTreeSet::new(),
+        });
+        self.convs.last_mut().expect("just pushed")
+    }
+
+    /// Drops the oldest offline DM, or failing that the oldest non-current conversation.
+    fn evict(&mut self) {
+        let current = self.current.clone();
+        let victim = self
+            .convs
+            .iter()
+            .position(|c| matches!(c.conv, Conv::Dm(_)) && c.offline)
+            .or_else(|| self.convs.iter().position(|c| Some(&c.conv) != current.as_ref()));
+        if let Some(i) = victim {
+            self.convs.remove(i);
+        }
+    }
+}
+
+fn push(c: &mut Conversation, line: Line) {
+    if c.lines.len() == MAX_LINES {
+        c.lines.pop_front();
+    }
+    c.lines.push_back(line);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{LeaveReason, PeerId};
+
+    fn room(n: &str) -> Conv {
+        Conv::Room(n.into())
+    }
+
+    fn dm(n: &str) -> Conv {
+        Conv::Dm(n.into())
+    }
+
+    fn msg(conv: Conv, from: &str, text: &str) -> Event {
+        Event::Message { conv, from: from.into(), text: text.into(), ts: 1 }
+    }
+
+    #[test]
+    fn messages_outside_the_current_conversation_count_as_unread() {
+        let mut s = Store::new();
+        s.switch(room("catPieR"));
+        s.apply(&msg(room("catPieR"), "bobRoger", "in view"), 0);
+        s.apply(&msg(dm("bobRoger"), "bobRoger", "psst"), 0);
+        s.apply(&msg(dm("bobRoger"), "bobRoger", "psst again"), 0);
+        assert_eq!(s.get(&room("catPieR")).unwrap().unread, 0);
+        assert_eq!(s.get(&dm("bobRoger")).unwrap().unread, 2);
+        s.switch(dm("bobRoger"));
+        assert_eq!(s.get(&dm("bobRoger")).unwrap().unread, 0);
+        assert_eq!(s.current(), Some(&dm("bobRoger")));
+    }
+
+    #[test]
+    fn history_returns_the_tail_and_marks_read() {
+        let mut s = Store::new();
+        s.switch(room("catPieR"));
+        s.switch(dm("bobRoger"));
+        for i in 0..5 {
+            s.apply(&msg(room("catPieR"), "bobRoger", &format!("m{i}")), 0);
+        }
+        s.apply(&Event::Sent { conv: room("catPieR"), text: "mine".into(), ts: 2 }, 0);
+        s.switch(room("catPieR"));
+        s.apply(&msg(room("catPieR"), "bobRoger", "late"), 0);
+        let tail = s.history(2);
+        assert_eq!(tail[0].kind, LineKind::Mine { text: "mine".into() });
+        assert_eq!(tail[1].kind, LineKind::Msg { from: "bobRoger".into(), text: "late".into() });
+        assert_eq!(s.get(&room("catPieR")).unwrap().unread, 0);
+        assert_eq!(s.history(100).len(), 7);
+    }
+
+    #[test]
+    fn lines_are_capped_per_conversation() {
+        let mut s = Store::new();
+        for i in 0..MAX_LINES + 5 {
+            s.apply(&msg(dm("bobRoger"), "bobRoger", &i.to_string()), 0);
+        }
+        let c = s.get(&dm("bobRoger")).unwrap();
+        assert_eq!(c.lines.len(), MAX_LINES);
+        assert_eq!(c.lines[0].kind, LineKind::Msg { from: "bobRoger".into(), text: "5".into() });
+    }
+
+    #[test]
+    fn dm_partners_go_offline_and_back() {
+        let mut s = Store::new();
+        let id = PeerId(1);
+        s.apply(&Event::PeerJoined { id, nick: "bobRoger".into() }, 0);
+        s.switch(dm("bobRoger"));
+        assert!(!s.get(&dm("bobRoger")).unwrap().offline);
+        s.apply(&Event::PeerLeft { id, nick: "bobRoger".into(), reason: LeaveReason::Lost }, 0);
+        assert!(s.get(&dm("bobRoger")).unwrap().offline);
+        assert!(!s.is_online("bobRoger"));
+        s.apply(&Event::PeerJoined { id, nick: "bobRoger".into() }, 0);
+        assert!(!s.get(&dm("bobRoger")).unwrap().offline);
+        // A DM opened with someone not online starts offline.
+        s.switch(dm("ghostMoon"));
+        assert!(s.get(&dm("ghostMoon")).unwrap().offline);
+    }
+
+    #[test]
+    fn rooms_track_members_and_vanish_on_leave() {
+        let mut s = Store::new();
+        s.apply(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
+        s.switch(room("catPieR"));
+        s.apply(&Event::MemberJoined { room: "catPieR".into(), nick: "carolFox".into() }, 0);
+        s.apply(&Event::MemberLeft { room: "catPieR".into(), nick: "bobRoger".into() }, 0);
+        let c = s.get(&room("catPieR")).unwrap();
+        assert_eq!(c.members.iter().cloned().collect::<Vec<_>>(), vec!["carolFox".to_string()]);
+        assert!(c.lines.iter().any(|l| l.kind == LineKind::Notice("@carolFox joined".into())));
+        s.apply(&Event::RoomLeft { name: "catPieR".into() }, 0);
+        assert!(s.get(&room("catPieR")).is_none());
+        assert_eq!(s.current(), None);
+    }
+
+    #[test]
+    fn full_store_evicts_the_oldest_offline_dm_first() {
+        let mut s = Store::new();
+        s.switch(dm("keepFox")); // offline, but older ones go first
+        for i in 0..MAX_CONVS - 1 {
+            s.apply(&Event::PeerJoined { id: PeerId(i as u64), nick: format!("p{i}Moon") }, 0);
+            s.switch(dm(&format!("p{i}Moon")));
+        }
+        s.switch(room("catPieR")); // store is full: keepFox is the only offline DM
+        assert_eq!(s.conversations().len(), MAX_CONVS);
+        assert!(s.get(&dm("keepFox")).is_none());
+        assert!(s.get(&room("catPieR")).is_some());
+    }
+
+    #[test]
+    fn assigned_name_is_remembered() {
+        let mut s = Store::new();
+        s.apply(&Event::Assigned { nick: "aliceMoon".into(), renamed: false }, 0);
+        assert_eq!(s.me(), Some("aliceMoon"));
+    }
+}
