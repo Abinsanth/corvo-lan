@@ -31,7 +31,7 @@ pub const OUTBOX_SIZE: usize = 256;
 pub type ConnId = u64;
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
-/// Our identity as sent in `Hello`. `nick` tracks `/nick` changes.
+/// Our identity as sent in `Hello`. `nick` follows re-rolls after a name clash.
 #[derive(Clone)]
 pub struct Me {
     pub id: PeerId,
