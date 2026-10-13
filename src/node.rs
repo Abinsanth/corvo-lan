@@ -20,6 +20,9 @@ use crate::protocol::{now_millis, Frame, PeerId, MAX_FRAME_LEN};
 pub const MAX_TEXT_LEN: usize = MAX_FRAME_LEN / 8;
 /// Connected peers beyond this are refused, so a hostile host can't exhaust file descriptors.
 pub const MAX_PEERS: usize = 64;
+/// Messages a peer may send in a burst before being throttled to `RATE_PER_SEC`.
+pub const RATE_BURST: u32 = 30;
+const RATE_PER_SEC: f64 = 10.0;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -52,11 +55,10 @@ pub enum NodeMsg {
         id: PeerId,
         nick: String,
         addr: SocketAddr,
-        outbound: bool,
+        key: ConnKey,
         dialed_as: Option<PeerId>,
         out: mpsc::Sender<Frame>,
-        /// Node replies `true` to keep the connection, `false` to close it.
-        accept: oneshot::Sender<bool>,
+        accept: oneshot::Sender<Verdict>,
     },
     PeerFrame { conn: ConnId, id: PeerId, frame: Frame },
     PeerGone { conn: ConnId, id: PeerId, reason: LeaveReason },
@@ -68,19 +70,73 @@ pub fn should_dial(me: PeerId, them: PeerId) -> bool {
     me < them
 }
 
+/// What both ends of a TCP connection know about it, used to break duplicate ties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnKey {
+    /// We dialed this connection.
+    pub outbound: bool,
+    /// Source port of the dialing side; the same number on both ends.
+    pub dialer_port: u16,
+}
+
+/// The Node's answer to a finished handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Use this connection.
+    Keep,
+    /// A duplicate that lost the tie-break. The other side may not have
+    /// noticed yet, so stop writing but keep reading until it drops it,
+    /// instead of losing frames it already sent.
+    Retire,
+    /// Refused (ourselves, or at the peer limit): close now.
+    Close,
+}
+
 /// When two connections to the same peer exist, both sides keep the one
-/// dialed by the lower id. `outbound` = we dialed that connection.
-pub fn keep_new_connection(me: PeerId, them: PeerId, existing_outbound: bool, new_outbound: bool) -> bool {
+/// dialed by the lower id. If both were dialed the same way, both keep the
+/// lower dialer port, so the choice never depends on arrival order.
+pub fn keep_new_connection(me: PeerId, them: PeerId, existing: ConnKey, new: ConnKey) -> bool {
+    if existing.outbound == new.outbound {
+        return new.dialer_port < existing.dialer_port;
+    }
     let preferred_outbound = me < them;
-    new_outbound == preferred_outbound && existing_outbound != preferred_outbound
+    new.outbound == preferred_outbound
 }
 
 struct PeerEntry {
     conn: ConnId,
     nick: String,
     addr: SocketAddr,
-    outbound: bool,
+    key: ConnKey,
     out: mpsc::Sender<Frame>,
+    limit: RateLimit,
+}
+
+/// Token bucket for frames from one peer, so a flood can't outrun the terminal
+/// and pile up in memory.
+struct RateLimit {
+    tokens: f64,
+    last: Instant,
+    /// Already told the user about the current flood.
+    warned: bool,
+}
+
+impl RateLimit {
+    fn new(now: Instant) -> Self {
+        RateLimit { tokens: RATE_BURST as f64, last: now, warned: false }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * RATE_PER_SEC).min(RATE_BURST as f64);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct Backoff {
@@ -194,9 +250,13 @@ impl Node {
         self.peers.iter().map(|(id, p)| (*id, p.nick.as_str())).collect()
     }
 
+    /// Display name for a peer; our own nick counts as a clash too.
     fn display(&self, id: PeerId) -> String {
+        let me = self.nick.borrow();
+        let mut everyone = self.roster();
+        everyone.push((self.id, me.as_str()));
         match self.peers.get(&id) {
-            Some(p) => names::display_name(id, &p.nick, &self.roster()),
+            Some(p) => names::display_name(id, &p.nick, &everyone),
             None => id.short(),
         }
     }
@@ -277,13 +337,13 @@ impl Node {
     fn handle_msg(&mut self, msg: NodeMsg) {
         match msg {
             NodeMsg::Discovered(s) => self.on_discovered(s),
-            NodeMsg::PeerConnected { conn, id, nick, addr, outbound, dialed_as, out, accept } => {
+            NodeMsg::PeerConnected { conn, id, nick, addr, key, dialed_as, out, accept } => {
                 if let Some(expected) = dialed_as {
                     self.dialing.remove(&expected);
                     self.backoff.remove(&expected);
                 }
-                let keep = self.on_connected(PeerEntry { conn, nick, addr, outbound, out }, id);
-                let _ = accept.send(keep);
+                let verdict = self.on_connected(PeerEntry { conn, nick, addr, key, out, limit: RateLimit::new(Instant::now()) }, id);
+                let _ = accept.send(verdict);
             }
             NodeMsg::PeerFrame { conn, id, frame } => self.on_frame(conn, id, frame),
             NodeMsg::PeerGone { conn, id, reason } => {
@@ -322,37 +382,46 @@ impl Node {
         peer::dial(s.tcp_addr, Some(id), self.me(), self.msg_tx.clone());
     }
 
-    /// Returns whether to keep the new connection.
-    fn on_connected(&mut self, entry: PeerEntry, id: PeerId) -> bool {
+    fn on_connected(&mut self, entry: PeerEntry, id: PeerId) -> Verdict {
         if id == self.id {
-            return false;
+            return Verdict::Close;
         }
         match self.peers.get(&id) {
             None if self.peers.len() >= MAX_PEERS => {
                 warn!(%id, "refusing peer: already at {MAX_PEERS} peers");
-                false
+                Verdict::Close
             }
             None => {
                 self.peers.insert(id, entry);
                 self.emit(Event::PeerJoined { id, nick: self.display(id) });
-                true
+                Verdict::Keep
             }
             Some(existing) => {
-                if keep_new_connection(self.id, id, existing.outbound, entry.outbound) {
-                    // Dropping the old sender closes the old connection quietly.
+                if keep_new_connection(self.id, id, existing.key, entry.key) {
+                    // Dropping the old sender retires the old connection.
                     self.peers.insert(id, entry);
-                    true
+                    Verdict::Keep
                 } else {
-                    false
+                    Verdict::Retire
                 }
             }
         }
     }
 
-    fn on_frame(&mut self, conn: ConnId, id: PeerId, frame: Frame) {
-        if !self.peers.get(&id).is_some_and(|p| p.conn == conn) {
-            return; // stale duplicate connection
+    /// Frames count from any connection to a known peer, including one being
+    /// retired after a duplicate race; it may carry messages sent before the swap.
+    fn on_frame(&mut self, _conn: ConnId, id: PeerId, frame: Frame) {
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return;
+        };
+        if !peer.limit.allow(Instant::now()) {
+            if !std::mem::replace(&mut peer.limit.warned, true) {
+                let nick = self.display(id);
+                self.emit(Event::Info(format!("{nick} is sending too fast; dropping messages")));
+            }
+            return;
         }
+        peer.limit.warned = false;
         match frame {
             Frame::Chat { text, ts } | Frame::Direct { text, ts } if text.len() > MAX_TEXT_LEN => {
                 debug!(%id, ts, "dropping oversized message ({} bytes)", text.len());
@@ -383,8 +452,17 @@ impl Node {
         for task in &self.background {
             task.abort();
         }
-        self.broadcast(Frame::Bye);
+        // Queue Bye everywhere first, then wait (within the grace period) only
+        // for peers whose outbox was full, so one slow peer can't starve the rest.
         let deadline = Instant::now() + SHUTDOWN_GRACE;
+        let full: Vec<&PeerEntry> = self
+            .peers
+            .values()
+            .filter(|p| matches!(p.out.try_send(Frame::Bye), Err(mpsc::error::TrySendError::Full(_))))
+            .collect();
+        for p in full {
+            let _ = tokio::time::timeout_at(deadline, p.out.send(Frame::Bye)).await;
+        }
         for p in self.peers.values() {
             let _ = tokio::time::timeout_at(deadline, p.out.closed()).await;
         }
@@ -415,15 +493,31 @@ mod tests {
 
         /// Simulates a peer task completing its handshake; returns the Node's verdict.
         fn connect(&mut self, id: PeerId, nick: &str, outbound: bool) -> bool {
+            let port = 40000 + self.next_conn as u16;
+            self.connect_key(id, nick, ConnKey { outbound, dialer_port: port })
+        }
+
+        fn connect_key(&mut self, id: PeerId, nick: &str, key: ConnKey) -> bool {
+            self.connect_verdict(id, nick, key) == Verdict::Keep
+        }
+
+        fn connect_verdict(&mut self, id: PeerId, nick: &str, key: ConnKey) -> Verdict {
             let (out, rx) = mpsc::channel(8);
             let conn = self.next_conn;
             self.next_conn += 1;
-            let entry = PeerEntry { conn, nick: nick.into(), addr: "127.0.0.1:1".parse().unwrap(), outbound, out };
-            let keep = self.node.on_connected(entry, id);
-            if keep {
+            let entry = PeerEntry {
+                conn,
+                nick: nick.into(),
+                addr: "127.0.0.1:1".parse().unwrap(),
+                key,
+                out,
+                limit: RateLimit::new(Instant::now()),
+            };
+            let verdict = self.node.on_connected(entry, id);
+            if verdict == Verdict::Keep {
                 self.outboxes.insert(id, rx);
             }
-            keep
+            verdict
         }
 
         fn sent(&mut self, id: PeerId) -> Vec<Frame> {
@@ -442,23 +536,38 @@ mod tests {
         assert!(!should_dial(BOB, ME));
     }
 
+    fn out(dialer_port: u16) -> ConnKey {
+        ConnKey { outbound: true, dialer_port }
+    }
+
+    fn inb(dialer_port: u16) -> ConnKey {
+        ConnKey { outbound: false, dialer_port }
+    }
+
     #[test]
-    fn both_sides_agree_on_which_duplicate_to_keep() {
+    fn opposite_direction_duplicates_keep_the_lower_ids_dial() {
         // ME < BOB, so the connection ME dialed (outbound for ME, inbound for BOB) wins.
-        assert!(keep_new_connection(ME, BOB, false, true));
-        assert!(!keep_new_connection(ME, BOB, true, false));
-        assert!(keep_new_connection(BOB, ME, true, false));
-        assert!(!keep_new_connection(BOB, ME, false, true));
-        // Same direction twice: keep the existing one.
-        assert!(!keep_new_connection(ME, BOB, true, true));
+        assert!(keep_new_connection(ME, BOB, inb(1), out(2)));
+        assert!(!keep_new_connection(ME, BOB, out(2), inb(1)));
+        assert!(keep_new_connection(BOB, ME, out(1), inb(2)));
+        assert!(!keep_new_connection(BOB, ME, inb(2), out(1)));
+    }
+
+    #[test]
+    fn same_direction_duplicates_agree_even_when_seen_in_opposite_order() {
+        // ME dialed BOB twice (e.g. --peer racing discovery) from ports 5000 and 6000.
+        // ME finished 5000 first; BOB finished 6000 first. Both must settle on 5000.
+        assert!(!keep_new_connection(ME, BOB, out(5000), out(6000)));
+        assert!(keep_new_connection(BOB, ME, inb(6000), inb(5000)));
     }
 
     #[test]
     fn duplicate_connection_does_not_rejoin() {
         let mut h = Harness::new();
-        assert!(h.connect(BOB, "bob", false));
-        assert!(h.connect(BOB, "bob", true)); // preferred direction replaces
-        assert!(!h.connect(BOB, "bob", true)); // same direction rejected
+        assert!(h.connect_key(BOB, "bob", inb(7000)));
+        assert!(h.connect_key(BOB, "bob", out(9000))); // preferred direction replaces
+        assert!(h.connect_key(BOB, "bob", out(8000))); // same direction, lower port replaces
+        assert!(!h.connect_key(BOB, "bob", out(8500))); // same direction, higher port rejected
         let joins = h.events().into_iter().filter(|e| matches!(e, Event::PeerJoined { .. })).count();
         assert_eq!(joins, 1);
     }
@@ -469,7 +578,7 @@ mod tests {
         for i in 0..MAX_PEERS as u64 {
             assert!(h.connect(PeerId(0x4000_0000_0000_0000 + i), "p", true));
         }
-        assert!(!h.connect(PeerId(0x5000_0000_0000_0000), "late", true));
+        assert_eq!(h.connect_verdict(PeerId(0x5000_0000_0000_0000), "late", out(1)), Verdict::Close);
         assert_eq!(h.node.peers.len(), MAX_PEERS);
     }
 
@@ -482,6 +591,68 @@ mod tests {
         for id in [BOB, CAROL] {
             assert!(matches!(h.sent(id).as_slice(), [Frame::Chat { text, .. }] if text == "hi all"));
         }
+    }
+
+    #[tokio::test]
+    async fn bye_waits_for_room_in_a_full_outbox() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bob", true);
+        for i in 0..8 {
+            h.node.handle_command(Command::Say(format!("msg {i}"))); // fills the 8-slot outbox
+        }
+        let mut rx = h.outboxes.remove(&BOB).unwrap();
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut got = Vec::new();
+            while let Some(frame) = rx.recv().await {
+                let bye = frame == Frame::Bye;
+                got.push(frame);
+                if bye {
+                    break; // like the writer: stop after Bye, dropping the receiver
+                }
+            }
+            got
+        });
+        h.node.shutdown().await;
+        let got = drain.await.unwrap();
+        assert_eq!(got.len(), 9);
+        assert_eq!(got.last(), Some(&Frame::Bye));
+    }
+
+    #[test]
+    fn rate_limit_allows_a_burst_then_refills() {
+        let t0 = Instant::now();
+        let mut limit = RateLimit::new(t0);
+        let allowed = (0..100).filter(|_| limit.allow(t0)).count();
+        assert_eq!(allowed, RATE_BURST as usize);
+        assert!(!limit.allow(t0));
+        assert!(limit.allow(t0 + Duration::from_millis(150))); // refills 10/s
+    }
+
+    #[test]
+    fn flooding_peer_is_throttled_with_one_warning() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bob", true);
+        h.events();
+        let conn = h.node.peers[&BOB].conn;
+        for i in 0..100 {
+            h.node.on_frame(conn, BOB, Frame::Chat { text: format!("spam {i}"), ts: 0 });
+        }
+        let events = h.events();
+        let messages = events.iter().filter(|e| matches!(e, Event::Message { .. })).count();
+        let warnings = events.iter().filter(|e| matches!(e, Event::Info(m) if m.contains("too fast"))).count();
+        assert_eq!(messages, RATE_BURST as usize);
+        assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn peer_sharing_my_nick_gets_a_suffix() {
+        let mut h = Harness::new(); // our nick is "me"
+        h.connect(BOB, "me", true);
+        assert_eq!(h.events(), vec![Event::PeerJoined { id: BOB, nick: "me#2000".into() }]);
+        // It's still addressable by the plain nick, since we can't DM ourselves.
+        h.node.handle_command(Command::Direct { to: "me".into(), text: "hi".into() });
+        assert_eq!(h.events(), vec![Event::DirectSent { to: "me#2000".into(), text: "hi".into() }]);
     }
 
     #[test]
@@ -542,15 +713,27 @@ mod tests {
     }
 
     #[test]
-    fn frames_from_stale_connection_are_ignored() {
+    fn frames_from_a_replaced_connection_still_arrive_but_its_close_is_silent() {
         let mut h = Harness::new();
         h.connect(BOB, "bob", false); // conn 1
         h.connect(BOB, "bob", true); // conn 2 replaces it
         h.events();
-        h.node.on_frame(1, BOB, Frame::Chat { text: "old".into(), ts: 0 });
+        // bob may have sent this before he switched over too.
+        h.node.on_frame(1, BOB, Frame::Chat { text: "in flight".into(), ts: 0 });
         h.node.handle_msg(NodeMsg::PeerGone { conn: 1, id: BOB, reason: LeaveReason::Lost });
-        assert!(h.events().is_empty());
+        assert_eq!(
+            h.events(),
+            vec![Event::Message { from_id: BOB, from_nick: "bob".into(), text: "in flight".into(), direct: false, ts: 0 }]
+        );
         assert!(h.node.peers.contains_key(&BOB));
+    }
+
+    #[test]
+    fn losing_duplicates_are_retired_and_other_refusals_closed() {
+        let mut h = Harness::new();
+        assert_eq!(h.connect_verdict(BOB, "bob", out(5000)), Verdict::Keep);
+        assert_eq!(h.connect_verdict(BOB, "bob", out(6000)), Verdict::Retire);
+        assert_eq!(h.connect_verdict(ME, "me", out(7000)), Verdict::Close);
     }
 
     #[test]

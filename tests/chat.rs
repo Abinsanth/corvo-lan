@@ -151,3 +151,22 @@ async fn garbage_connection_does_not_disturb_the_node() {
     send(&bob, Command::Say("still here".into())).await;
     wait_for(&mut alice, "message", |e| matches!(e, Event::Message { text, .. } if text == "still here")).await;
 }
+
+#[tokio::test]
+async fn racing_duplicate_dials_settle_on_one_connection() {
+    let mut alice = spawn_node("alice", &[]).await;
+    // Two dials from bob to alice race; both sides must keep the same one.
+    // (Loopback rarely reorders them; the unit tests in node.rs pin the tie-break.)
+    let mut bob = spawn_node("bob", &[alice.local_addr, alice.local_addr]).await;
+    wait_joined(&mut alice, &["bob"]).await;
+    wait_joined(&mut bob, &["alice"]).await;
+    send(&bob, Command::Say("one".into())).await;
+    send(&alice, Command::Say("two".into())).await;
+    wait_for(&mut alice, "message", |e| matches!(e, Event::Message { text, .. } if text == "one")).await;
+    wait_for(&mut bob, "message", |e| matches!(e, Event::Message { text, .. } if text == "two")).await;
+    // Ping keeps a healthy link alive; a torn-down one would show up as a leave.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while let Ok(event) = alice.events.try_recv() {
+        assert!(!matches!(event, Event::PeerLeft { .. } | Event::PeerJoined { .. }), "unexpected {event:?}");
+    }
+}
