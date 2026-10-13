@@ -1,0 +1,680 @@
+//! The TUI's state that isn't in the shared session: the input box, history,
+//! scroll position, the corvo (status) tab, the error flash and click targets.
+//! Pure, so it's tested without a terminal.
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Position, Rect};
+
+use crate::api::{Conv, Event};
+use crate::ui::render::Tone;
+use crate::ui::session::Session;
+
+pub const MAX_INPUT_ROWS: usize = 5;
+pub const HISTORY_LEN: usize = 100;
+pub const STATUS_LEN: usize = 500;
+pub const FLASH_FOR: Duration = Duration::from_secs(5);
+pub const WHEEL_STEP: usize = 3;
+
+/// The multi-line input box. `cursor` is a byte index on a char boundary.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Editor {
+    text: String,
+    cursor: usize,
+}
+
+impl Editor {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn set(&mut self, text: String) {
+        self.cursor = text.len();
+        self.text = text;
+    }
+
+    pub fn clear(&mut self) {
+        self.set(String::new());
+    }
+
+    pub fn take(&mut self) -> String {
+        self.cursor = 0;
+        std::mem::take(&mut self.text)
+    }
+
+    pub fn insert(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Pasted text: CRLF and lone CR become newlines.
+    pub fn insert_str(&mut self, s: &str) {
+        let s = s.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
+        self.text.insert_str(self.cursor, &s);
+        self.cursor += s.len();
+    }
+
+    pub fn newline(&mut self) {
+        self.insert('\n');
+    }
+
+    pub fn backspace(&mut self) {
+        if let Some(c) = self.text[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+            self.text.remove(self.cursor);
+        }
+    }
+
+    pub fn delete(&mut self) {
+        if self.cursor < self.text.len() {
+            self.text.remove(self.cursor);
+        }
+    }
+
+    pub fn left(&mut self) {
+        if let Some(c) = self.text[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+        }
+    }
+
+    pub fn right(&mut self) {
+        if let Some(c) = self.text[self.cursor..].chars().next() {
+            self.cursor += c.len_utf8();
+        }
+    }
+
+    fn row_start(&self) -> usize {
+        self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    fn row_end(&self) -> usize {
+        self.text[self.cursor..].find('\n').map_or(self.text.len(), |i| self.cursor + i)
+    }
+
+    pub fn home(&mut self) {
+        self.cursor = self.row_start();
+    }
+
+    pub fn end(&mut self) {
+        self.cursor = self.row_end();
+    }
+
+    /// Ctrl-U: delete from the start of the row to the cursor.
+    pub fn kill_to_row_start(&mut self) {
+        let start = self.row_start();
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    /// Ctrl-W: delete the word before the cursor, and the spaces after it.
+    pub fn kill_word(&mut self) {
+        let start = self.row_start();
+        let trimmed = self.text[start..self.cursor].trim_end_matches(' ');
+        let from = start + trimmed.rfind(' ').map_or(0, |i| i + 1);
+        self.text.replace_range(from..self.cursor, "");
+        self.cursor = from;
+    }
+
+    pub fn rows(&self) -> Vec<&str> {
+        self.text.split('\n').collect()
+    }
+
+    /// (row, column in chars).
+    pub fn cursor_pos(&self) -> (usize, usize) {
+        let row = self.text[..self.cursor].matches('\n').count();
+        (row, self.text[self.row_start()..self.cursor].chars().count())
+    }
+
+    /// Byte offset of `col` chars into row `row`, clamped to its end.
+    fn offset(&self, row: usize, col: usize) -> usize {
+        let start: usize = self.text.split('\n').take(row).map(|r| r.len() + 1).sum();
+        let line = self.text.split('\n').nth(row).unwrap_or("");
+        start + line.char_indices().nth(col).map_or(line.len(), |(i, _)| i)
+    }
+
+    /// Moves to the same column one row up; false on the first row.
+    pub fn up(&mut self) -> bool {
+        let (row, col) = self.cursor_pos();
+        if row == 0 {
+            return false;
+        }
+        self.cursor = self.offset(row - 1, col);
+        true
+    }
+
+    /// Moves to the same column one row down; false on the last row.
+    pub fn down(&mut self) -> bool {
+        let (row, col) = self.cursor_pos();
+        if row + 1 >= self.rows().len() {
+            return false;
+        }
+        self.cursor = self.offset(row + 1, col);
+        true
+    }
+}
+
+/// Sent lines, browsed with ↑/↓ from the input's first or last row.
+#[derive(Debug, Default)]
+pub struct History {
+    entries: Vec<String>,
+    at: Option<usize>,
+    /// What was being typed when browsing started.
+    draft: String,
+}
+
+impl History {
+    pub fn push(&mut self, entry: &str) {
+        self.at = None;
+        if entry.trim().is_empty() || self.entries.last().is_some_and(|last| last == entry) {
+            return;
+        }
+        self.entries.push(entry.to_string());
+        if self.entries.len() > HISTORY_LEN {
+            self.entries.remove(0);
+        }
+    }
+
+    pub fn prev(&mut self, current: &str) -> Option<String> {
+        let at = match self.at {
+            None if self.entries.is_empty() => return None,
+            None => {
+                self.draft = current.to_string();
+                self.entries.len() - 1
+            }
+            Some(0) => return None,
+            Some(i) => i - 1,
+        };
+        self.at = Some(at);
+        Some(self.entries[at].clone())
+    }
+
+    /// The next newer entry, then the draft, then nothing.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<String> {
+        let at = self.at?;
+        if at + 1 < self.entries.len() {
+            self.at = Some(at + 1);
+            Some(self.entries[at + 1].clone())
+        } else {
+            self.at = None;
+            Some(std::mem::take(&mut self.draft))
+        }
+    }
+}
+
+/// Where the message pane is. `top` is the first visible row counted from the
+/// top, so new rows at the bottom don't move a scrolled view; `None` follows the end.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Scroll {
+    top: Option<usize>,
+    unseen: usize,
+}
+
+impl Scroll {
+    pub fn top(&self, total: usize, height: usize) -> usize {
+        let max = total.saturating_sub(height);
+        self.top.map_or(max, |t| t.min(max))
+    }
+
+    pub fn is_scrolled(&self) -> bool {
+        self.top.is_some()
+    }
+
+    pub fn unseen(&self) -> usize {
+        self.unseen
+    }
+
+    pub fn by(&mut self, delta: isize, total: usize, height: usize) {
+        let max = total.saturating_sub(height);
+        let next = (self.top(total, height) as isize + delta).clamp(0, max as isize) as usize;
+        if next >= max { self.to_bottom() } else { self.top = Some(next) }
+    }
+
+    pub fn page_up(&mut self, total: usize, height: usize) {
+        self.by(-(height.max(1) as isize), total, height);
+    }
+
+    pub fn page_down(&mut self, total: usize, height: usize) {
+        self.by(height.max(1) as isize, total, height);
+    }
+
+    pub fn to_bottom(&mut self) {
+        self.top = None;
+        self.unseen = 0;
+    }
+
+    /// A message arrived in the view; counted only while scrolled up.
+    pub fn note_new(&mut self) {
+        if self.top.is_some() {
+            self.unseen += 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tab {
+    /// `corvo`: command output, notices and errors.
+    Status,
+    Conv(Conv),
+}
+
+/// `corvo` first, then conversations in the store's order.
+pub fn tabs(session: &Session) -> Vec<Tab> {
+    std::iter::once(Tab::Status)
+        .chain(session.store.conversations().iter().map(|c| Tab::Conv(c.conv.clone())))
+        .collect()
+}
+
+/// Something clickable on screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hit {
+    Tab(usize),
+    Person(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    Send,
+    Newline,
+    Insert(char),
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    Up,
+    Down,
+    NextTab,
+    PrevTab,
+    GoTab(usize),
+    PageUp,
+    PageDown,
+    Esc,
+    KillRow,
+    KillWord,
+    Quit,
+    Redraw,
+}
+
+/// What a key press means. Shift+Enter needs a terminal that reports it;
+/// Alt+Enter and Ctrl-J work everywhere.
+pub fn action_for(key: KeyEvent) -> Option<Action> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    Some(match key.code {
+        KeyCode::Enter if shift || alt => Action::Newline,
+        KeyCode::Enter => Action::Send,
+        KeyCode::Char('c') if ctrl => Action::Quit,
+        KeyCode::Char('l') if ctrl => Action::Redraw,
+        KeyCode::Char('u') if ctrl => Action::KillRow,
+        KeyCode::Char('w') if ctrl => Action::KillWord,
+        KeyCode::Char('j') if ctrl => Action::Newline,
+        KeyCode::Char(c @ '1'..='9') if alt => Action::GoTab(c as usize - '1' as usize),
+        KeyCode::Char(_) if ctrl || alt => return None,
+        KeyCode::Char(c) => Action::Insert(c),
+        KeyCode::Backspace => Action::Backspace,
+        KeyCode::Delete => Action::Delete,
+        KeyCode::Left => Action::Left,
+        KeyCode::Right => Action::Right,
+        KeyCode::Home => Action::Home,
+        KeyCode::End => Action::End,
+        KeyCode::Up => Action::Up,
+        KeyCode::Down => Action::Down,
+        KeyCode::Tab => Action::NextTab,
+        KeyCode::BackTab => Action::PrevTab,
+        KeyCode::PageUp => Action::PageUp,
+        KeyCode::PageDown => Action::PageDown,
+        KeyCode::Esc => Action::Esc,
+        _ => return None,
+    })
+}
+
+/// Events shown in the corvo tab. Chat lines and member changes already live
+/// in their conversation.
+pub fn goes_to_status(event: &Event) -> bool {
+    !matches!(event, Event::Message { .. } | Event::Sent { .. } | Event::MemberJoined { .. } | Event::MemberLeft { .. })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusLine {
+    pub ts: u64,
+    pub text: String,
+    pub tone: Tone,
+}
+
+pub struct TuiState {
+    pub editor: Editor,
+    pub history: History,
+    pub scroll: Scroll,
+    /// Showing the corvo tab rather than the store's current conversation.
+    pub on_status: bool,
+    pub color: bool,
+    /// (total rows, visible rows) of the message pane at the last draw.
+    pub view: (usize, usize),
+    status: VecDeque<StatusLine>,
+    flash: Option<(String, Instant)>,
+    hits: Vec<(Rect, Hit)>,
+}
+
+impl TuiState {
+    pub fn new(color: bool) -> Self {
+        TuiState {
+            editor: Editor::default(),
+            history: History::default(),
+            scroll: Scroll::default(),
+            on_status: true,
+            color,
+            view: (0, 0),
+            status: VecDeque::new(),
+            flash: None,
+            hits: Vec::new(),
+        }
+    }
+
+    pub fn current_tab(&self, session: &Session) -> usize {
+        if self.on_status {
+            return 0;
+        }
+        let current = session.store.current();
+        tabs(session).iter().position(|t| matches!(t, Tab::Conv(c) if Some(c) == current)).unwrap_or(0)
+    }
+
+    pub fn select_tab(&mut self, session: &mut Session, idx: usize) {
+        match tabs(session).get(idx) {
+            Some(Tab::Status) => {
+                session.store.clear_current();
+                self.on_status = true;
+            }
+            Some(Tab::Conv(conv)) => {
+                session.store.switch(conv.clone());
+                self.on_status = false;
+            }
+            None => return,
+        }
+        self.scroll.to_bottom();
+    }
+
+    pub fn step_tab(&mut self, session: &mut Session, delta: isize) {
+        let n = tabs(session).len() as isize;
+        let next = (self.current_tab(session) as isize + delta).rem_euclid(n);
+        self.select_tab(session, next as usize);
+    }
+
+    pub fn push_status(&mut self, ts: u64, text: &str, tone: Tone) {
+        self.status.push_back(StatusLine { ts, text: text.to_string(), tone });
+        if self.status.len() > STATUS_LEN {
+            self.status.pop_front();
+        }
+    }
+
+    pub fn status_lines(&self) -> impl Iterator<Item = &StatusLine> {
+        self.status.iter()
+    }
+
+    pub fn flash(&mut self, text: &str, now: Instant) {
+        self.flash = Some((text.to_string(), now));
+    }
+
+    pub fn flash_text(&self, now: Instant) -> Option<&str> {
+        self.flash.as_ref().filter(|(_, at)| now.saturating_duration_since(*at) < FLASH_FOR).map(|(t, _)| t.as_str())
+    }
+
+    pub fn clear_hits(&mut self) {
+        self.hits.clear();
+    }
+
+    pub fn add_hit(&mut self, area: Rect, hit: Hit) {
+        self.hits.push((area, hit));
+    }
+
+    pub fn hit(&self, col: u16, row: u16) -> Option<Hit> {
+        self.hits.iter().find(|(area, _)| area.contains(Position::new(col, row))).map(|(_, hit)| hit.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::PeerId;
+    use crate::ui::render::Style;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn ed(text: &str) -> Editor {
+        let mut e = Editor::default();
+        e.set(text.into());
+        e
+    }
+
+    #[test]
+    fn editor_edits_and_moves_by_chars() {
+        let mut e = Editor::default();
+        for c in "héllo".chars() {
+            e.insert(c);
+        }
+        e.left();
+        e.left();
+        e.backspace();
+        assert_eq!(e.text(), "hélo");
+        e.delete();
+        assert_eq!(e.text(), "héo");
+        e.home();
+        e.insert('>');
+        e.end();
+        e.insert('!');
+        assert_eq!(e.text(), ">héo!");
+        assert_eq!(e.take(), ">héo!");
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn newlines_rows_and_vertical_moves() {
+        let mut e = ed("first line");
+        e.newline();
+        e.insert_str("second\r\nthird");
+        assert_eq!(e.rows(), vec!["first line", "second", "third"]);
+        assert_eq!(e.cursor_pos(), (2, 5));
+        assert!(e.up());
+        assert_eq!(e.cursor_pos(), (1, 5));
+        assert!(e.up());
+        assert_eq!(e.cursor_pos(), (0, 5));
+        assert!(!e.up(), "already on the first row");
+        assert!(e.down() && e.down());
+        assert!(!e.down(), "already on the last row");
+        e.home();
+        assert_eq!(e.cursor_pos(), (2, 0));
+    }
+
+    #[test]
+    fn pasted_tabs_become_spaces() {
+        let mut e = ed("");
+        e.insert_str("a\tb\r\n\tc");
+        assert_eq!(e.text(), "a    b\n    c");
+        assert_eq!(e.cursor_pos(), (1, 5));
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_w_stay_on_the_row() {
+        let mut e = ed("keep\nsay hello  world");
+        e.kill_word();
+        assert_eq!(e.text(), "keep\nsay hello  ");
+        e.kill_word();
+        assert_eq!(e.text(), "keep\nsay ");
+        e.kill_to_row_start();
+        assert_eq!(e.text(), "keep\n");
+        e.kill_to_row_start();
+        assert_eq!(e.text(), "keep\n");
+    }
+
+    #[test]
+    fn history_browses_and_keeps_the_draft() {
+        let mut h = History::default();
+        assert_eq!(h.prev("draft"), None);
+        h.push("one");
+        h.push("two");
+        h.push("two");
+        h.push("  ");
+        assert_eq!(h.prev("draft").as_deref(), Some("two"));
+        assert_eq!(h.prev("ignored").as_deref(), Some("one"));
+        assert_eq!(h.prev("ignored"), None);
+        assert_eq!(h.next().as_deref(), Some("two"));
+        assert_eq!(h.next().as_deref(), Some("draft"));
+        assert_eq!(h.next(), None);
+        for i in 0..HISTORY_LEN + 5 {
+            h.push(&format!("m{i}"));
+        }
+        let mut oldest = None;
+        while let Some(e) = h.prev("") {
+            oldest = Some(e);
+        }
+        assert_eq!(oldest.as_deref(), Some("m5"));
+    }
+
+    #[test]
+    fn scrolling_pages_counts_new_lines_and_returns() {
+        let mut s = Scroll::default();
+        assert_eq!(s.top(100, 10), 90);
+        s.page_up(100, 10);
+        assert_eq!(s.top(100, 10), 80);
+        s.note_new();
+        s.note_new();
+        assert_eq!(s.unseen(), 2);
+        assert_eq!(s.top(102, 10), 80, "new lines don't move the view");
+        s.by(-500, 102, 10);
+        assert_eq!(s.top(102, 10), 0);
+        s.page_down(102, 10);
+        s.by(1000, 102, 10);
+        assert!(!s.is_scrolled() && s.unseen() == 0);
+        s.note_new();
+        assert_eq!(s.unseen(), 0, "at the bottom, nothing is unseen");
+        s.page_up(5, 10);
+        assert!(!s.is_scrolled(), "nothing to scroll when it all fits");
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn keys_map_to_actions() {
+        let none = KeyModifiers::NONE;
+        assert_eq!(action_for(key(KeyCode::Enter, none)), Some(Action::Send));
+        assert_eq!(action_for(key(KeyCode::Enter, KeyModifiers::SHIFT)), Some(Action::Newline));
+        assert_eq!(action_for(key(KeyCode::Enter, KeyModifiers::ALT)), Some(Action::Newline));
+        assert_eq!(action_for(key(KeyCode::Char('j'), KeyModifiers::CONTROL)), Some(Action::Newline));
+        assert_eq!(action_for(key(KeyCode::Char('x'), none)), Some(Action::Insert('x')));
+        assert_eq!(action_for(key(KeyCode::Char('X'), KeyModifiers::SHIFT)), Some(Action::Insert('X')));
+        assert_eq!(action_for(key(KeyCode::Char('c'), KeyModifiers::CONTROL)), Some(Action::Quit));
+        assert_eq!(action_for(key(KeyCode::Char('3'), KeyModifiers::ALT)), Some(Action::GoTab(2)));
+        assert_eq!(action_for(key(KeyCode::BackTab, KeyModifiers::SHIFT)), Some(Action::PrevTab));
+        assert_eq!(action_for(key(KeyCode::Char('q'), KeyModifiers::ALT)), None);
+        let mut release = key(KeyCode::Char('x'), none);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(action_for(release), None);
+    }
+
+    fn session_with_tabs() -> Session {
+        let mut s = Session::new(Style::plain());
+        s.on_event(&Event::PeerJoined { id: PeerId(2), nick: "bobRoger".into() }, 0);
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
+        s.on_event(
+            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 },
+            0,
+        );
+        s
+    }
+
+    #[test]
+    fn tabs_cycle_and_jump() {
+        let mut s = session_with_tabs();
+        let mut t = TuiState::new(false);
+        assert_eq!(
+            tabs(&s),
+            vec![Tab::Status, Tab::Conv(Conv::Room("catPieR".into())), Tab::Conv(Conv::Dm("bobRoger".into()))]
+        );
+        assert_eq!(t.current_tab(&s), 0);
+        t.step_tab(&mut s, 1);
+        assert_eq!(t.current_tab(&s), 1);
+        t.step_tab(&mut s, 1);
+        assert_eq!(s.store.current(), Some(&Conv::Dm("bobRoger".into())));
+        assert_eq!(s.store.get(&Conv::Dm("bobRoger".into())).unwrap().unread, 0, "viewing marks read");
+        t.step_tab(&mut s, 1);
+        assert!(t.on_status, "wraps to corvo");
+        t.step_tab(&mut s, -1);
+        assert_eq!(t.current_tab(&s), 2);
+        t.select_tab(&mut s, 9);
+        assert_eq!(t.current_tab(&s), 2, "out of range does nothing");
+    }
+
+    #[test]
+    fn messages_count_as_unread_while_on_the_corvo_tab() {
+        let mut s = session_with_tabs();
+        let mut t = TuiState::new(false);
+        t.select_tab(&mut s, 2);
+        t.select_tab(&mut s, 0);
+        let bob = Conv::Dm("bobRoger".into());
+        s.on_event(&Event::Message { conv: bob.clone(), from: "bobRoger".into(), text: "hi".into(), ts: 0 }, 0);
+        assert_eq!(s.store.get(&bob).unwrap().unread, 1);
+        assert_eq!(s.store.current(), None);
+        assert_eq!(t.current_tab(&s), 0);
+    }
+
+    #[test]
+    fn removing_the_current_tab_falls_back() {
+        let mut s = session_with_tabs();
+        let mut t = TuiState::new(false);
+        t.select_tab(&mut s, 2);
+        s.store.close(&Conv::Dm("bobRoger".into()));
+        assert_eq!(t.current_tab(&s), 0, "no current conversation means the corvo tab");
+        assert!(tabs(&s).len() == 2);
+        t.step_tab(&mut s, 1);
+        assert_eq!(t.current_tab(&s), 1);
+    }
+
+    #[test]
+    fn status_lines_are_capped_and_flash_expires() {
+        let mut t = TuiState::new(false);
+        for i in 0..STATUS_LEN + 3 {
+            t.push_status(0, &format!("l{i}"), Tone::Plain);
+        }
+        assert_eq!(t.status_lines().count(), STATUS_LEN);
+        assert_eq!(t.status_lines().next().unwrap().text, "l3");
+        let t0 = Instant::now();
+        t.flash("! nope", t0);
+        assert_eq!(t.flash_text(t0 + Duration::from_secs(4)), Some("! nope"));
+        assert_eq!(t.flash_text(t0 + FLASH_FOR), None);
+    }
+
+    #[test]
+    fn clicks_hit_what_was_drawn_there() {
+        let mut t = TuiState::new(false);
+        t.add_hit(Rect::new(0, 0, 7, 1), Hit::Tab(0));
+        t.add_hit(Rect::new(60, 3, 20, 1), Hit::Person("bobRoger".into()));
+        assert_eq!(t.hit(3, 0), Some(Hit::Tab(0)));
+        assert_eq!(t.hit(79, 3), Some(Hit::Person("bobRoger".into())));
+        assert_eq!(t.hit(80, 3), None);
+        t.clear_hits();
+        assert_eq!(t.hit(3, 0), None);
+    }
+
+    #[test]
+    fn only_chat_lines_stay_out_of_the_corvo_tab() {
+        let msg = Event::Message { conv: Conv::Dm("b".into()), from: "b".into(), text: "x".into(), ts: 0 };
+        assert!(!goes_to_status(&msg));
+        assert!(!goes_to_status(&Event::Sent { conv: Conv::Dm("b".into()), text: "x".into(), ts: 0 }));
+        assert!(!goes_to_status(&Event::MemberJoined { room: "r".into(), nick: "b".into() }));
+        assert!(goes_to_status(&Event::Error("x".into())));
+        assert!(goes_to_status(&Event::RoomCreated { name: "r".into(), key: "k".into() }));
+        assert!(goes_to_status(&Event::PeerJoined { id: PeerId(1), nick: "b".into() }));
+    }
+}

@@ -1,5 +1,5 @@
-//! Line-based frontend. `Session` is the pure part (input + events → commands
-//! + output, backed by the conversation store); `run` wires it to rustyline.
+//! Line-based frontend: rustyline on its own thread, output through a printer
+//! thread. It shares the `Session` with the TUI via `Ctx`.
 
 use std::sync::{Arc, Mutex};
 
@@ -7,153 +7,12 @@ use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, ExternalPrinter as _};
 use tokio::sync::mpsc;
 
-use super::input::{Input, parse_line};
-use super::render::{self, Style};
-use super::updates::{UpdateAction, Updater};
-use crate::api::{Command, Conv, Event, Target};
-use crate::convo::Store;
-use crate::node::NodeHandle;
+use super::render::Style;
+use super::{Ctx, Exit};
+use crate::api::{Command, Conv};
 use crate::protocol::now_millis;
 
-pub const HELP: &str = "\
-commands:
-  <text>                 send to the current conversation (shown in the prompt)
-  /msg @nick <text>      one-off private message
-  /chat @nick            switch to a private chat
-  /chat #room <key>      join a room (just /chat #room once you're in)
-  /create <name> <key>   create a private room; share its name and key to invite
-  /leave [#room]         leave the current or named room
-  /rooms                 your rooms and who's in them
-  /chats                 your conversations, with unread counts
-  /history [n]           show the last n messages here (default 20)
-  /update [yes]          check for a newer version; yes installs it
-  /who                   connected people
-  /quit                  leave (also Ctrl-C / Ctrl-D)
-  //text                 send a message starting with '/'";
-
-/// What the UI loop should do after an input line.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Reaction {
-    pub commands: Vec<Command>,
-    pub print: Vec<String>,
-    pub quit: bool,
-    pub update: Option<UpdateAction>,
-}
-
-impl Reaction {
-    fn say(s: impl Into<String>) -> Self {
-        Reaction { print: vec![s.into()], ..Default::default() }
-    }
-
-    fn send(cmd: Command) -> Self {
-        Reaction { commands: vec![cmd], ..Default::default() }
-    }
-}
-
-pub struct Session {
-    pub store: Store,
-    style: Style,
-}
-
-impl Session {
-    pub fn new(style: Style) -> Self {
-        Session { store: Store::new(), style }
-    }
-
-    pub fn prompt(&self) -> String {
-        render::prompt(self.store.current())
-    }
-
-    /// Folds an event into the store and returns what to print.
-    pub fn on_event(&mut self, event: &Event, now: u64) -> Option<String> {
-        self.store.apply(event, now);
-        // Creating or joining a room takes you there.
-        if let Event::RoomCreated { name, .. } | Event::RoomJoined { name, .. } = event {
-            self.store.switch(Conv::Room(name.clone()));
-        }
-        render::event(event, now, &self.style)
-    }
-
-    /// What the prompt shows: its text and the conversation plain text goes to.
-    pub fn prompt_state(&self) -> (String, Option<Conv>) {
-        (self.prompt(), self.store.current().cloned())
-    }
-
-    /// Handles a typed line. `shown` is the conversation its prompt showed:
-    /// plain text goes there even if a join switched us while the user typed.
-    /// If the prompt showed none, the user means where they've just arrived.
-    pub fn on_line(&mut self, line: &str, shown: Option<&Conv>) -> Reaction {
-        match parse_line(line) {
-            Input::Empty => Reaction::default(),
-            Input::Error(e) => Reaction::say(format!("! {e}")),
-            Input::Help => Reaction::say(HELP),
-            Input::Quit => Reaction { quit: true, ..Default::default() },
-            Input::Who => Reaction::send(Command::ListPeers),
-            Input::Text(text) => match shown.or(self.store.current()) {
-                Some(Conv::Room(n)) => Reaction::send(Command::Send { to: Target::Room(n.clone()), text }),
-                Some(Conv::Dm(n)) => Reaction::send(Command::Send { to: Target::Dm(n.clone()), text }),
-                None => Reaction::say("! no conversation — /chat @nick or /create <name> <key>"),
-            },
-            Input::Msg { to, text } => Reaction::send(Command::Send { to: Target::Dm(to), text }),
-            Input::ChatDm(nick) => {
-                if self.store.me() == Some(nick.as_str()) {
-                    return Reaction::say("! that's you");
-                }
-                let conv = Conv::Dm(nick.clone());
-                if !self.store.is_online(&nick) && self.store.get(&conv).is_none() {
-                    return Reaction::say(format!("! @{nick} is offline"));
-                }
-                self.switch(conv)
-            }
-            Input::ChatRoom { name, key } => {
-                let conv = Conv::Room(name.clone());
-                if self.store.get(&conv).is_some() {
-                    return self.switch(conv);
-                }
-                match key {
-                    Some(key) => Reaction::send(Command::JoinRoom { name, key }),
-                    None => Reaction::say(format!("! join with /chat #{name} <key>")),
-                }
-            }
-            Input::Create { base, part } => Reaction::send(Command::CreateRoom { base, key_part: part }),
-            Input::Leave(Some(name)) => Reaction::send(Command::LeaveRoom { name }),
-            Input::Leave(None) => match self.store.current() {
-                Some(Conv::Room(n)) => Reaction::send(Command::LeaveRoom { name: n.clone() }),
-                _ => Reaction::say("! you're not in a room here — /leave #room"),
-            },
-            Input::Update { confirm } => Reaction {
-                update: Some(if confirm { UpdateAction::Install } else { UpdateAction::Check }),
-                ..Default::default()
-            },
-            Input::Rooms => Reaction::say(render::rooms(&self.store, &self.style)),
-            Input::Chats => Reaction::say(render::chats(&self.store, &self.style)),
-            Input::History(n) => {
-                let Some(conv) = self.store.current().cloned() else {
-                    return Reaction::say("! no conversation — /chat @nick or /chat #room");
-                };
-                let lines = self.store.history(n);
-                if lines.is_empty() {
-                    return Reaction::say("* nothing here yet");
-                }
-                Reaction {
-                    print: lines.iter().map(|l| render::line(&conv, l, &self.style)).collect(),
-                    ..Default::default()
-                }
-            }
-        }
-    }
-
-    fn switch(&mut self, conv: Conv) -> Reaction {
-        let unread = self.store.get(&conv).map_or(0, |c| c.unread);
-        self.store.switch(conv.clone());
-        if unread > 0 {
-            let name = render::conv_name(&conv, &self.style);
-            Reaction::say(format!("* {name}: {unread} unread — /history to see them"))
-        } else {
-            Reaction::default()
-        }
-    }
-}
+type Typed = Option<(String, Option<Conv>)>;
 
 /// Runs `print` on its own thread. Sending never blocks, so the UI task can't
 /// stall on rustyline's printer (which blocks while a prompt isn't being read).
@@ -175,247 +34,149 @@ fn readline_gives_up(err: &ReadlineError, consecutive: u32) -> bool {
     matches!(err, ReadlineError::Interrupted | ReadlineError::Eof) || consecutive >= MAX_READ_ERRORS
 }
 
-/// Runs the frontend until the user quits, then waits for the Node to say goodbye.
-pub async fn run(handle: NodeHandle, check_updates: bool) -> anyhow::Result<()> {
-    let NodeHandle { commands, mut events, task, .. } = handle;
-    let mut editor = DefaultEditor::new()?;
-    // The external printer redraws the prompt around output; it needs a real
-    // terminal, so piped stdin falls back to plain println.
-    let out = match editor.create_external_printer() {
-        Ok(mut printer) => spawn_printer(move |s| {
-            let _ = printer.print(s);
-        }),
-        Err(_) => spawn_printer(|s| println!("{s}")),
-    };
-    let print = |s: String| {
-        let _ = out.send(s);
-    };
-
-    let updater = Updater::new(out.clone());
-    if check_updates {
-        updater.check_at_startup();
-    }
-
-    // rustyline blocks, so it lives on its own thread. It waits for `resume`
-    // before each prompt so we never exit while the terminal is in raw mode,
-    // and reads the prompt then so it follows conversation switches.
-    let prompt = Arc::new(Mutex::new((String::from("> "), None)));
-    let (line_tx, mut lines) = mpsc::unbounded_channel::<Option<(String, Option<Conv>)>>();
-    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
-    let thread_prompt = prompt.clone();
-    std::thread::spawn(move || {
-        let mut errors = 0;
-        loop {
-            let (text, shown) = thread_prompt.lock().map(|p| p.clone()).unwrap_or_else(|_| ("> ".into(), None));
-            match editor.readline(&text) {
-                Ok(line) => {
-                    errors = 0;
-                    let _ = editor.add_history_entry(line.as_str());
-                    if line_tx.send(Some((line, shown))).is_err() || resume_rx.recv().is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    errors += 1;
-                    if readline_gives_up(&e, errors) {
-                        let _ = line_tx.send(None);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let mut session = Session::new(Style::detect());
-    let result =
-        event_loop(&mut session, &commands, &mut events, &mut lines, &resume_tx, &prompt, &updater, print).await;
-    drop(resume_tx);
-    let _ = task.await;
-    result
+/// Whether a line-mode turn opens with the banner: every turn that follows the TUI.
+fn banner_due(entered: bool, from_tui: bool) -> bool {
+    entered || from_tui
 }
 
-/// Routes input lines to the Node and events to `print` until the user quits.
-/// Returns only while no prompt is active, so the terminal is never left raw.
-#[allow(clippy::too_many_arguments)] // each is a separate channel or handle `run` owns
-async fn event_loop(
-    session: &mut Session,
-    commands: &mpsc::Sender<Command>,
-    events: &mut mpsc::UnboundedReceiver<Event>,
-    lines: &mut mpsc::UnboundedReceiver<Option<(String, Option<Conv>)>>,
-    resume: &std::sync::mpsc::Sender<()>,
-    prompt: &Mutex<(String, Option<Conv>)>,
-    updater: &Updater,
-    print: impl Fn(String),
-) -> anyhow::Result<()> {
-    loop {
-        tokio::select! {
-            event = events.recv() => match event {
-                Some(event) => {
-                    if let Some(text) = session.on_event(&event, now_millis()) {
-                        print(text);
+pub struct LineFrontend {
+    out: std::sync::mpsc::Sender<String>,
+    prompt: Arc<Mutex<(String, Option<Conv>)>>,
+    lines: mpsc::UnboundedReceiver<Typed>,
+    /// Lets the input thread show one prompt. Dropped on shutdown.
+    resume: Option<std::sync::mpsc::Sender<()>>,
+    style: Style,
+    /// Has run before, so a later turn came from the TUI.
+    entered: bool,
+    /// The program started in the TUI, so even the first turn came from it.
+    from_tui: bool,
+}
+
+impl LineFrontend {
+    /// Starts the input thread paused: it shows no prompt (and reads nothing)
+    /// until `run` asks, so it never competes with the TUI for the keyboard.
+    pub fn new(style: Style, from_tui: bool) -> anyhow::Result<Self> {
+        let mut editor = DefaultEditor::new()?;
+        // The external printer redraws the prompt around output; it needs a real
+        // terminal, so piped stdin falls back to plain println.
+        let out = match editor.create_external_printer() {
+            Ok(mut printer) => spawn_printer(move |s| {
+                // Without a trailing newline the next prompt's redraw erases the line.
+                let _ = printer.print(format!("{s}\n"));
+            }),
+            Err(_) => spawn_printer(|s| println!("{s}")),
+        };
+        let prompt = Arc::new(Mutex::new((String::from("> "), None)));
+        let (line_tx, lines) = mpsc::unbounded_channel::<Typed>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let thread_prompt = prompt.clone();
+        std::thread::spawn(move || {
+            let mut errors = 0;
+            'prompts: while resume_rx.recv().is_ok() {
+                loop {
+                    let (text, shown) = thread_prompt.lock().map(|p| p.clone()).unwrap_or_else(|_| ("> ".into(), None));
+                    match editor.readline(&text) {
+                        Ok(line) => {
+                            errors = 0;
+                            let _ = editor.add_history_entry(line.as_str());
+                            if line_tx.send(Some((line, shown))).is_err() {
+                                break 'prompts;
+                            }
+                            continue 'prompts;
+                        }
+                        Err(e) => {
+                            errors += 1;
+                            if readline_gives_up(&e, errors) {
+                                let _ = line_tx.send(None);
+                                break 'prompts;
+                            }
+                        }
                     }
-                    if let Ok(mut p) = prompt.lock() {
-                        *p = session.prompt_state();
-                    }
                 }
-                None => {
-                    // A prompt is showing; wait for it to return before exiting.
-                    print("! chat core stopped unexpectedly; press Enter to exit".into());
-                    lines.recv().await;
-                    return Ok(());
-                }
-            },
-            line = lines.recv() => {
-                let Some((line, shown)) = line.flatten() else {
-                    let _ = commands.send(Command::Quit).await;
-                    return Ok(());
-                };
-                let reaction = session.on_line(&line, shown.as_ref());
-                for text in reaction.print {
-                    print(text);
-                }
-                if reaction.quit {
-                    let _ = commands.send(Command::Quit).await;
-                    return Ok(());
-                }
-                for cmd in reaction.commands {
-                    commands.send(cmd).await?;
-                }
-                if let Some(action) = reaction.update {
-                    updater.start(action);
-                }
-                if let Ok(mut p) = prompt.lock() {
-                    *p = session.prompt_state();
-                }
-                let _ = resume.send(());
+            }
+        });
+        Ok(LineFrontend { out, prompt, lines, resume: Some(resume_tx), style, entered: false, from_tui })
+    }
+
+    fn print(&self, s: impl Into<String>) {
+        let _ = self.out.send(s.into());
+    }
+
+    /// Updates the prompt and lets the input thread show it.
+    fn ready(&self, ctx: &Ctx) {
+        if let Ok(mut p) = self.prompt.lock() {
+            *p = ctx.session.prompt_state();
+        }
+        if let Some(resume) = &self.resume {
+            let _ = resume.send(());
+        }
+    }
+
+    /// Owns the terminal until the user quits or switches to the TUI. Returns
+    /// only while no prompt is showing, so the terminal is never left raw.
+    pub async fn run(&mut self, ctx: &mut Ctx) -> anyhow::Result<Exit> {
+        if banner_due(self.entered, self.from_tui) {
+            for line in ctx.session.line_banner() {
+                self.print(line);
             }
         }
+        self.entered = true;
+        self.ready(ctx);
+        loop {
+            tokio::select! {
+                event = ctx.events.recv() => match event {
+                    Some(event) => {
+                        if let Some(text) = ctx.session.on_event(&event, now_millis()) {
+                            self.print(text);
+                        }
+                        if let Ok(mut p) = self.prompt.lock() {
+                            *p = ctx.session.prompt_state();
+                        }
+                    }
+                    None => {
+                        // A prompt is showing; wait for it to return before exiting.
+                        self.print("! chat core stopped unexpectedly; press Enter to exit");
+                        self.lines.recv().await;
+                        return Ok(Exit::Quit);
+                    }
+                },
+                Some(notice) = ctx.notices.recv() => self.print(self.style.tone(notice.tone, &notice.text)),
+                line = self.lines.recv() => {
+                    let Some((line, shown)) = line.flatten() else {
+                        let _ = ctx.commands.send(Command::Quit).await;
+                        return Ok(Exit::Quit);
+                    };
+                    let mut reaction = ctx.session.on_line(&line, shown.as_ref());
+                    for text in std::mem::take(&mut reaction.print) {
+                        self.print(self.style.toned(&text));
+                    }
+                    if let Some(exit) = ctx.act(reaction).await? {
+                        return Ok(exit);
+                    }
+                    self.ready(ctx);
+                }
+            }
+        }
+    }
+
+    /// Lets the input thread finish.
+    pub fn shutdown(&mut self) {
+        self.resume = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::PeerId;
-
-    fn session() -> Session {
-        let mut s = Session::new(Style::plain());
-        s.on_event(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
-        s.on_event(&Event::PeerJoined { id: PeerId(2), nick: "bobRoger".into() }, 0);
-        s
-    }
-
-    /// Types `line` at whatever prompt is currently showing.
-    fn typed(s: &mut Session, line: &str) -> Reaction {
-        let shown = s.store.current().cloned();
-        s.on_line(line, shown.as_ref())
-    }
-
-    fn send(to: Target, text: &str) -> Reaction {
-        Reaction::send(Command::Send { to, text: text.into() })
-    }
 
     #[test]
-    fn plain_text_goes_to_the_current_conversation() {
-        let mut s = session();
-        assert_eq!(typed(&mut s, "hello").print, vec!["! no conversation — /chat @nick or /create <name> <key>"]);
-        assert_eq!(typed(&mut s, "/chat @bobRoger"), Reaction::default());
-        assert_eq!(s.prompt(), "@bobRoger> ");
-        assert_eq!(typed(&mut s, "hello"), send(Target::Dm("bobRoger".into()), "hello"));
-    }
-
-    #[test]
-    fn creating_or_joining_a_room_switches_to_it() {
-        let mut s = session();
-        assert_eq!(
-            typed(&mut s, "/create cat 123"),
-            Reaction::send(Command::CreateRoom { base: "cat".into(), key_part: "123".into() })
-        );
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
-        assert_eq!(s.prompt(), "#catPieR> ");
-        assert_eq!(typed(&mut s, "meow"), send(Target::Room("catPieR".into()), "meow"));
-
-        assert_eq!(
-            typed(&mut s, "/chat #dogFoxR 1-abcdef"),
-            Reaction::send(Command::JoinRoom { name: "dogFoxR".into(), key: "1-abcdef".into() })
-        );
-        assert_eq!(s.prompt(), "#catPieR> ", "not until the join succeeds");
-        s.on_event(&Event::RoomJoined { name: "dogFoxR".into(), members: vec!["bobRoger".into()] }, 0);
-        assert_eq!(s.prompt(), "#dogFoxR> ");
-        assert_eq!(typed(&mut s, "/chat #catPieR"), Reaction::default(), "already in: just switch");
-        assert_eq!(s.prompt(), "#catPieR> ");
-        assert_eq!(typed(&mut s, "/chat #nopeMoonR").print, vec!["! join with /chat #nopeMoonR <key>"]);
-    }
-
-    #[test]
-    fn text_goes_where_the_prompt_pointed_even_if_a_join_switched_us() {
-        let mut s = session();
-        typed(&mut s, "/chat @bobRoger");
-        typed(&mut s, "/chat #catPieR 1-abcdef");
-        // The user starts typing at the "@bobRoger> " prompt...
-        let shown = s.store.current().cloned();
-        assert_eq!(shown, Some(Conv::Dm("bobRoger".into())));
-        // ...and the join completes meanwhile, switching the current conversation.
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
-        assert_eq!(s.on_line("for bob only", shown.as_ref()), send(Target::Dm("bobRoger".into()), "for bob only"));
-        assert_eq!(s.prompt(), "#catPieR> ", "the next prompt shows the room");
-    }
-
-    #[test]
-    fn text_typed_right_after_creating_a_room_goes_to_it() {
-        let mut s = session();
-        // The prompt after /create still shows no conversation...
-        typed(&mut s, "/create cat 123");
-        let shown = s.store.current().cloned();
-        assert_eq!(shown, None);
-        // ...the room arrives while the user types, and that's where they mean.
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
-        assert_eq!(s.on_line("first!", shown.as_ref()), send(Target::Room("catPieR".into()), "first!"));
-    }
-
-    #[test]
-    fn leave_uses_the_current_room_or_the_named_one() {
-        let mut s = session();
-        assert_eq!(typed(&mut s, "/leave").print, vec!["! you're not in a room here — /leave #room"]);
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "1-abcdef".into() }, 0);
-        assert_eq!(typed(&mut s, "/leave"), Reaction::send(Command::LeaveRoom { name: "catPieR".into() }));
-        assert_eq!(typed(&mut s, "/leave #dogFoxR"), Reaction::send(Command::LeaveRoom { name: "dogFoxR".into() }));
-        s.on_event(&Event::RoomLeft { name: "catPieR".into() }, 0);
-        assert_eq!(s.prompt(), "> ");
-    }
-
-    #[test]
-    fn chatting_with_yourself_or_someone_offline_is_refused() {
-        let mut s = session();
-        assert_eq!(typed(&mut s, "/chat @annMoon").print, vec!["! that's you"]);
-        assert_eq!(typed(&mut s, "/chat @ghostMoon").print, vec!["! @ghostMoon is offline"]);
-    }
-
-    #[test]
-    fn switching_mentions_unread_and_history_shows_them() {
-        let mut s = session();
-        s.on_event(
-            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "one".into(), ts: 0 },
-            0,
-        );
-        s.on_event(
-            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "two".into(), ts: 0 },
-            0,
-        );
-        assert_eq!(typed(&mut s, "/chat @bobRoger").print, vec!["* @bobRoger: 2 unread — /history to see them"]);
-        let shown = typed(&mut s, "/history 1").print;
-        assert_eq!(shown.len(), 1);
-        assert!(shown[0].ends_with("@bobRoger → you: two"), "{shown:?}");
-    }
-
-    #[test]
-    fn msg_who_quit_and_errors() {
-        let mut s = session();
-        assert_eq!(typed(&mut s, "/msg @bobRoger hi"), send(Target::Dm("bobRoger".into()), "hi"));
-        assert_eq!(typed(&mut s, "/who"), Reaction::send(Command::ListPeers));
-        assert!(typed(&mut s, "/quit").quit);
-        assert_eq!(typed(&mut s, "/nick x").print, vec!["! names are assigned by the system and can't be changed"]);
-        assert_eq!(typed(&mut s, "/history").print, vec!["! no conversation — /chat @nick or /chat #room"]);
+    fn banner_shows_on_every_turn_after_the_tui() {
+        // Started in line mode: no banner on the first turn, one on each later turn.
+        assert!(!banner_due(false, false));
+        assert!(banner_due(true, false));
+        // Started in the TUI: even the first line-mode turn came from it.
+        assert!(banner_due(false, true));
+        assert!(banner_due(true, true));
     }
 
     #[test]
@@ -426,31 +187,6 @@ mod tests {
         assert!(!readline_gives_up(&glitch(), 1));
         assert!(!readline_gives_up(&glitch(), 2));
         assert!(readline_gives_up(&glitch(), 3));
-    }
-
-    #[tokio::test]
-    async fn when_the_core_stops_we_wait_for_the_prompt_before_exiting() {
-        use std::time::Duration;
-        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
-        let (event_tx, mut events) = mpsc::unbounded_channel();
-        let (line_tx, mut lines) = mpsc::unbounded_channel();
-        let (resume_tx, _resume_rx) = std::sync::mpsc::channel();
-        let printed = Arc::new(Mutex::new(Vec::<String>::new()));
-        let log = printed.clone();
-        drop(event_tx); // the Node is gone
-        let ui = tokio::spawn(async move {
-            let print = move |s: String| log.lock().unwrap().push(s);
-            let prompt = Mutex::new((String::new(), None));
-            let mut session = Session::new(Style::plain());
-            let updater = Updater::new(std::sync::mpsc::channel().0);
-            event_loop(&mut session, &cmd_tx, &mut events, &mut lines, &resume_tx, &prompt, &updater, print).await
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // Exiting now would leave rustyline's prompt (and raw mode) behind.
-        assert!(!ui.is_finished());
-        assert!(printed.lock().unwrap().iter().any(|s| s.contains("press Enter")));
-        line_tx.send(Some((String::new(), None))).unwrap(); // user presses Enter
-        tokio::time::timeout(Duration::from_secs(1), ui).await.unwrap().unwrap().unwrap();
     }
 
     #[test]
@@ -473,15 +209,5 @@ mod tests {
         }
         let got: Vec<String> = (0..100).map(|_| seen_rx.recv_timeout(Duration::from_secs(1)).unwrap()).collect();
         assert_eq!(got, (0..100).map(|i| i.to_string()).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn update_hands_the_work_to_the_updater() {
-        let mut s = session();
-        let check = typed(&mut s, "/update");
-        assert_eq!(check.update, Some(UpdateAction::Check));
-        assert!(check.commands.is_empty() && check.print.is_empty());
-        assert_eq!(typed(&mut s, "/update yes").update, Some(UpdateAction::Install));
-        assert!(HELP.contains("/update [yes]"));
     }
 }

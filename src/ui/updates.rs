@@ -3,9 +3,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::time::Duration;
 
+use tokio::sync::mpsc::UnboundedSender;
+
+use super::Notice;
 use crate::update::{self, Release, Version};
 
 /// Releases listed by `/update` before "…and N older".
@@ -46,18 +48,18 @@ pub fn format_notice(newer: &[Release]) -> Option<String> {
 
 /// Runs one update job at a time in the background, printing through `out`.
 pub struct Updater {
-    out: Sender<String>,
+    out: UnboundedSender<Notice>,
     busy: Arc<AtomicBool>,
 }
 
 impl Updater {
-    pub fn new(out: Sender<String>) -> Self {
+    pub fn new(out: UnboundedSender<Notice>) -> Self {
         Updater { out, busy: Arc::new(AtomicBool::new(false)) }
     }
 
     pub fn start(&self, action: UpdateAction) {
         if self.busy.swap(true, Ordering::SeqCst) {
-            let _ = self.out.send("! an update check is already running".into());
+            let _ = self.out.send(Notice::new("! an update check is already running"));
             return;
         }
         let (out, busy) = (self.out.clone(), self.busy.clone());
@@ -73,7 +75,7 @@ impl Updater {
         tokio::spawn(async move {
             tokio::time::sleep(STARTUP_DELAY).await;
             if let Some(notice) = update::check().await.ok().and_then(|newer| format_notice(&newer)) {
-                let _ = out.send(notice);
+                let _ = out.send(Notice::new(notice));
             }
         });
     }
@@ -88,9 +90,9 @@ impl Drop for ClearOnDrop {
     }
 }
 
-async fn run(action: UpdateAction, out: &Sender<String>) {
+async fn run(action: UpdateAction, out: &UnboundedSender<Notice>) {
     let say = |s: String| {
-        let _ = out.send(s);
+        let _ = out.send(Notice::new(s));
     };
     // Installing checks again, so it never acts on a stale list.
     let newer = match update::check().await {
