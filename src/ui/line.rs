@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 use super::input::{Input, parse_line};
 use super::render::{self, Style};
+use super::updates::{UpdateAction, Updater};
 use crate::api::{Command, Conv, Event, Target};
 use crate::convo::Store;
 use crate::node::NodeHandle;
@@ -25,6 +26,7 @@ commands:
   /rooms                 your rooms and who's in them
   /chats                 your conversations, with unread counts
   /history [n]           show the last n messages here (default 20)
+  /update [yes]          check for a newer version; yes installs it
   /who                   connected people
   /quit                  leave (also Ctrl-C / Ctrl-D)
   //text                 send a message starting with '/'";
@@ -35,6 +37,7 @@ pub struct Reaction {
     pub commands: Vec<Command>,
     pub print: Vec<String>,
     pub quit: bool,
+    pub update: Option<UpdateAction>,
 }
 
 impl Reaction {
@@ -118,6 +121,10 @@ impl Session {
                 Some(Conv::Room(n)) => Reaction::send(Command::LeaveRoom { name: n.clone() }),
                 _ => Reaction::say("! you're not in a room here — /leave #room"),
             },
+            Input::Update { confirm } => Reaction {
+                update: Some(if confirm { UpdateAction::Install } else { UpdateAction::Check }),
+                ..Default::default()
+            },
             Input::Rooms => Reaction::say(render::rooms(&self.store, &self.style)),
             Input::Chats => Reaction::say(render::chats(&self.store, &self.style)),
             Input::History(n) => {
@@ -169,7 +176,7 @@ fn readline_gives_up(err: &ReadlineError, consecutive: u32) -> bool {
 }
 
 /// Runs the frontend until the user quits, then waits for the Node to say goodbye.
-pub async fn run(handle: NodeHandle) -> anyhow::Result<()> {
+pub async fn run(handle: NodeHandle, check_updates: bool) -> anyhow::Result<()> {
     let NodeHandle { commands, mut events, task, .. } = handle;
     let mut editor = DefaultEditor::new()?;
     // The external printer redraws the prompt around output; it needs a real
@@ -183,6 +190,11 @@ pub async fn run(handle: NodeHandle) -> anyhow::Result<()> {
     let print = |s: String| {
         let _ = out.send(s);
     };
+
+    let updater = Updater::new(out.clone());
+    if check_updates {
+        updater.check_at_startup();
+    }
 
     // rustyline blocks, so it lives on its own thread. It waits for `resume`
     // before each prompt so we never exit while the terminal is in raw mode,
@@ -215,7 +227,8 @@ pub async fn run(handle: NodeHandle) -> anyhow::Result<()> {
     });
 
     let mut session = Session::new(Style::detect());
-    let result = event_loop(&mut session, &commands, &mut events, &mut lines, &resume_tx, &prompt, print).await;
+    let result =
+        event_loop(&mut session, &commands, &mut events, &mut lines, &resume_tx, &prompt, &updater, print).await;
     drop(resume_tx);
     let _ = task.await;
     result
@@ -223,6 +236,7 @@ pub async fn run(handle: NodeHandle) -> anyhow::Result<()> {
 
 /// Routes input lines to the Node and events to `print` until the user quits.
 /// Returns only while no prompt is active, so the terminal is never left raw.
+#[allow(clippy::too_many_arguments)] // each is a separate channel or handle `run` owns
 async fn event_loop(
     session: &mut Session,
     commands: &mpsc::Sender<Command>,
@@ -230,6 +244,7 @@ async fn event_loop(
     lines: &mut mpsc::UnboundedReceiver<Option<(String, Option<Conv>)>>,
     resume: &std::sync::mpsc::Sender<()>,
     prompt: &Mutex<(String, Option<Conv>)>,
+    updater: &Updater,
     print: impl Fn(String),
 ) -> anyhow::Result<()> {
     loop {
@@ -265,6 +280,9 @@ async fn event_loop(
                 }
                 for cmd in reaction.commands {
                     commands.send(cmd).await?;
+                }
+                if let Some(action) = reaction.update {
+                    updater.start(action);
                 }
                 if let Ok(mut p) = prompt.lock() {
                     *p = session.prompt_state();
@@ -424,7 +442,8 @@ mod tests {
             let print = move |s: String| log.lock().unwrap().push(s);
             let prompt = Mutex::new((String::new(), None));
             let mut session = Session::new(Style::plain());
-            event_loop(&mut session, &cmd_tx, &mut events, &mut lines, &resume_tx, &prompt, print).await
+            let updater = Updater::new(std::sync::mpsc::channel().0);
+            event_loop(&mut session, &cmd_tx, &mut events, &mut lines, &resume_tx, &prompt, &updater, print).await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Exiting now would leave rustyline's prompt (and raw mode) behind.
@@ -454,5 +473,15 @@ mod tests {
         }
         let got: Vec<String> = (0..100).map(|_| seen_rx.recv_timeout(Duration::from_secs(1)).unwrap()).collect();
         assert_eq!(got, (0..100).map(|i| i.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn update_hands_the_work_to_the_updater() {
+        let mut s = session();
+        let check = typed(&mut s, "/update");
+        assert_eq!(check.update, Some(UpdateAction::Check));
+        assert!(check.commands.is_empty() && check.print.is_empty());
+        assert_eq!(typed(&mut s, "/update yes").update, Some(UpdateAction::Install));
+        assert!(HELP.contains("/update [yes]"));
     }
 }
