@@ -1,8 +1,15 @@
 //! UDP multicast discovery: announce ourselves every 2s, report peers we hear.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
+use socket2::{Domain, Protocol, Socket, Type};
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, warn};
+
+use crate::node::NodeMsg;
 use crate::protocol::{Announce, PeerId, PROTOCOL_VERSION};
 
 pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
@@ -24,6 +31,53 @@ pub fn parse_announce(bytes: &[u8], src: SocketAddr, me: PeerId) -> Option<Sight
         return None;
     }
     Some(Sighting { id: a.id, nick: a.nick, tcp_addr: SocketAddr::new(src.ip(), a.tcp_port) })
+}
+
+fn bind_socket() -> io::Result<std::net::UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    // Lets several instances on one machine share the discovery port.
+    socket.set_reuse_port(true)?;
+    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PORT).into())?;
+    socket.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED)?;
+    socket.set_multicast_loop_v4(true)?;
+    socket.set_multicast_ttl_v4(1)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
+/// Runs until the socket fails to set up (returns the error) or `node_tx` closes.
+pub async fn run(
+    me: PeerId,
+    nick: watch::Receiver<String>,
+    tcp_port: u16,
+    node_tx: mpsc::Sender<NodeMsg>,
+) -> io::Result<()> {
+    let socket = UdpSocket::from_std(bind_socket()?)?;
+    let group = SocketAddr::V4(SocketAddrV4::new(GROUP, PORT));
+    let mut tick = tokio::time::interval(ANNOUNCE_INTERVAL);
+    let mut buf = [0u8; 2048];
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let announce = Announce { v: PROTOCOL_VERSION, id: me, nick: nick.borrow().clone(), tcp_port };
+                if let Err(e) = socket.send_to(&announce.to_bytes(), group).await {
+                    warn!("discovery announce failed: {e}");
+                }
+            }
+            received = socket.recv_from(&mut buf) => match received {
+                Ok((n, src)) => {
+                    if let Some(sighting) = parse_announce(&buf[..n], src, me) {
+                        debug!(?sighting, "discovered");
+                        if node_tx.send(NodeMsg::Discovered(sighting)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => warn!("discovery receive failed: {e}"),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
