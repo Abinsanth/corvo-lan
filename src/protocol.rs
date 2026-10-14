@@ -58,6 +58,9 @@ impl TryFrom<String> for PeerId {
         if s.len() != 64 {
             return Err(format!("peer id must be 64 hex chars, got {} chars", s.len()));
         }
+        if !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(format!("invalid peer id {s:?}"));
+        }
         crate::room::from_hex(&s)
             .and_then(|b| <[u8; 32]>::try_from(b).ok())
             .map(PeerId)
@@ -172,5 +175,15 @@ mod tests {
     fn test_ids_order_by_their_number() {
         assert!(PeerId::test(1) < PeerId::test(2));
         assert!(PeerId::test(0xff) < PeerId::test(0x100));
+    }
+
+    #[test]
+    fn peer_ids_parse_only_as_lowercase_hex() {
+        let good = "ab".repeat(32);
+        assert_eq!(PeerId::try_from(good.clone()).unwrap().to_string(), good);
+        assert!(PeerId::try_from("AB".repeat(32)).is_err(), "uppercase");
+        assert!(PeerId::try_from(format!("+a{}", "ab".repeat(31))).is_err(), "a sign");
+        assert!(PeerId::try_from(format!("zz{}", "ab".repeat(31))).is_err());
+        assert!(PeerId::try_from("ab".repeat(31)).is_err(), "too short");
     }
 }

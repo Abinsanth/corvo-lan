@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, warn};
 
 use crate::api::LeaveReason;
@@ -18,7 +18,7 @@ use crate::identity::Keys;
 use crate::names;
 use crate::node::{ConnKey, NodeMsg, Verdict};
 use crate::noise::{self, Opener, Sealer};
-use crate::protocol::{Frame, PROTOCOL_VERSION, PeerId};
+use crate::protocol::{DecodeError, Frame, PROTOCOL_VERSION, PeerId};
 
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PING_INTERVAL: Duration = Duration::from_secs(3);
@@ -106,24 +106,26 @@ async fn handle(
     let _ = node_tx.send(NodeMsg::PeerGone { conn, id, reason }).await;
 }
 
-/// Runs the Noise handshake, then exchanges `Hello` frames over it. Returns the
-/// remote key, its nick and the two halves of the encrypted link.
-async fn handshake(
-    stream: &mut TcpStream,
+/// Runs the Noise handshake, then exchanges `Hello` frames over it, all within
+/// one `HANDSHAKE_TIMEOUT`. Returns the remote key, its nick and the two
+/// halves of the encrypted link.
+async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     me: &Me,
     outbound: bool,
     expected: Option<PeerId>,
 ) -> anyhow::Result<(PeerId, String, Sealer, Opener)> {
-    let (id, mut sealer, mut opener) =
-        timeout(HANDSHAKE_TIMEOUT, noise::handshake(stream, &me.keys, outbound, expected))
-            .await
-            .context("no handshake within 5s")??;
-    let nick = me.nick.borrow().clone();
-    sealer.write_frame(stream, &Frame::Hello { v: PROTOCOL_VERSION, nick }).await.context("sending hello")?;
-    let reply = timeout(HANDSHAKE_TIMEOUT, opener.read_frame(stream))
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let (id, mut sealer, mut opener) = timeout_at(deadline, noise::handshake(stream, &me.keys, outbound, expected))
         .await
-        .context("no hello within 5s")?
-        .context("reading hello")?;
+        .ok()
+        .context("no handshake within 5s")??;
+    let nick = me.nick.borrow().clone();
+    let hello = async {
+        sealer.write_frame(stream, &Frame::Hello { v: PROTOCOL_VERSION, nick }).await.context("sending hello")?;
+        opener.read_frame(stream).await.context("reading hello")
+    };
+    let reply = timeout_at(deadline, hello).await.ok().context("no hello within 5s")??;
     match reply {
         Frame::Hello { v, .. } if v != PROTOCOL_VERSION => bail!("unsupported protocol version {v}"),
         Frame::Hello { nick, .. } if !names::is_valid_nick(&nick) => bail!("invalid nick {nick:?}"),
@@ -234,12 +236,19 @@ async fn write_loop<W: AsyncWrite + Unpin>(
         match timeout(WRITE_TIMEOUT, sealer.write_frame(wr, &frame)).await {
             Err(_) => return WriterExit::Stalled,
             // Sending it would make the peer drop us; lose just this frame.
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidInput => warn!("not sending frame: {e}"),
+            Ok(Err(e)) if is_too_large(&e) => warn!("not sending frame: {e}"),
             Ok(Err(_)) => return WriterExit::Failed,
             Ok(Ok(())) if frame == Frame::Bye => return WriterExit::Bye,
             Ok(Ok(())) => {}
         }
     }
+}
+
+/// `Sealer::write_frame`'s refusal of a frame over `MAX_FRAME_LEN`.
+fn is_too_large(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<DecodeError>())
+        .is_some_and(|d| matches!(d, DecodeError::TooLarge(_)))
 }
 
 #[cfg(test)]
@@ -310,5 +319,99 @@ mod tests {
             _ => panic!("expected the chat frame to be forwarded"),
         }
         assert!(node_rx.try_recv().is_err()); // Ping is swallowed
+    }
+
+    use crate::identity::Keys;
+    use crate::noise;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    fn me(nick: &str) -> (watch::Sender<String>, Me) {
+        let (tx, rx) = watch::channel(nick.to_string());
+        (tx, Me { keys: Keys::generate(), nick: rx })
+    }
+
+    /// Our side of `handshake` against a peer that finishes Noise and then sends `hello`.
+    async fn against(hello: Frame) -> anyhow::Result<(PeerId, String, Sealer, Opener)> {
+        let (_tx, me) = me("annMoon");
+        let (mut ours, mut theirs) = tokio::io::duplex(1 << 16);
+        let them = Keys::generate();
+        let peer = async move {
+            let (_, mut seal, _open) = noise::handshake(&mut theirs, &them, false, None).await.unwrap();
+            seal.write_frame(&mut theirs, &hello).await.unwrap();
+            theirs // stays open until our side is done
+        };
+        let (result, _theirs) = tokio::join!(handshake(&mut ours, &me, true, None), peer);
+        result
+    }
+
+    #[tokio::test]
+    async fn a_good_hello_gives_the_peers_nick() {
+        let (_, nick, _, _) = against(Frame::Hello { v: PROTOCOL_VERSION, nick: "bobRoger".into() }).await.unwrap();
+        assert_eq!(nick, "bobRoger");
+    }
+
+    #[tokio::test]
+    async fn a_hello_with_another_version_is_refused() {
+        let err = against(Frame::Hello { v: 2, nick: "bobRoger".into() }).await.err().unwrap();
+        assert_eq!(format!("{err:#}"), "unsupported protocol version 2");
+    }
+
+    #[tokio::test]
+    async fn a_hello_with_an_invalid_nick_is_refused() {
+        let err = against(Frame::Hello { v: PROTOCOL_VERSION, nick: "bob".into() }).await.err().unwrap();
+        assert_eq!(format!("{err:#}"), "invalid nick \"bob\"");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_hello_shares_the_handshake_deadline() {
+        let (_tx, me) = me("annMoon");
+        let (mut ours, mut theirs) = tokio::io::duplex(1 << 16);
+        let them = Keys::generate();
+        let start = tokio::time::Instant::now();
+        let peer = async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let _link = noise::handshake(&mut theirs, &them, false, None).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await; // never says hello
+        };
+        let our_side = async {
+            let result = handshake(&mut ours, &me, true, None).await;
+            (result, start.elapsed())
+        };
+        let ((result, took), ()) = tokio::join!(our_side, peer);
+        assert_eq!(format!("{:#}", result.err().unwrap()), "no hello within 5s");
+        assert!(took <= HANDSHAKE_TIMEOUT, "took {took:?}");
+    }
+
+    /// Refuses every write with `InvalidInput`, like a socket that rejects the call.
+    struct Refuses;
+
+    impl AsyncWrite for Refuses {
+        fn poll_write(self: Pin<&mut Self>, _: &mut std::task::Context<'_>, _: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "refused")))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_stops_on_an_invalid_input_that_isnt_too_large() {
+        let ((mut seal, _), _) = test_pair().await;
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(Frame::Direct { text: "hi".into(), ts: 0 }).await.unwrap();
+        drop(tx);
+        assert_eq!(write_loop(&mut Refuses, &mut seal, rx).await, WriterExit::Failed);
+    }
+
+    #[test]
+    fn only_too_large_counts_as_too_large() {
+        let big = std::io::Error::new(std::io::ErrorKind::InvalidInput, DecodeError::TooLarge(70_000));
+        assert!(is_too_large(&big));
+        assert!(!is_too_large(&std::io::Error::new(std::io::ErrorKind::InvalidInput, "other")));
+        assert!(!is_too_large(&std::io::Error::other(DecodeError::Decrypt)));
     }
 }

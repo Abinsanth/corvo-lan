@@ -310,4 +310,97 @@ mod tests {
         let mut empty: &[u8] = &[];
         assert!(matches!(open.read_frame(&mut empty).await, Err(DecodeError::Eof)));
     }
+
+    use snow::params::{CipherChoice, DHChoice, HashChoice};
+    use snow::resolvers::{CryptoResolver, DefaultResolver};
+    use snow::types::{Cipher, Dh, Hash, Random};
+
+    /// The default primitives, except that a static key set on a DH claims the
+    /// all-zero (low-order) point. Its DH output is then always zero, which is
+    /// exactly what an attacker without a real key could compute.
+    struct WeakResolver;
+
+    impl CryptoResolver for WeakResolver {
+        fn resolve_rng(&self) -> Option<Box<dyn Random>> {
+            DefaultResolver.resolve_rng()
+        }
+        fn resolve_dh(&self, choice: &DHChoice) -> Option<Box<dyn Dh>> {
+            Some(Box::new(WeakStatic { inner: DefaultResolver.resolve_dh(choice)?, weak: false }))
+        }
+        fn resolve_hash(&self, choice: &HashChoice) -> Option<Box<dyn Hash>> {
+            DefaultResolver.resolve_hash(choice)
+        }
+        fn resolve_cipher(&self, choice: &CipherChoice) -> Option<Box<dyn Cipher>> {
+            DefaultResolver.resolve_cipher(choice)
+        }
+    }
+
+    struct WeakStatic {
+        inner: Box<dyn Dh>,
+        /// Set for the static key (`set`), not for ephemerals (`generate`).
+        weak: bool,
+    }
+
+    impl Dh for WeakStatic {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn pub_len(&self) -> usize {
+            self.inner.pub_len()
+        }
+        fn priv_len(&self) -> usize {
+            self.inner.priv_len()
+        }
+        fn set(&mut self, privkey: &[u8]) {
+            self.inner.set(privkey);
+            self.weak = true;
+        }
+        fn generate(&mut self, rng: &mut dyn Random) -> Result<(), snow::Error> {
+            self.inner.generate(rng)
+        }
+        fn pubkey(&self) -> &[u8] {
+            if self.weak { &[0; 32] } else { self.inner.pubkey() }
+        }
+        fn privkey(&self) -> &[u8] {
+            self.inner.privkey()
+        }
+        fn dh(&self, pubkey: &[u8], out: &mut [u8]) -> Result<(), snow::Error> {
+            if self.weak {
+                out[..32].fill(0);
+                Ok(())
+            } else {
+                self.inner.dh(pubkey, out)
+            }
+        }
+    }
+
+    /// The responder side of a handshake from a peer claiming a low-order key.
+    async fn weak_responder<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S) -> Result<(), HandshakeError> {
+        s.write_all(&[MAGIC.as_slice(), &[PROTOCOL_VERSION]].concat()).await?;
+        let mut theirs = [0u8; 5];
+        s.read_exact(&mut theirs).await?;
+        let mut hs = Builder::with_resolver(PARAMS.parse().unwrap(), Box::new(WeakResolver))
+            .local_private_key(&[7; 32])?
+            .prologue(PROLOGUE)?
+            .build_responder()?;
+        let mut buf = vec![0u8; MAX_MSG];
+        while !hs.is_handshake_finished() {
+            if hs.is_my_turn() {
+                let n = hs.write_message(&[], &mut buf)?;
+                write_msg(s, &buf[..n]).await?;
+            } else {
+                let msg = read_msg(s).await?;
+                hs.read_message(&msg, &mut buf)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_peer_claiming_a_low_order_key_is_refused_end_to_end() {
+        let (mut ours, mut theirs) = duplex(1 << 16);
+        let keys = Keys::generate();
+        let (ra, _) = tokio::join!(handshake(&mut ours, &keys, true, None), weak_responder(&mut theirs));
+        assert_eq!(ra.err().unwrap().to_string(), "peer key is invalid");
+    }
 }
