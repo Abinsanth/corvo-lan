@@ -131,7 +131,8 @@ struct Room {
     door: RoomKeys,
     /// Other members, all proven.
     members: HashMap<PeerId, Member>,
-    /// Peers removed from the room; they may only come back through the door.
+    /// Peers removed from the room while they still hold its key: ignored
+    /// until the next key switch, or until they're let back in through the door.
     gone: HashSet<PeerId>,
     challenges: HashMap<PeerId, Challenge>,
     requests: HashMap<PeerId, Request>,

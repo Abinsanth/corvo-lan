@@ -178,6 +178,9 @@ impl Node {
         // A running timer stays: it may be for a removal this key doesn't cover yet.
         room.rekey_backup = None;
         room.challenges.clear();
+        // Whoever was removed lost the key with this switch; anyone who has the
+        // new one got it from a member who still counts them in.
+        room.gone.clear();
         // Lets a newcomer who just switched be challenged, and so proven, under the new key.
         let here = self.seal(&room.keys, RoomBody::Here { name: room.name.clone(), echo: None });
         self.rooms.doors.insert(room.door.id, new_id);
@@ -433,6 +436,26 @@ mod tests {
         h.pump().await; // RekeyDue
         assert!(rekeys(&made.keys, &h.sent(BOB)).is_empty(), "and he isn't handed the new key");
         assert_eq!(rekeys(&made.keys, &h.sent(CAROL)).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn someone_dropped_only_on_our_side_proves_again_under_the_new_key() {
+        let mut h = with_peers();
+        h.connect(ZED, "zedfox", true);
+        h.events(); // its PeerJoined
+        let made = room_with(&mut h, &[ZED, BOB]).await;
+        tokio::time::advance(super::super::MEMBER_TIMEOUT).await;
+        deliver(&mut h, ZED, frame_from(ZED, &made.keys, here(&made.name, None)));
+        h.node.on_tick(tokio::time::Instant::now()); // bob went quiet, for us only
+        assert!(!room_of(&h, &made.name).members.contains_key(&BOB));
+        // Zed still counts bob, so its key reached him too.
+        deliver(&mut h, ZED, frame_from(ZED, &made.keys, rekey_body(1, ZED, [5; 32])));
+        let k1 = keys_now(&h, &made.name);
+        h.events();
+        h.sent(BOB);
+        verify(&mut h, BOB, &made.name, &k1);
+        assert!(room_of(&h, &made.name).members.contains_key(&BOB));
+        assert!(h.events().contains(&Event::MemberJoined { room: made.name.clone(), nick: "bobroger".into() }));
     }
 
     #[tokio::test(start_paused = true)]
