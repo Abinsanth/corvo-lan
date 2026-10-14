@@ -27,7 +27,7 @@ pub struct Entry {
 pub enum Judgement {
     Known,
     FirstMeeting,
-    /// A new key under a base we've only met with other keys, none of them online now.
+    /// A key under a base we've met with other keys, none of them online now.
     KeyChanged {
         last_seen: u64,
     },
@@ -67,15 +67,18 @@ impl Store {
     }
 
     pub fn judge(&self, key: PeerId, nick: &str, online: &[PeerId]) -> Judgement {
-        if self.entries.iter().any(|e| e.key == key) {
+        let base = names::base_of(nick).unwrap_or(nick);
+        let stored = self.entries.iter().find(|e| e.key == key);
+        if stored.is_some_and(|e| e.base == base) {
             return Judgement::Known;
         }
-        let base = names::base_of(nick).unwrap_or(nick);
-        let others: Vec<&Entry> = self.entries.iter().filter(|e| e.base == base).collect();
-        if others.is_empty() || others.iter().any(|e| online.contains(&e.key)) {
-            return Judgement::FirstMeeting;
+        let others: Vec<&Entry> = self.entries.iter().filter(|e| e.base == base && e.key != key).collect();
+        let clear = others.is_empty() || others.iter().any(|e| online.contains(&e.key));
+        match (stored.is_some(), clear) {
+            (true, true) => Judgement::Known,
+            (false, true) => Judgement::FirstMeeting,
+            (_, false) => Judgement::KeyChanged { last_seen: others.iter().map(|e| e.last_seen).max().unwrap_or(0) },
         }
-        Judgement::KeyChanged { last_seen: others.iter().map(|e| e.last_seen).max().unwrap_or(0) }
     }
 
     /// Remembers `key` as `nick`, seen at `now`.
@@ -134,6 +137,19 @@ mod tests {
             s.record(PeerId::test(key), nick, at);
         }
         s
+    }
+
+    #[test]
+    fn a_known_key_under_a_base_met_with_other_keys_is_judged_there() {
+        let s = met(&[(1, "eveFox", DAY), (2, "bobRoger", 2 * DAY)]);
+        assert_eq!(s.judge(PeerId::test(1), "bobMoon", &[]), Judgement::KeyChanged { last_seen: 2 * DAY });
+        assert_eq!(s.judge(PeerId::test(1), "bobMoon", &[PeerId::test(2)]), Judgement::Known);
+    }
+
+    #[test]
+    fn a_known_key_under_a_new_base_nobody_else_used_is_silent() {
+        let s = met(&[(1, "eveFox", DAY)]);
+        assert_eq!(s.judge(PeerId::test(1), "carolFox", &[]), Judgement::Known);
     }
 
     #[test]
