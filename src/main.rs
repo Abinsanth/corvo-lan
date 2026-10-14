@@ -13,7 +13,7 @@ use corvo_lan::update;
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// Base of your name, 1-9 letters or digits (default: your login name); the system adds a word
+    /// Base of your name, 1-6 letters or digits (default: your login name); the system adds a word
     #[arg(long)]
     nick: Option<String>,
     /// TCP port to listen on (0 = pick a free one)

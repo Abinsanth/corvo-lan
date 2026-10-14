@@ -6,7 +6,12 @@ use rand::seq::SliceRandom;
 
 use crate::words::WORDS;
 
-pub const MAX_BASE_LEN: usize = 9;
+/// Longest base you can pick.
+pub const MAX_BASE_LEN: usize = 6;
+
+/// Longest base a name may have. Bases used to go up to 9, and those names
+/// still arrive from older peers and sit in saved rooms and known peers.
+const MAX_SEEN_BASE_LEN: usize = 9;
 
 /// Command names and a few words that would read as commands or as "everyone".
 pub const RESERVED: [&str; 21] = [
@@ -14,13 +19,14 @@ pub const RESERVED: [&str; 21] = [
     "help", "quit", "exit", "me", "all", "system", "accept", "decline",
 ];
 
-/// A base is what the user types, lowercased: 1–9 ASCII letters or digits, not reserved.
+/// A base is what the user types, lowercased: 1–6 ASCII letters or digits, not reserved.
 pub fn validate_base(base: &str) -> Result<(), String> {
-    if base.is_empty()
-        || base.len() > MAX_BASE_LEN
-        || !base.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-    {
-        return Err(format!("name must be 1–{MAX_BASE_LEN} letters or digits"));
+    check_base(base, MAX_BASE_LEN)
+}
+
+fn check_base(base: &str, max_len: usize) -> Result<(), String> {
+    if base.is_empty() || base.len() > max_len || !base.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+        return Err(format!("name must be 1–{max_len} letters or digits"));
     }
     if RESERVED.contains(&base) {
         return Err(format!("'{base}' is reserved"));
@@ -36,7 +42,7 @@ pub fn is_valid_name(name: &str) -> bool {
 
 /// `bobroger` → `bob`: the part the user chose. `None` if `name` isn't a valid name.
 pub fn base_of(name: &str) -> Option<&str> {
-    WORDS.iter().find_map(|w| name.strip_suffix(w).filter(|base| validate_base(base).is_ok()))
+    WORDS.iter().find_map(|w| name.strip_suffix(w).filter(|base| check_base(base, MAX_SEEN_BASE_LEN).is_ok()))
 }
 
 /// `bobroger` → `bobRoger`: how a name is shown. Only the screen sees this;
@@ -100,10 +106,10 @@ pub fn default_base(login: Option<&str>) -> String {
 mod tests {
     #[test]
     fn default_base_makes_any_login_usable() {
-        assert_eq!(default_base(Some("abinsanth")), "abinsanth");
-        assert_eq!(default_base(Some("John Smith")), "johnsmith");
+        assert_eq!(default_base(Some("abinsanth")), "abinsa");
+        assert_eq!(default_base(Some("John Smith")), "johnsm");
         assert_eq!(default_base(Some("j.doe")), "jdoe");
-        assert_eq!(default_base(Some("christopher")), "christoph");
+        assert_eq!(default_base(Some("christopher")), "christ");
         assert_eq!(default_base(Some("José")), "jos");
         assert_eq!(default_base(Some("HELP")), "anon", "reserved");
         assert_eq!(default_base(Some("...")), "anon");
@@ -116,8 +122,8 @@ mod tests {
     fn bases_are_short_lowercase_alphanumeric_and_not_reserved() {
         assert!(validate_base("bob").is_ok());
         assert!(validate_base("team42").is_ok());
-        assert!(validate_base("abcdefghi").is_ok());
-        assert_eq!(validate_base("abcdefghij"), Err("name must be 1–9 letters or digits".into()));
+        assert!(validate_base("abcdef").is_ok());
+        assert_eq!(validate_base("abcdefg"), Err("name must be 1–6 letters or digits".into()));
         assert!(validate_base("").is_err());
         assert!(validate_base("Bob").is_err(), "callers lowercase what's typed");
         assert!(validate_base("bob smith").is_err());
@@ -141,6 +147,7 @@ mod tests {
         assert!(!is_valid_name("roger")); // empty base
         assert!(!is_valid_name("bobzzz")); // not a listed word
         assert!(!is_valid_name("chatroger")); // reserved base
+        assert!(is_valid_name("abcdefghiroger"), "a 9-letter base from before the limit was 6");
         assert!(!is_valid_name("abcdefghijroger")); // base too long
         assert!(!is_valid_name("catpier"), "rooms have no R any more");
     }
@@ -150,6 +157,7 @@ mod tests {
         assert_eq!(base_of("bobroger"), Some("bob"));
         assert_eq!(base_of("team42moon"), Some("team42"));
         assert_eq!(base_of("grapegrape"), Some("grape"));
+        assert_eq!(base_of("abhishekmoon"), Some("abhishek"));
         assert_eq!(base_of("bob"), None);
         assert_eq!(base_of("roger"), None, "no base left");
     }
@@ -160,6 +168,7 @@ mod tests {
         assert_eq!(display("catpie"), "catPie");
         assert_eq!(display("team42moon"), "team42Moon");
         assert_eq!(display("grapegrape"), "grapeGrape");
+        assert_eq!(display("abhishekmoon"), "abhishekMoon");
         assert_eq!(display("bob"), "bob", "not a name, left alone");
         assert_eq!(display("bobRoger"), "bobRoger");
     }

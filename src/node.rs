@@ -1029,7 +1029,7 @@ pub(super) mod tests {
         h.node.handle_command(Command::PreviewName { base: "Bob".into() });
         assert_eq!(
             h.events(),
-            vec![Event::Error("'chat' is reserved".into()), Event::Error("name must be 1–9 letters or digits".into()),]
+            vec![Event::Error("'chat' is reserved".into()), Event::Error("name must be 1–6 letters or digits".into()),]
         );
         h.node.handle_command(dm("bobroger", "hi"));
         assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("still picking")));
