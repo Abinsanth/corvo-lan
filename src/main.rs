@@ -45,6 +45,13 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
+    // A Windows /update leaves the old exe beside the new one until now.
+    if cfg!(windows)
+        && let Some(dir) = std::env::current_exe().ok().as_deref().and_then(std::path::Path::parent)
+    {
+        update::remove_old_exe(dir);
+    }
+
     // Windows sets USERNAME rather than USER.
     let login = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok();
     let base = args.nick.unwrap_or_else(|| names::default_base(login.as_deref()));

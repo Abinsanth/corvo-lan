@@ -1,12 +1,11 @@
 //! Self-update: find newer GitHub releases and replace the running binary.
-//! Talks to GitHub through the system `curl` (as install.sh does), so the app
-//! needs no HTTP or TLS crates.
+//! Talks to GitHub through the system `curl` and unpacks with the system `tar` (as install.sh does; Windows 10+
+//! ships both), so the app needs no HTTP or TLS crates.
 
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -15,6 +14,14 @@ use crate::room::to_hex;
 
 pub const REPO: &str = "Abinsanth/corvo-lan";
 pub const INSTALL_URL: &str = "https://raw.githubusercontent.com/Abinsanth/corvo-lan/release/install.sh";
+pub const INSTALL_PS1_URL: &str = "https://raw.githubusercontent.com/Abinsanth/corvo-lan/release/install.ps1";
+/// Where a Windows update moves the running exe, which can be renamed but not replaced.
+pub const OLD_EXE: &str = "corvo-lan.old.exe";
+/// The binary inside a release archive.
+#[cfg(windows)]
+const BIN_NAME: &str = "corvo-lan.exe";
+#[cfg(not(windows))]
+const BIN_NAME: &str = "corvo-lan";
 /// Names the temp dir an install works in, beside the binary it replaces.
 const TMP_PREFIX: &str = ".corvo-lan-update-";
 /// Most PR titles shown per release.
@@ -102,18 +109,14 @@ pub fn newer_than(current: Version, releases: Vec<Release>) -> Vec<Release> {
     newer
 }
 
-/// The release asset for `std::env::consts::{OS, ARCH}`; same naming as install.sh.
+/// The release asset for `std::env::consts::{OS, ARCH}`; same naming as install.sh and install.ps1.
 pub fn asset_name(os: &str, arch: &str) -> Option<String> {
-    let os = match os {
-        "macos" => "apple-darwin",
-        "linux" => "unknown-linux-musl",
-        _ => return None,
-    };
-    let arch = match arch {
-        "x86_64" | "aarch64" => arch,
-        _ => return None,
-    };
-    Some(format!("corvo-lan-{arch}-{os}.tar.gz"))
+    match (os, arch) {
+        ("macos", "x86_64" | "aarch64") => Some(format!("corvo-lan-{arch}-apple-darwin.tar.gz")),
+        ("linux", "x86_64" | "aarch64") => Some(format!("corvo-lan-{arch}-unknown-linux-musl.tar.gz")),
+        ("windows", "x86_64") => Some("corvo-lan-x86_64-pc-windows-msvc.zip".into()),
+        _ => None,
+    }
 }
 
 /// Whether `CORVO_LAN_NO_UPDATE_CHECK=<value>` turns the startup check off.
@@ -187,9 +190,9 @@ async fn install_in(tmp: &Path, urls: &Urls, version: Version, asset: &str, targ
         return Err("download didn't match its checksum; nothing changed".into());
     }
 
-    let status = tokio::process::Command::new("tar")
+    let status = tokio::process::Command::new(tar_program())
         .kill_on_drop(true)
-        .arg("-xzf")
+        .arg("-xf")
         .arg(&archive)
         .arg("-C")
         .arg(tmp)
@@ -201,13 +204,60 @@ async fn install_in(tmp: &Path, urls: &Urls, version: Version, asset: &str, targ
         Err(e) if e.kind() == ErrorKind::NotFound => return Err("/update needs tar, which isn't installed".into()),
         Err(e) => return Err(format!("couldn't run tar: {e}")),
     }
-    let new = tmp.join("corvo-lan");
+    let new = tmp.join(BIN_NAME);
     if !new.is_file() {
         return Err("the download didn't contain corvo-lan; nothing changed".into());
     }
-    std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
-    // The running process keeps its open copy of the old file; restarting picks up the new one.
-    std::fs::rename(&new, target).map_err(|e| cant_replace(target, &e.to_string()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    }
+    swap_in(&new, target).map_err(|e| cant_replace(target, &e.to_string()))
+}
+
+/// Windows' own bsdtar reads zip; a GNU tar from Git for Windows on PATH doesn't.
+fn tar_program() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        return Path::new(&root).join("System32").join("tar.exe");
+    }
+    PathBuf::from("tar")
+}
+
+/// Puts `new` where `target` is. The running process keeps its open copy of
+/// the old file; restarting picks up the new one.
+#[cfg(not(windows))]
+fn swap_in(new: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(new, target)
+}
+
+/// Windows won't replace a running exe but will rename it, so move it aside
+/// first and put it back if the new one can't go in.
+#[cfg(windows)]
+fn swap_in(new: &Path, target: &Path) -> std::io::Result<()> {
+    if !new.is_file() {
+        return Err(std::io::Error::new(ErrorKind::NotFound, "the new version is missing"));
+    }
+    let old = target.with_file_name(OLD_EXE);
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(target, &old)?;
+    if let Err(e) = std::fs::rename(new, target) {
+        return match std::fs::rename(&old, target) {
+            Ok(()) => Err(e),
+            Err(_) => Err(std::io::Error::other(format!(
+                "{e}; the old version is at {}, rename it back to {}",
+                old.display(),
+                target.display()
+            ))),
+        };
+    }
+    Ok(())
+}
+
+/// Deletes the exe a Windows update moved aside; it couldn't go while it ran.
+pub fn remove_old_exe(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(OLD_EXE));
 }
 
 async fn download(url: &str, out: &Path) -> Result<(), String> {
@@ -225,11 +275,19 @@ fn sweep_leftovers(dir: &Path) {
             let path = entry.path();
             let _ = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
         }
+        if entry.file_name() == OLD_EXE {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
+/// How to reinstall by hand on this platform.
+pub fn reinstall_hint() -> String {
+    if cfg!(windows) { format!("irm {INSTALL_PS1_URL} | iex") } else { format!("curl -fsSL {INSTALL_URL} | sh") }
+}
+
 fn cant_replace(target: &Path, reason: &str) -> String {
-    format!("can't replace {}: {reason}. Reinstall with: curl -fsSL {INSTALL_URL} | sh", target.display())
+    format!("can't replace {}: {reason}. Reinstall with: {}", target.display(), reinstall_hint())
 }
 
 /// Runs curl and returns what it wrote to stdout.
@@ -340,7 +398,8 @@ mod tests {
         assert_eq!(asset_name("macos", "x86_64").as_deref(), Some("corvo-lan-x86_64-apple-darwin.tar.gz"));
         assert_eq!(asset_name("linux", "x86_64").as_deref(), Some("corvo-lan-x86_64-unknown-linux-musl.tar.gz"));
         assert_eq!(asset_name("linux", "aarch64").as_deref(), Some("corvo-lan-aarch64-unknown-linux-musl.tar.gz"));
-        assert_eq!(asset_name("windows", "x86_64"), None);
+        assert_eq!(asset_name("windows", "x86_64").as_deref(), Some("corvo-lan-x86_64-pc-windows-msvc.zip"));
+        assert_eq!(asset_name("windows", "aarch64"), None);
         assert_eq!(asset_name("linux", "riscv64"), None);
     }
 
@@ -353,8 +412,8 @@ mod tests {
         assert!(check_disabled_by(Some("yes")));
     }
 
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A fresh empty directory under the system temp dir.
@@ -374,24 +433,25 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = root.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("corvo-lan"), format!("#!/bin/sh\necho {marker}\n")).unwrap();
+        std::fs::write(src.join(BIN_NAME), format!("#!/bin/sh\necho {marker}\n")).unwrap();
         let archive = dir.join(asset);
-        let ok = std::process::Command::new("tar")
-            .arg("-czf")
+        let ok = std::process::Command::new(tar_program())
+            .arg("-a")
+            .arg("-cf")
             .arg(&archive)
             .arg("-C")
             .arg(&src)
-            .arg("corvo-lan")
+            .arg(BIN_NAME)
             .status()
             .unwrap();
         assert!(ok.success());
         let sum = to_hex(&Sha256::digest(std::fs::read(&archive).unwrap()));
         std::fs::write(dir.join(format!("{asset}.sha256")), format!("{sum}  {asset}\n")).unwrap();
-        Urls { api: String::new(), download: format!("file://{}", root.display()) }
+        Urls { api: String::new(), download: file_url(root) }
     }
 
     fn old_binary(dir: &Path) -> PathBuf {
-        let target = dir.join("corvo-lan");
+        let target = dir.join(BIN_NAME);
         std::fs::write(&target, "old").unwrap();
         target
     }
@@ -400,17 +460,27 @@ mod tests {
         std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n != "corvo-lan")
+            .filter(|n| n != BIN_NAME)
             .collect()
     }
 
+    /// The archive the fake releases use: tar picks the format from the name.
+    #[cfg(windows)]
+    const ASSET: &str = "corvo-lan-test.zip";
+    #[cfg(not(windows))]
     const ASSET: &str = "corvo-lan-test.tar.gz";
+
+    /// A `file://` URL curl accepts; Windows paths become `file:///C:/...`.
+    fn file_url(path: &Path) -> String {
+        let p = path.display().to_string().replace('\\', "/");
+        if p.starts_with('/') { format!("file://{p}") } else { format!("file:///{p}") }
+    }
 
     #[tokio::test]
     async fn check_reads_the_api_and_keeps_newer_releases() {
         let root = scratch("check");
         std::fs::write(root.join("releases.json"), API).unwrap();
-        let urls = Urls { api: format!("file://{}/releases.json", root.display()), download: String::new() };
+        let urls = Urls { api: file_url(&root.join("releases.json")), download: String::new() };
         let newer = check_with(&urls, Version(0, 2, 0)).await.unwrap();
         let versions: Vec<Version> = newer.iter().map(|r| r.version).collect();
         assert_eq!(versions, vec![Version(0, 10, 0), Version(0, 2, 1)]);
@@ -424,8 +494,11 @@ mod tests {
         let target = old_binary(&bin);
         install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "#!/bin/sh\necho new\n");
+        #[cfg(unix)]
         assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
-        assert!(leftovers(&bin).is_empty(), "{:?}", leftovers(&bin));
+        // Windows can't delete the exe it just moved aside; the next start does.
+        let expected: Vec<String> = if cfg!(windows) { vec![OLD_EXE.into()] } else { vec![] };
+        assert_eq!(leftovers(&bin), expected);
     }
 
     #[tokio::test]
@@ -445,7 +518,7 @@ mod tests {
     async fn missing_archive_leaves_target_unchanged() {
         let root = scratch("empty-release");
         let bin = scratch("missing-bin");
-        let urls = Urls { api: String::new(), download: format!("file://{}", root.display()) };
+        let urls = Urls { api: String::new(), download: file_url(&root) };
         let target = old_binary(&bin);
         let err = install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap_err();
         assert!(err.starts_with("couldn't download v0.3.0"), "{err}");
@@ -453,6 +526,7 @@ mod tests {
         assert!(leftovers(&bin).is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn read_only_directory_fails_before_downloading() {
         let bin = scratch("ro-bin");
@@ -463,7 +537,7 @@ mod tests {
         let err = install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap_err();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(err.starts_with(&format!("can't replace {}: permission denied", target.display())), "{err}");
-        assert!(err.ends_with(&format!("Reinstall with: curl -fsSL {INSTALL_URL} | sh")), "{err}");
+        assert!(err.ends_with(&format!("Reinstall with: {}", reinstall_hint())), "{err}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
     }
 
@@ -480,7 +554,64 @@ mod tests {
         std::fs::write(bin.join(".corvo-lan-update-2"), "x").unwrap();
         std::fs::write(bin.join(format!(".corvo-lan-update-{}", std::process::id())), "x").unwrap();
         install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
+        let expected: Vec<String> = if cfg!(windows) { vec![OLD_EXE.into()] } else { vec![] };
+        assert_eq!(leftovers(&bin), expected);
+    }
+
+    #[tokio::test]
+    async fn installing_twice_sweeps_the_previous_old_exe() {
+        let root = scratch("twice-release");
+        let bin = scratch("twice-bin");
+        let urls = fake_release(&root, "0.3.0", ASSET, "new");
+        let target = old_binary(&bin);
+        install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
+        install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
+        let expected: Vec<String> = if cfg!(windows) { vec![OLD_EXE.into()] } else { vec![] };
+        assert_eq!(leftovers(&bin), expected);
+    }
+
+    #[test]
+    fn a_failed_swap_leaves_the_target_as_it_was() {
+        let bin = scratch("swap-fail");
+        let target = old_binary(&bin);
+        assert!(swap_in(&bin.join("missing"), &target).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
         assert!(leftovers(&bin).is_empty(), "{:?}", leftovers(&bin));
+    }
+
+    #[test]
+    fn the_old_exe_is_removed_at_startup() {
+        let bin = scratch("old-exe");
+        std::fs::write(bin.join(OLD_EXE), "old").unwrap();
+        remove_old_exe(&bin);
+        assert!(!bin.join(OLD_EXE).exists());
+        remove_old_exe(&bin); // nothing there: no panic
+    }
+
+    #[test]
+    fn the_reinstall_hint_fits_the_platform() {
+        if cfg!(windows) {
+            assert_eq!(reinstall_hint(), format!("irm {INSTALL_PS1_URL} | iex"));
+        } else {
+            assert_eq!(reinstall_hint(), format!("curl -fsSL {INSTALL_URL} | sh"));
+        }
+    }
+
+    /// Updating again before restarting: the old exe is still running, so it
+    /// can't be replaced. Nothing may change.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_locked_old_exe_fails_cleanly() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = scratch("locked-release");
+        let bin = scratch("locked-bin");
+        let urls = fake_release(&root, "0.3.0", ASSET, "new");
+        let target = old_binary(&bin);
+        std::fs::write(bin.join(OLD_EXE), "running").unwrap();
+        let _held = std::fs::OpenOptions::new().read(true).share_mode(0).open(bin.join(OLD_EXE)).unwrap();
+        let err = install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap_err();
+        assert!(err.starts_with("can't replace"), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
     }
 
     #[test]
