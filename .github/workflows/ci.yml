@@ -1,9 +1,18 @@
 name: CI
 
+# Docs-only changes skip CI. Safe for the `release` ruleset's required checks,
+# because every release bumps Cargo.toml, which always runs CI.
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', LICENSE]
   pull_request:
+    paths-ignore: ['**.md', LICENSE]
+
+# A newer push to the same pull request cancels the older run; runs on main always finish.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
