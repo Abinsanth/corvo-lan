@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Serverless peer-to-peer chat for your local network"
-license = "Apache-2.0"
+license = "MIT"
 repository = "https://github.com/Abinsanth/corvo-lan"
 readme = "README.md"
 

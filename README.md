@@ -1,7 +1,5 @@
 # corvo-lan
 
-*Formerly lan-chat.*
-
 Serverless chat for your local network. Run it on two machines on the same
 Wi-Fi or LAN and they find each other. There's no server, no account and no
 setup.
@@ -105,4 +103,4 @@ bump it first.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
