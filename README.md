@@ -46,7 +46,7 @@ cargo install --path .
 Open a new terminal and run:
 
 ```bash
-corvo-lan --version         # prints e.g. "corvo-lan 0.4.0"
+corvo-lan --version         # prints "corvo-lan <version>"
 command -v corvo-lan        # macOS/Linux: where it's installed
 ```
 
@@ -197,7 +197,9 @@ Work happens on `main`. To ship, bump `version` in `Cargo.toml`, then merge
 `main` into the `release` branch. That builds macOS, Linux and Windows
 binaries, tags `v<version>`, and publishes them as a GitHub Release, which is
 what the install script downloads. A version that's already released is
-refused, so bump it first.
+refused, so bump it (and `Cargo.lock`) in its own pull request to `main`
+first. CI fails a pull request into `release` that still has a released
+version, before it can be merged.
 
 ## License
 
