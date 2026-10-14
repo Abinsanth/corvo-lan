@@ -57,8 +57,17 @@ pub struct Session {
     color: bool,
     /// Text is always plain; the TUI colours lines itself.
     style: Style,
-    /// `/create <base>` without a head count: the next line answers it.
-    asking: Option<String>,
+    /// The question the next line answers, if any.
+    asking: Option<Asking>,
+}
+
+/// A question the input is waiting on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Asking {
+    /// Startup: keep the previewed name or type another. Only a name ends it.
+    Name { preview: String },
+    /// `/create <base>` without a head count.
+    HeadCount { base: String },
 }
 
 impl Session {
@@ -73,6 +82,11 @@ impl Session {
     /// Folds an event into the store and returns what to print.
     pub fn on_event(&mut self, event: &Event, now: u64) -> Option<String> {
         self.store.apply(event, now);
+        match event {
+            Event::NamePreview { nick } => self.asking = Some(Asking::Name { preview: nick.clone() }),
+            Event::Assigned { .. } if matches!(self.asking, Some(Asking::Name { .. })) => self.asking = None,
+            _ => {}
+        }
         // Creating or joining a room takes you there.
         if let Event::RoomCreated { name, .. } | Event::RoomJoined { name, .. } = event {
             self.store.switch(Conv::Room(name.clone()));
@@ -84,7 +98,11 @@ impl Session {
     /// plain text goes there even if a join switched us while the user typed.
     /// If the prompt showed none, the user means where they've just arrived.
     pub fn on_line(&mut self, line: &str, shown: Option<&Conv>) -> Reaction {
-        if let Some(base) = self.asking.take()
+        if let Some(Asking::Name { preview }) = &self.asking {
+            let preview = preview.clone();
+            return self.answer_name(&preview, line.trim());
+        }
+        if let Some(Asking::HeadCount { base }) = self.asking.take()
             && !line.trim_start().starts_with('/')
         {
             return self.answer_head_count(base, line.trim());
@@ -94,14 +112,38 @@ impl Session {
 
     /// The question the input is waiting on, if any.
     pub fn prompt(&self) -> Option<String> {
-        self.asking.as_ref().map(|base| {
-            format!("how many people in #{base}…? {MIN_MEMBERS}–{MAX_MEMBERS}, Enter for {MAX_MEMBERS}, Esc to cancel")
+        self.asking.as_ref().map(|asking| match asking {
+            Asking::Name { preview } => format!("you'll be @{preview} — Enter to keep it, or type a name"),
+            Asking::HeadCount { base } => format!(
+                "how many people in #{base}…? {MIN_MEMBERS}–{MAX_MEMBERS}, Enter for {MAX_MEMBERS}, Esc to cancel"
+            ),
         })
     }
 
-    /// Drops the question; says whether there was one.
+    /// Drops the question; says whether there was one. The name question can't be dropped.
     pub fn cancel_prompt(&mut self) -> bool {
+        if matches!(self.asking, Some(Asking::Name { .. })) {
+            return false;
+        }
         self.asking.take().is_some()
+    }
+
+    /// Enter keeps the preview; a name asks for a new one. Only /quit gets past it.
+    fn answer_name(&mut self, preview: &str, answer: &str) -> Reaction {
+        if answer.is_empty() {
+            return Reaction::send(Command::ConfirmName);
+        }
+        if answer.starts_with('/') {
+            return match parse_line(answer) {
+                Input::Quit => self.on_input(Input::Quit, None),
+                _ => Reaction::say(format!("! pick your name first — Enter keeps @{preview}")),
+            };
+        }
+        let base = answer.to_ascii_lowercase();
+        match crate::names::validate_base(&base) {
+            Ok(()) => Reaction::send(Command::PreviewName { base }),
+            Err(e) => Reaction::say(format!("! {e}")),
+        }
     }
 
     fn answer_head_count(&mut self, base: String, answer: &str) -> Reaction {
@@ -111,7 +153,7 @@ impl Session {
         match answer.parse::<u8>() {
             Ok(max) if (MIN_MEMBERS..=MAX_MEMBERS).contains(&max) => Reaction::send(Command::CreateRoom { base, max }),
             _ => {
-                self.asking = Some(base);
+                self.asking = Some(Asking::HeadCount { base });
                 Reaction::say(format!(
                     "! a room holds {MIN_MEMBERS}–{MAX_MEMBERS} people — type a number, or Esc to cancel"
                 ))
@@ -172,7 +214,7 @@ impl Session {
             Input::Create { base, max } => match max.as_deref().map(str::parse::<u8>) {
                 None => match crate::names::validate_base(&base) {
                     Ok(()) => {
-                        self.asking = Some(base);
+                        self.asking = Some(Asking::HeadCount { base });
                         Reaction::default()
                     }
                     Err(e) => Reaction::say(format!("! {e}")),
@@ -394,6 +436,38 @@ mod tests {
         assert_eq!(typed(&mut s, "/chat #catpie"), Reaction::default(), "already in: just switch");
         assert_eq!(s.store.current(), Some(&Conv::Room("catpie".into())));
         assert_eq!(typed(&mut s, "/chat #nopemoon").print, vec!["! join with /chat #nopemoon <key>"]);
+    }
+
+    /// A session at startup, showing `preview` as the name it would get.
+    fn naming(preview: &str) -> Session {
+        let mut s = Session::new(false);
+        s.on_event(&Event::NamePreview { nick: preview.into() }, 0);
+        s
+    }
+
+    #[test]
+    fn the_name_question_previews_and_confirms() {
+        let mut s = naming("abinsanthroger");
+        assert_eq!(s.prompt(), Some("you'll be @abinsanthroger — Enter to keep it, or type a name".into()));
+        assert_eq!(typed(&mut s, "Luffy"), Reaction::send(Command::PreviewName { base: "luffy".into() }));
+        s.on_event(&Event::NamePreview { nick: "luffysunny".into() }, 0);
+        assert_eq!(s.prompt(), Some("you'll be @luffysunny — Enter to keep it, or type a name".into()));
+        assert_eq!(typed(&mut s, ""), Reaction::send(Command::ConfirmName));
+        assert!(s.prompt().is_some(), "asked until the name arrives");
+        s.on_event(&Event::Assigned { nick: "luffysunny".into(), renamed: false }, 0);
+        assert_eq!(s.prompt(), None);
+    }
+
+    #[test]
+    fn the_name_question_only_ends_with_a_name() {
+        let mut s = naming("bobroger");
+        let question = s.prompt();
+        assert!(!s.cancel_prompt(), "Esc can't drop it");
+        assert_eq!(typed(&mut s, "Bob Smith").print, vec!["! name must be 1–9 letters or digits"]);
+        assert_eq!(typed(&mut s, "CHAT").print, vec!["! 'chat' is reserved"]);
+        assert_eq!(typed(&mut s, "/who").print, vec!["! pick your name first — Enter keeps @bobroger"]);
+        assert_eq!(s.prompt(), question, "same question, same preview");
+        assert!(typed(&mut s, "/quit").quit);
     }
 
     #[test]

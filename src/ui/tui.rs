@@ -287,6 +287,11 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
         }
     }
     follow_current(state, before, session);
+    if matches!(event, Event::NamePreview { .. })
+        && let Some(question) = session.prompt()
+    {
+        state.flash(&question, now);
+    }
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -440,6 +445,20 @@ mod tests {
         assert!(state.flash_text(now).is_some());
         let r = on_send(&mut s, &mut state, "/who".into(), now).unwrap();
         assert_eq!(r.commands, vec![crate::api::Command::ListPeers]);
+    }
+
+    #[test]
+    fn the_name_question_flashes_and_survives_a_tab_switch() {
+        let mut s = Session::new(false);
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_event(&mut s, &mut state, &Event::NamePreview { nick: "bobroger".into() }, now);
+        assert!(state.flash_text(now).is_some_and(|t| t.contains("you'll be @bobroger")));
+        state.select_tab(&mut s, 0);
+        apply_key(&mut s, &mut state, Action::Esc);
+        assert!(s.prompt().is_some_and(|p| p.contains("@bobroger")));
+        let r = on_send(&mut s, &mut state, String::new(), now).expect("Enter answers from the corvo tab");
+        assert_eq!(r.commands, vec![crate::api::Command::ConfirmName]);
     }
 
     #[test]

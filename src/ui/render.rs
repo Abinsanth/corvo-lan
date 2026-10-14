@@ -180,7 +180,7 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
     let s = style;
     Some(match event {
         Event::Assigned { nick, renamed: false } => {
-            format!("* the system assigned you {} — this name can't be changed", s.nick(nick))
+            format!("* you're {} — restart to pick another name", s.nick(nick))
         }
         Event::Assigned { nick, renamed: true } => {
             format!("* your name was taken at the same moment — you are now {} (can't be changed)", s.nick(nick))
@@ -386,7 +386,7 @@ mod tests {
         let lost = Event::PeerLeft { id: PeerId::test(1), nick: "bobroger".into(), reason: LeaveReason::Lost };
         assert_eq!(event(&lost, 0, &P).unwrap(), format!("{} * @bobroger went offline (connection lost)", t(0)));
         let assigned = Event::Assigned { nick: "annmoon".into(), renamed: false };
-        assert_eq!(event(&assigned, 0, &P).unwrap(), "* the system assigned you @annmoon — this name can't be changed");
+        assert_eq!(event(&assigned, 0, &P).unwrap(), "* you're @annmoon — restart to pick another name");
         let peers = Event::Peers {
             you: PeerId::test(0x7f3a_9c0d_12e4_5b68),
             nick: "annmoon".into(),

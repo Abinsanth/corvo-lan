@@ -91,7 +91,8 @@ corvo-lan                   # your name starts with your login name
 corvo-lan --nick bob        # or choose the start yourself
 ```
 
-After about two seconds you get a name, and you're connected to everyone else running it.
+It shows the name you'd get: press Enter to keep it, or type another start to see a new one.
+Then you're connected to everyone else running it. With `--nick` it skips the question.
 
 ```
 /create cat 5              # a room for up to 5 people, e.g. #catpie with key k7m9xq
