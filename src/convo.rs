@@ -50,6 +50,8 @@ pub struct Store {
     online: BTreeSet<String>,
     /// Rooms we've asked to join and are waiting to be let into.
     pending: BTreeSet<String>,
+    /// Invitations to us as (from, room), oldest first, capped like the node's.
+    invites: Vec<(String, String)>,
 }
 
 /// Whether `text` mentions `@me`: the whole name, ignoring case, not part of
@@ -65,6 +67,14 @@ pub fn mentions(text: &str, me: &str) -> bool {
 impl Store {
     pub fn new() -> Self {
         Store::default()
+    }
+
+    pub fn invites(&self) -> &[(String, String)] {
+        &self.invites
+    }
+
+    pub fn drop_invite(&mut self, room: &str) {
+        self.invites.retain(|(_, r)| r != room);
     }
 
     pub fn me(&self) -> Option<&str> {
@@ -166,7 +176,19 @@ impl Store {
                 let text = format!("created #{name} for up to {max} people — invite with /chat #{name} {key}");
                 push(c, Line { ts: now, kind: LineKind::Notice(text) });
             }
+            Event::Invited { from, room } => {
+                self.invites.retain(|(_, r)| r != room);
+                if self.invites.iter().filter(|(f, _)| f == from).count() >= crate::node::MAX_INVITES_FROM_ONE {
+                    let oldest = self.invites.iter().position(|(f, _)| f == from).expect("counted above");
+                    self.invites.remove(oldest);
+                }
+                self.invites.push((from.clone(), room.clone()));
+                if self.invites.len() > crate::node::MAX_INVITES {
+                    self.invites.remove(0);
+                }
+            }
             Event::RoomJoined { name, key, max, members } => {
+                self.invites.retain(|(_, r)| r != name);
                 self.pending.remove(name);
                 let c = self.entry(&Conv::Room(name.clone()));
                 c.members = members.iter().cloned().collect();
@@ -174,6 +196,7 @@ impl Store {
                 push(c, Line { ts: now, kind: LineKind::Notice(format!("joined #{name}")) });
             }
             Event::JoinWaiting { name, .. } => {
+                self.invites.retain(|(_, r)| r != name);
                 self.pending.insert(name.clone());
             }
             Event::JoinEnded { name, .. } => {
@@ -229,7 +252,11 @@ impl Store {
                     push(c, Line { ts: now, kind: LineKind::Notice(format!("@{nick} left")) });
                 }
             }
-            Event::Peers { .. } | Event::Error(_) | Event::Info(_) | Event::NamePreview { .. } => {}
+            Event::Peers { .. }
+            | Event::Error(_)
+            | Event::Info(_)
+            | Event::NamePreview { .. }
+            | Event::InviteDeclined { .. } => {}
         }
     }
 

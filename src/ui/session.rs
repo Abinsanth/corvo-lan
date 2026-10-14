@@ -17,7 +17,8 @@ commands:
   /chat #room <key>      ask to join a room (just /chat #room once you're in)
   /create <name> [n]     create a private room for n people, 2–13 (asks if you leave it out)
   /approve @nick [#room] let someone who asked into a room; /deny @nick turns them away
-  /invite [#room]        copy the line that asks to join this room (or click its key)
+  /invite @nick [#room]  invite someone to a room (your invite counts as your approval)
+  /accept  /decline      answer an invitation (add #room if you have several)
   /leave [#room]         leave the current or named room
   /close [@nick]         close the current or named private chat
   /rooms  /chats  /who   list rooms, chats, connected people
@@ -273,27 +274,26 @@ impl Session {
                 };
                 self.preview_room(&base, max)
             }
-            Input::Invite(room) => {
+            Input::Invite { nick, room } => {
                 let Some(room) = room.or_else(|| match self.store.current() {
                     Some(Conv::Room(name)) => Some(name.clone()),
                     _ => None,
                 }) else {
-                    return Reaction::say("! /invite works in a room tab, or name the room: /invite #room");
+                    return Reaction::say("! /invite works in a room tab, or name the room: /invite @nick #room");
                 };
-                match self.store.get(&Conv::Room(room.clone())).and_then(|c| c.key.clone()) {
-                    Some(key) => {
-                        let line = format!("/chat #{room} {key}");
-                        Reaction {
-                            print: vec![format!(
-                                "* invite copied: {line} (if it didn't copy, Shift/Option-drag to select it)"
-                            )],
-                            copy: Some(line),
-                            ..Default::default()
-                        }
-                    }
-                    None => Reaction::say(format!("! you're not in #{room}")),
-                }
+                Reaction::send(Command::Invite { nick, room })
             }
+            Input::Accept(room) => match self.invited_room(room, "accept") {
+                Ok(room) => Reaction::send(Command::Accept { room }),
+                Err(e) => Reaction::say(format!("! {e}")),
+            },
+            Input::Decline(room) => match self.invited_room(room, "decline") {
+                Ok(room) => {
+                    self.store.drop_invite(&room);
+                    Reaction::send(Command::Decline { room })
+                }
+                Err(e) => Reaction::say(format!("! {e}")),
+            },
             Input::Approve { nick, room } => match self.waiting_room(&nick, room, "approve") {
                 Ok(room) => Reaction::send(Command::Approve { room, nick }),
                 Err(e) => Reaction::say(format!("! {e}")),
@@ -374,6 +374,37 @@ impl Session {
 
     /// The room `nick` is asking to join: the one typed, else the current
     /// room if they wait there, else the only room they wait in.
+    /// The invitation `/accept` or `/decline` means: the room typed, else the only one.
+    fn invited_room(&self, typed: Option<String>, cmd: &str) -> Result<String, String> {
+        if let Some(room) = typed {
+            return Ok(room);
+        }
+        let names: Vec<String> = self.store.invites().iter().map(|(_, room)| format!("#{room}")).collect();
+        match names.as_slice() {
+            [] => Err("no invitations".into()),
+            [one] => Ok(one[1..].to_string()),
+            many => {
+                let (last, rest) = many.split_last().expect("at least two");
+                Err(format!("invited to {} and {last} — say which: /{cmd} {}", rest.join(", "), many[0]))
+            }
+        }
+    }
+
+    /// `/chat #room key` for the clipboard, when a room's key is clicked.
+    pub fn copy_join_line(&self, room: &str) -> Reaction {
+        match self.store.get(&Conv::Room(room.to_string())).and_then(|c| c.key.clone()) {
+            Some(key) => {
+                let line = format!("/chat #{room} {key}");
+                Reaction {
+                    print: vec![format!("* copied: {line} (if it didn't copy, Shift/Option-drag to select it)")],
+                    copy: Some(line),
+                    ..Default::default()
+                }
+            }
+            None => Reaction::say(format!("! you're not in #{room}")),
+        }
+    }
+
     fn waiting_room(&self, nick: &str, typed: Option<String>, cmd: &str) -> Result<String, String> {
         if let Some(room) = typed {
             return Ok(room);
@@ -629,24 +660,63 @@ mod tests {
     }
 
     #[test]
-    fn invite_copies_the_join_line() {
+    fn invite_sends_to_the_current_or_named_room() {
         let mut s = bob_waits_in(&["catpie"]);
-        let copied = Reaction {
-            copy: Some("/chat #catpie k7m9xq".into()),
-            print: vec![
-                "* invite copied: /chat #catpie k7m9xq (if it didn't copy, Shift/Option-drag to select it)".into(),
-            ],
-            ..Default::default()
-        };
         s.store.switch(Conv::Room("catpie".into()));
-        assert_eq!(typed(&mut s, "/invite"), copied);
+        let invite = |room: &str| Reaction::send(Command::Invite { nick: "carolwolf".into(), room: room.into() });
+        assert_eq!(typed(&mut s, "/invite @CarolWolf"), invite("catpie"));
         typed(&mut s, "/chat @bobroger");
-        assert_eq!(typed(&mut s, "/invite #catpie"), copied);
+        assert_eq!(typed(&mut s, "/invite @carolwolf #dogpie"), invite("dogpie"), "the node checks the room");
         assert_eq!(
-            typed(&mut s, "/invite").print,
-            vec!["! /invite works in a room tab, or name the room: /invite #room"]
+            typed(&mut s, "/invite @carolwolf"),
+            Reaction::say("! /invite works in a room tab, or name the room: /invite @nick #room")
         );
-        assert_eq!(typed(&mut s, "/invite #nopemoon").print, vec!["! you're not in #nopemoon"]);
+        assert_eq!(typed(&mut s, "/invite").print, vec!["! usage: /invite @nick [#room]"]);
+    }
+
+    #[test]
+    fn accept_and_decline_find_the_invitation() {
+        let mut s = session();
+        assert_eq!(typed(&mut s, "/accept"), Reaction::say("! no invitations"));
+        s.on_event(&Event::Invited { from: "bobroger".into(), room: "catpie".into() }, 0);
+        assert_eq!(typed(&mut s, "/accept"), Reaction::send(Command::Accept { room: "catpie".into() }));
+        s.on_event(&Event::Invited { from: "carolwolf".into(), room: "dogpie".into() }, 0);
+        assert_eq!(
+            typed(&mut s, "/decline"),
+            Reaction::say("! invited to #catpie and #dogpie — say which: /decline #catpie")
+        );
+        assert_eq!(typed(&mut s, "/decline #dogpie"), Reaction::send(Command::Decline { room: "dogpie".into() }));
+        assert_eq!(typed(&mut s, "/decline"), Reaction::send(Command::Decline { room: "catpie".into() }));
+        assert!(s.store.invites().is_empty());
+
+        s.on_event(&Event::Invited { from: "bobroger".into(), room: "owlpie".into() }, 0);
+        s.on_event(&Event::JoinWaiting { name: "owlpie".into(), members: 2, needs: 1 }, 0);
+        assert!(s.store.invites().is_empty(), "accepting it clears it");
+        for room in ["apie", "bpie", "cpie"] {
+            s.on_event(&Event::Invited { from: "bobroger".into(), room: room.into() }, 0);
+        }
+        let rooms = |s: &Session| s.store.invites().iter().map(|(_, r)| r.clone()).collect::<Vec<_>>();
+        assert_eq!(rooms(&s), ["bpie", "cpie"], "two per inviter, like in the node");
+        for (from, room) in [("carolwolf", "dpie"), ("carolwolf", "epie"), ("daveoak", "fpie"), ("erinowl", "gpie")] {
+            s.on_event(&Event::Invited { from: from.into(), room: room.into() }, 0);
+        }
+        assert_eq!(rooms(&s), ["cpie", "dpie", "epie", "fpie", "gpie"], "five in all: the oldest goes");
+    }
+
+    #[test]
+    fn the_join_line_is_copied_for_rooms_we_are_in() {
+        let s = bob_waits_in(&["catpie"]);
+        assert_eq!(
+            s.copy_join_line("catpie"),
+            Reaction {
+                copy: Some("/chat #catpie k7m9xq".into()),
+                print: vec![
+                    "* copied: /chat #catpie k7m9xq (if it didn't copy, Shift/Option-drag to select it)".into()
+                ],
+                ..Default::default()
+            }
+        );
+        assert_eq!(s.copy_join_line("nopemoon"), Reaction::say("! you're not in #nopemoon"));
     }
 
     #[test]

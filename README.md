@@ -96,8 +96,8 @@ Then you're connected to everyone else running it. With `--nick` it skips the qu
 
 ```
 /create cat 5              # a room for up to 5 people, e.g. #catpie with key k7m9xq
-/invite                    # copy "/chat #catpie k7m9xq" to send to someone
-/chat #catpie k7m9xq      # they paste it to ask to join
+/invite @bobroger          # invite someone; they /accept (your invite counts as your approval)
+/chat #catpie k7m9xq       # or ask to join with a room's key (click it in the sidebar to copy)
 /approve @bobroger         # someone in the room lets them in (or /deny @bobroger)
 /chat @bobroger            # private chat
 /msg @bobroger hi          # one-off private message
@@ -124,9 +124,13 @@ can be in up to 3 rooms at once. Its key is 6 characters made up by the app.
 Anyone with the room's name and key can *ask* to join; the people already
 inside see the request and approve or deny it. A request waits up to 2 minutes.
 
+`/invite @name` sends someone an invitation: they answer with `/accept` or
+`/decline`, and if they accept, your invite counts as your approval. An
+invitation lasts 10 minutes.
+
 A room's sidebar shows its key, how full it is and who's waiting to get in.
-Click the room name or key, or type `/invite`, to copy the line someone pastes
-to ask to join. Copying uses your terminal's clipboard support (OSC 52); macOS
+Click the room name or key to copy the line someone pastes to ask to join, for
+anyone who isn't online yet. Copying uses your terminal's clipboard support (OSC 52); macOS
 Terminal.app doesn't have it, so there you select the line with Option-drag
 instead.
 

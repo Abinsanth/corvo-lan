@@ -64,6 +64,19 @@ pub enum Command {
     },
     /// While picking our name: keep the last preview.
     ConfirmName,
+    /// Invite `nick`, who's online, to `room`, one of ours.
+    Invite {
+        nick: String,
+        room: String,
+    },
+    /// Join `room` with the key its invitation carried.
+    Accept {
+        room: String,
+    },
+    /// Turn down the invitation to `room`.
+    Decline {
+        room: String,
+    },
     ListPeers,
     Quit,
 }
@@ -119,6 +132,16 @@ pub enum Event {
     /// The name we'd get if the user keeps it (only when the app asks).
     NamePreview {
         nick: String,
+    },
+    /// `from` invites us to `room`; `/accept` or `/decline` answers.
+    Invited {
+        from: String,
+        room: String,
+    },
+    /// `by` turned down our invitation to `room`.
+    InviteDeclined {
+        by: String,
+        room: String,
     },
     PeerJoined {
         id: PeerId,

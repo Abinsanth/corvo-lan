@@ -358,3 +358,15 @@ async fn an_asking_node_goes_live_on_confirm() {
     let assigned = wait_for(&mut node, "a name", |e| matches!(e, Event::Assigned { .. })).await;
     assert_eq!(assigned, Event::Assigned { nick: second, renamed: false });
 }
+
+#[tokio::test]
+async fn an_invited_person_gets_in_without_an_approve() {
+    let (mut alice, mut bob, _carol) = trio().await;
+    let (room, _key) = create_room(&mut alice, "cat").await;
+    send(&alice, Command::Invite { nick: bob.nick.clone(), room: room.clone() }).await;
+    let invited = wait_for(&mut bob.node, "an invitation", |e| matches!(e, Event::Invited { .. })).await;
+    assert_eq!(invited, Event::Invited { from: alice.nick.clone(), room: room.clone() });
+    send(&bob, Command::Accept { room: room.clone() }).await;
+    let joined = wait_for(&mut bob.node, "joined", |e| matches!(e, Event::RoomJoined { .. })).await;
+    assert!(matches!(joined, Event::RoomJoined { name, .. } if name == room));
+}
