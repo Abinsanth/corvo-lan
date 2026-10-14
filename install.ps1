@@ -65,7 +65,11 @@ function Install-CorvoLan {
             Move-Item -Force "$exe.new" $exe
         } catch {
             Remove-Item -Force -ErrorAction SilentlyContinue "$exe.new"
-            if ($movedAside) { Move-Item -Force $old $exe }
+            if ($movedAside) {
+                try { Move-Item -Force $old $exe } catch {
+                    throw "corvo-lan install: couldn't write $exe, and the old version is at $old; rename it back to corvo-lan.exe"
+                }
+            }
             throw "corvo-lan install: couldn't write $exe; close corvo-lan and try again"
         }
     } finally {
@@ -81,6 +85,9 @@ function Install-CorvoLan {
     if ($entries -notcontains $installDir.TrimEnd('\')) {
         $newPath = if ($userPath) { "$userPath;$installDir" } else { $installDir }
         Set-ItemProperty -Path 'HKCU:\Environment' -Name Path -Value $newPath -Type ExpandString
+        # Set-ItemProperty doesn't tell Explorer the environment changed; these calls do, so new terminals see PATH.
+        [Environment]::SetEnvironmentVariable('CORVO_LAN_INSTALLING', '1', 'User')
+        [Environment]::SetEnvironmentVariable('CORVO_LAN_INSTALLING', $null, 'User')
         $env:Path = "$env:Path;$installDir"
         Write-Output ''
         Write-Output "added $installDir to your PATH. Open a new terminal, then run: corvo-lan"
