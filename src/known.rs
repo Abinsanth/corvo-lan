@@ -68,12 +68,12 @@ impl Store {
                 }
                 (Store { path: Some(path), entries }, None)
             }
-            Err(_) => {
+            Err(parse_err) => {
                 let bad = path.with_extension("json.bad");
                 match fs::rename(&path, &bad) {
                     Ok(()) => {
                         let notice = format!(
-                            "{} was unreadable; moved it to {} and started a new list of known peers",
+                            "{} was unreadable ({parse_err}); moved it to {} and started a new list of known peers",
                             path.display(),
                             bad.display()
                         );
@@ -81,7 +81,7 @@ impl Store {
                     }
                     Err(e) => {
                         let notice = format!(
-                            "{} is unreadable and couldn't be moved aside ({e}); left it alone, and known peers \
+                            "{} is unreadable and couldn't be moved aside ({e}; {parse_err}); left it alone, and known peers \
                              won't be saved this session",
                             path.display()
                         );
