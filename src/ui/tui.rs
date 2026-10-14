@@ -245,13 +245,14 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     let before = session.store.current().cloned();
     let shown = if state.on_status { None } else { before.clone() };
     let mut reaction = session.on_line(&text, shown.as_ref());
+    let complained = reaction.print.iter().any(|l| l.starts_with("! "));
     for line in std::mem::take(&mut reaction.print) {
         say(state, &line, now);
     }
     if session.store.current().cloned() != before {
         follow_current(state, before, session);
     }
-    if let Some(question) = session.prompt() {
+    if let Some(question) = session.prompt().filter(|_| !complained) {
         state.flash(&question, now);
     }
     if reaction.copy.is_some()
@@ -463,6 +464,35 @@ mod tests {
         apply_key(&mut s, &mut state, Action::Esc);
         assert_eq!(s.prompt(), None);
         assert_eq!(on_send(&mut s, &mut state, String::new(), now), None, "Enter does nothing again");
+    }
+
+    #[test]
+    fn switching_tabs_drops_the_create_question() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        s.on_line("/chat @bobRoger", None);
+        state.on_status = false;
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        state.step_tab(&mut s, 1);
+        assert_eq!(s.prompt(), None);
+        state.step_tab(&mut s, 1);
+        let r = on_send(&mut s, &mut state, "10".into(), now).unwrap();
+        assert_eq!(
+            r.commands,
+            vec![crate::api::Command::Send { to: Target::Dm("bobRoger".into()), text: "10".into() }]
+        );
+    }
+
+    #[test]
+    fn a_bad_answer_keeps_its_error_on_screen() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        on_send(&mut s, &mut state, "hello".into(), now);
+        assert!(s.prompt().is_some());
+        assert!(state.flash_text(now).is_some_and(|t| t.starts_with("! a room holds")), "{:?}", state.flash_text(now));
     }
 
     #[test]

@@ -429,6 +429,8 @@ impl TuiState {
 
     pub fn select_tab(&mut self, session: &mut Session, idx: usize) {
         self.popup = None;
+        // A question left open would take whatever is typed in the new tab.
+        session.cancel_prompt();
         match tabs(session).get(idx) {
             Some(Tab::Status) => {
                 session.store.clear_current();

@@ -119,13 +119,15 @@ select text, hold Shift (Option on macOS) while dragging.
 ### Rooms
 
 A room holds 2–13 people (`/create cat` asks how many; Enter means 13), and you
-can be in up to 3 rooms at once. A room's sidebar shows its key, how full it is
-and who's waiting to get in. Click the room name or key, or type `/invite`, to
-copy the line someone pastes to ask to join. Copying uses your terminal's
-clipboard support (OSC 52); macOS Terminal.app doesn't have it, so there you
-select the line with Option-drag instead. Its key is 6 characters made up by the app. Anyone with the
-room's name and key can *ask* to join; the people already inside see the
-request and approve or deny it. A request waits up to 2 minutes.
+can be in up to 3 rooms at once. Its key is 6 characters made up by the app.
+Anyone with the room's name and key can *ask* to join; the people already
+inside see the request and approve or deny it. A request waits up to 2 minutes.
+
+A room's sidebar shows its key, how full it is and who's waiting to get in.
+Click the room name or key, or type `/invite`, to copy the line someone pastes
+to ask to join. Copying uses your terminal's clipboard support (OSC 52); macOS
+Terminal.app doesn't have it, so there you select the line with Option-drag
+instead.
 
 How many approvals a newcomer needs depends on how many people are in the room
 (online) right now:
