@@ -275,7 +275,7 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             format!("* {} declined your invite to {}", s.nick(by), s.room(room))
         }
         // Shown inside the room's conversation.
-        Event::Approved { .. } | Event::RequestEnded { .. } => return None,
+        Event::Approved { .. } | Event::RequestEnded { .. } | Event::Rekeyed { .. } => return None,
         Event::NamePreview { .. } => return None,
     })
 }

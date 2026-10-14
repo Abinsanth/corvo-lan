@@ -254,6 +254,11 @@ impl Store {
                     push(c, Line { ts: now, kind: LineKind::Notice(format!("@{nick} left")) });
                 }
             }
+            Event::Rekeyed { room } => {
+                if let Some(c) = self.find_mut(&Conv::Room(room.clone())) {
+                    push(c, Line { ts: now, kind: LineKind::Notice("key changed".into()) });
+                }
+            }
             Event::Peers { .. }
             | Event::Error(_)
             | Event::Info(_)
@@ -425,6 +430,15 @@ mod tests {
         // A DM opened with someone not online starts offline.
         s.switch(dm("ghostmoon"));
         assert!(s.get(&dm("ghostmoon")).unwrap().offline);
+    }
+
+    #[test]
+    fn a_rekey_is_noted_in_the_room() {
+        let mut s = Store::new();
+        s.apply(&Event::RoomCreated { name: "catpie".into(), key: "k7m9xq".into(), max: 13 }, 0);
+        s.apply(&Event::Rekeyed { room: "catpie".into() }, 0);
+        let c = s.get(&room("catpie")).unwrap();
+        assert!(c.lines.iter().any(|l| l.kind == LineKind::Notice("key changed".into())));
     }
 
     #[test]

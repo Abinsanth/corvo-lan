@@ -123,6 +123,8 @@ pub enum NodeMsg {
     JoinExpired(RoomId, rooms::Attempt),
     /// Let in whoever has enough approvals (keyed by room id).
     Settle(RoomId),
+    /// The wait after someone left room `name` is over (by name: a re-key changes the id).
+    RekeyDue(String),
     Tick,
 }
 
@@ -479,6 +481,7 @@ impl Node {
             NodeMsg::JoinTimeout(id, attempt) => self.on_join_timeout(id, attempt),
             NodeMsg::JoinExpired(id, attempt) => self.on_join_expired(id, attempt),
             NodeMsg::Settle(id) => self.settle(id),
+            NodeMsg::RekeyDue(name) => self.on_rekey_due(&name, Instant::now()),
             NodeMsg::Tick => self.on_tick(Instant::now()),
         }
     }

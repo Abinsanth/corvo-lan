@@ -222,6 +222,10 @@ pub enum Event {
         room: String,
         nick: String,
     },
+    /// `room` moved to a new key because someone left or was removed.
+    Rekeyed {
+        room: String,
+    },
     /// `you`/`nick` are ours, so `/who` can show our fingerprint.
     Peers {
         you: PeerId,
