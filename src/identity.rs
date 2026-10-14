@@ -18,6 +18,7 @@ const LOCK_FILE: &str = "identity.lock";
 const KNOWN_FILE: &str = "known_peers.json";
 pub const NO_DIR: &str = "no config directory; using a temporary identity for this session";
 pub const ALREADY_RUNNING: &str = "another corvo-lan is running here; using a temporary identity for this session";
+pub const NO_LOCK: &str = "couldn't lock the identity; using a temporary identity for this session";
 
 /// An X25519 keypair. `Debug` never shows the secret.
 #[derive(Clone)]
@@ -93,17 +94,37 @@ pub fn load_from(dir: Option<PathBuf>) -> anyhow::Result<Identity> {
     if fs::create_dir_all(&dir).and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))).is_err() {
         return Ok(Identity::throwaway(NO_DIR));
     }
-    let Ok(lock) = OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(dir.join(LOCK_FILE))
-    else {
+    let Ok(lock) = private_file().create(true).truncate(false).open(dir.join(LOCK_FILE)) else {
         return Ok(Identity::throwaway(NO_DIR));
     };
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(Identity::throwaway(ALREADY_RUNNING)),
-        Err(TryLockError::Error(_)) => return Ok(Identity::throwaway(NO_DIR)),
+    if let Err(e) = lock.try_lock() {
+        return Ok(Identity::throwaway(lock_notice(&e)));
     }
     let keys = read_or_create(&dir.join(KEY_FILE))?;
     Ok(Identity { keys, known_peers: Some(dir.join(KNOWN_FILE)), notice: None, _lock: Some(lock) })
+}
+
+fn lock_notice(e: &TryLockError) -> &'static str {
+    match e {
+        TryLockError::WouldBlock => ALREADY_RUNNING,
+        TryLockError::Error(_) => NO_LOCK,
+    }
+}
+
+/// Write access to a file only we can read.
+pub(crate) fn private_file() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true).mode(0o600);
+    options
+}
+
+/// Writes beside `path` and renames, so a crash never leaves a half-written key.
+fn write_key(path: &Path, keys: &Keys) -> std::io::Result<()> {
+    let tmp = path.with_extension("key.tmp");
+    let mut file = private_file().create(true).truncate(true).open(&tmp)?;
+    writeln!(file, "{}", to_hex(keys.secret()))?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)
 }
 
 fn read_or_create(path: &Path) -> anyhow::Result<Keys> {
@@ -118,13 +139,7 @@ fn read_or_create(path: &Path) -> anyhow::Result<Keys> {
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             let keys = Keys::generate();
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-                .with_context(|| format!("cannot save {}", path.display()))?;
-            writeln!(file, "{}", to_hex(keys.secret())).with_context(|| format!("cannot save {}", path.display()))?;
+            write_key(path, &keys).with_context(|| format!("cannot save {}", path.display()))?;
             Ok(keys)
         }
         Err(e) => Err(unusable(&e.to_string())),
@@ -136,10 +151,11 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("corvo-identity-{:016x}", rand::random::<u64>()));
-        fs::create_dir_all(&dir).unwrap();
-        dir.join("corvo-lan")
+    use crate::testutil::Scratch;
+
+    /// Where the config folder goes. It isn't created, so tests see a first run.
+    fn config(scratch: &Scratch) -> PathBuf {
+        scratch.path().join("corvo-lan")
     }
 
     fn mode(path: &Path) -> u32 {
@@ -157,7 +173,8 @@ mod tests {
 
     #[test]
     fn first_run_creates_a_private_key_and_reuses_it() {
-        let dir = temp_dir();
+        let scratch = Scratch::new("corvo-identity");
+        let dir = config(&scratch);
         let first = load_from(Some(dir.clone())).unwrap();
         assert_eq!(first.notice, None);
         assert_eq!(first.known_peers, Some(dir.join("known_peers.json")));
@@ -170,7 +187,8 @@ mod tests {
 
     #[test]
     fn a_second_copy_gets_a_throwaway_identity() {
-        let dir = temp_dir();
+        let scratch = Scratch::new("corvo-identity");
+        let dir = config(&scratch);
         let first = load_from(Some(dir.clone())).unwrap();
         let saved = fs::read(dir.join("identity.key")).unwrap();
         let second = load_from(Some(dir.clone())).unwrap();
@@ -184,7 +202,8 @@ mod tests {
 
     #[test]
     fn a_malformed_key_file_refuses_to_start() {
-        let dir = temp_dir();
+        let scratch = Scratch::new("corvo-identity");
+        let dir = config(&scratch);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("identity.key"), "nonsense\n").unwrap();
         let err = load_from(Some(dir.clone())).err().unwrap().to_string();
@@ -195,7 +214,8 @@ mod tests {
 
     #[test]
     fn whitespace_around_the_key_is_fine() {
-        let dir = temp_dir();
+        let scratch = Scratch::new("corvo-identity");
+        let dir = config(&scratch);
         fs::create_dir_all(&dir).unwrap();
         let keys = Keys::generate();
         fs::write(dir.join("identity.key"), format!("  {}\r\n", to_hex(keys.secret()))).unwrap();
@@ -207,6 +227,24 @@ mod tests {
         let id = load_from(None).unwrap();
         assert_eq!(id.notice.as_deref(), Some(NO_DIR));
         assert_eq!(id.known_peers, None);
+    }
+
+    #[test]
+    fn a_leftover_temp_key_is_replaced_and_cleaned_up() {
+        let scratch = Scratch::new("corvo-identity");
+        let dir = config(&scratch);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("identity.key.tmp"), "").unwrap(); // a crash mid-write left this
+        let id = load_from(Some(dir.clone())).unwrap();
+        let saved = fs::read_to_string(dir.join("identity.key")).unwrap();
+        assert_eq!(saved.trim(), to_hex(id.keys.secret()));
+        assert!(!dir.join("identity.key.tmp").exists());
+    }
+
+    #[test]
+    fn lock_errors_say_what_happened() {
+        assert_eq!(lock_notice(&TryLockError::WouldBlock), ALREADY_RUNNING);
+        assert_eq!(lock_notice(&TryLockError::Error(std::io::Error::other("nope"))), NO_LOCK);
     }
 
     #[test]
