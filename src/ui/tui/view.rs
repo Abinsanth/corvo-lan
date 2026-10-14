@@ -4,17 +4,17 @@
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use super::state::{Editor, Hit, MAX_INPUT_ROWS, Tab, TuiState, tabs};
 use crate::api::Conv;
 use crate::convo::{LineKind, mentions};
 use crate::names::{display, display_in};
 use crate::ui::render::{Tone, clean, hhmm, nick_color, tone_of_notice};
-use crate::ui::session::Session;
+use crate::ui::session::{HELP, Session};
 
 pub const SIDEBAR_WIDTH: u16 = 22;
 pub const SIDEBAR_MIN_WIDTH: u16 = 70;
@@ -367,6 +367,30 @@ fn draw_popup(frame: &mut Frame, input: Rect, state: &mut TuiState) {
     );
 }
 
+/// The help box, centred over everything but the status bar. A short
+/// terminal cuts the text, never the border that says how to close it.
+fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
+    let width = HELP.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 4;
+    let height = HELP.lines().count() as u16 + 2;
+    let [area] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(area);
+    let [area] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(area);
+    let lines: Vec<Line> = HELP
+        .lines()
+        .map(|l| {
+            let style =
+                if l.starts_with(' ') { Style::default() } else { Style::default().add_modifier(Modifier::BOLD) };
+            Line::from(Span::styled(l, style))
+        })
+        .collect();
+    let block = Block::bordered()
+        .border_style(tone_style(Tone::Dim, color))
+        .title(" help ")
+        .title_bottom(Line::from(" q close ").right_aligned())
+        .padding(Padding::horizontal(1));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_status_bar(frame: &mut Frame, area: Rect, session: &Session, state: &TuiState, now: Instant) {
     let line = if let Some(flash) = state.flash_text(now) {
         Line::from(Span::styled(flash.to_string(), tone_style(Tone::Bad, state.color)))
@@ -434,6 +458,9 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
     draw_input(frame, input_a, session, state);
     draw_popup(frame, input_a, state);
     draw_status_bar(frame, status_a, session, state, now);
+    if state.help {
+        draw_help(frame, Rect { height: area.height - 1, ..area }, state.color);
+    }
 }
 
 #[cfg(test)]
@@ -678,6 +705,27 @@ mod tests {
         assert!(state.popup.is_some());
         render(&s, &mut state, 39, 9);
         assert!(state.popup.is_none(), "a list that can't be shown can't take keys");
+    }
+
+    #[test]
+    fn help_is_a_centred_box_over_the_chat() {
+        let s = session();
+        let mut state = TuiState::new(true);
+        state.help = true;
+        let buf = render(&s, &mut state, 80, 24);
+        let all = rows(&buf);
+        let (x, y) = find(&buf, "/chat @nick").unwrap_or_else(|| panic!("{all:#?}"));
+        for needle in ["/create <name>", "/quit", "Shift-Tab", "PgUp/PgDn", "q close"] {
+            assert!(find(&buf, needle).is_some(), "{needle} missing: {all:#?}");
+        }
+        assert!(x > 10 && y > 1, "centred, not in the corner: ({x}, {y})");
+        let (_, bottom) = find(&buf, "q close").unwrap();
+        assert!(bottom < 23, "fits above the status bar");
+        state.help = false;
+        assert!(find(&render(&s, &mut state, 80, 24), "q close").is_none(), "closed means gone");
+        state.help = true;
+        let small = render(&s, &mut state, 40, 10);
+        assert!(find(&small, "q close").is_some(), "a short terminal still shows how to close it");
     }
 
     #[test]

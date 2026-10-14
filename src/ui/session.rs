@@ -9,27 +9,26 @@ use crate::node::{MAX_MEMBERS, MIN_MEMBERS};
 
 pub const MAX_MESSAGE_LINES: usize = 50;
 
+/// Shown in the help box; lines without indent are headings.
 pub const HELP: &str = "\
-commands:
-  <text>                 send to the current tab
-  /msg @nick <text>      one-off private message (also /m)
-  /chat @nick            open a private chat (also /c; the @ is optional)
-  /chat #room <key>      ask to join a room (just /chat #room once you're in)
-  /create <name> [n]     create a private room for n people, 2–13 (asks if you leave it out)
-  /approve @nick [#room] let someone who asked into a room; /deny @nick turns them away
-  /invite @nick [#room]  invite someone to a room (your invite counts as your approval)
-  /accept  /decline      answer an invitation (add #room if you have several)
-  /leave [#room]         leave the current or named room
-  /close [@nick]         close the current or named private chat
-  /rooms  /chats  /who   list rooms, chats, connected people
-  /update [yes]          check for a newer version; yes installs it
-  /help                  this list (also /h, /?)
-  /quit                  leave (also /q, Ctrl-C)
-  //text                 send a message starting with '/'
-keys:
-  Enter send · Alt+Enter or Shift+Enter new line · Tab complete @names, #rooms, /commands
-  Shift-Tab, Alt-←/→ or Alt-1..9 switch tabs · PgUp/PgDn or mouse wheel scroll
-  Esc close the list / clear input / back to latest · click a name to chat";
+chat
+  /chat @nick          private chat (/c)
+  /chat #room <key>    join a room
+  /msg @nick <text>    one-off message (/m)
+  /create <name>       new private room
+  /invite @nick        bring someone in
+  /accept  /decline    answer an invite
+  /approve /deny       answer a join request
+  /leave   /close      leave a room / chat
+
+info
+  /rooms /chats /who   lists
+  /update              check for updates
+  /quit                exit (/q, Ctrl-C)
+
+keys
+  Shift-Tab  switch tabs    Tab  complete
+  Alt+Enter  new line       PgUp/PgDn  scroll";
 
 /// What the UI loop should do after an input line.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -37,6 +36,8 @@ pub struct Reaction {
     pub commands: Vec<Command>,
     pub print: Vec<String>,
     pub quit: bool,
+    /// Open the help box.
+    pub help: bool,
     pub update: Option<UpdateAction>,
     /// Text for the clipboard.
     pub copy: Option<String>,
@@ -227,7 +228,7 @@ impl Session {
         match input {
             Input::Empty => Reaction::default(),
             Input::Error(e) => Reaction::say(format!("! {e}")),
-            Input::Help => Reaction::say(HELP),
+            Input::Help => Reaction { help: true, ..Default::default() },
             Input::Quit => Reaction { quit: true, ..Default::default() },
             Input::Who => Reaction::send(Command::ListPeers),
             Input::Text(text) => match tidy_message(&text) {
@@ -830,10 +831,14 @@ mod tests {
     #[test]
     fn help_lists_the_tui_commands_and_keys() {
         let mut s = session();
-        assert_eq!(typed(&mut s, "/help").print, vec![HELP]);
+        for cmd in ["/help", "/h", "/?"] {
+            let r = typed(&mut s, cmd);
+            assert!(r.help, "{cmd} opens the help box");
+            assert!(r.print.is_empty(), "{cmd} prints nothing to the corvo tab");
+        }
         assert!(HELP.contains("/close") && HELP.contains("Shift-Tab") && HELP.contains("/quit"));
         assert!(!HELP.contains("/line") && !HELP.contains("/his") && !HELP.contains("/tui"));
-        assert!(HELP.contains("/create <name> [n]") && HELP.contains("/approve @nick") && HELP.contains("/deny"));
+        assert!(HELP.contains("/create <name>") && HELP.contains("/approve") && HELP.contains("/deny"));
     }
 
     #[test]
@@ -899,7 +904,7 @@ mod tests {
         assert_eq!(check.update, Some(UpdateAction::Check));
         assert!(check.commands.is_empty() && check.print.is_empty());
         assert_eq!(typed(&mut s, "/update yes").update, Some(UpdateAction::Install));
-        assert!(HELP.contains("/update [yes]"));
+        assert!(HELP.contains("/update"));
     }
 
     #[test]
