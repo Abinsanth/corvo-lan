@@ -173,7 +173,8 @@ impl Store {
             Event::RoomCreated { name, key, max } => {
                 let c = self.entry(&Conv::Room(name.clone()));
                 (c.key, c.max) = (Some(key.clone()), Some(*max));
-                let text = format!("created #{name} for up to {max} people — invite with /chat #{name} {key}");
+                let text =
+                    format!("created #{name} for up to {max} people — /invite @name, or share /chat #{name} {key}");
                 push(c, Line { ts: now, kind: LineKind::Notice(text) });
             }
             Event::Invited { from, room } => {
@@ -200,6 +201,7 @@ impl Store {
                 self.pending.insert(name.clone());
             }
             Event::JoinEnded { name, .. } => {
+                self.invites.retain(|(_, r)| r != name);
                 self.pending.remove(name);
             }
             Event::JoinRequest { room, nick, have, need } => {
@@ -581,7 +583,9 @@ mod tests {
         let c = s.get(&room("catpie")).unwrap();
         assert_eq!(
             c.lines[0].kind,
-            LineKind::Notice("created #catpie for up to 5 people — invite with /chat #catpie k7m9xq".into())
+            LineKind::Notice(
+                "created #catpie for up to 5 people — /invite @name, or share /chat #catpie k7m9xq".into()
+            )
         );
         assert_eq!((c.key.as_deref(), c.max), (Some("k7m9xq"), Some(5)));
     }

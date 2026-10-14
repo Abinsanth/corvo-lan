@@ -183,7 +183,7 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             format!("* you're {} — restart to pick another name", s.nick(nick))
         }
         Event::Assigned { nick, renamed: true } => {
-            format!("* your name was taken at the same moment — you are now {} (can't be changed)", s.nick(nick))
+            format!("* your name was taken just now — you're {} (restart to pick another name)", s.nick(nick))
         }
         Event::PeerJoined { nick, .. } => {
             notice(now, &format!("{} {}", s.nick(nick), s.tone(Tone::Good, "is online")), s)
@@ -206,7 +206,7 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
         }
         Event::Sent { conv: Conv::Room(_), .. } => return None,
         Event::RoomCreated { name, key, max } => format!(
-            "{} {} for up to {max} people — invite with /chat #{} {}",
+            "{} {} for up to {max} people — /invite @name, or share /chat #{} {}",
             s.tone(Tone::Good, "* created"),
             s.room(name),
             clean(name),
@@ -263,14 +263,15 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
                 &format!("* {} wants to join {} — /approve @{n} or /deny @{n}", s.nick(nick), s.room(room)),
             )
         }
-        // Shown inside the room's conversation.
         Event::Invited { from, room } => {
             format!("* {} invites you to {} — /accept or /decline", s.nick(from), s.room(room))
         }
         Event::InviteDeclined { by, room } => {
             format!("* {} declined your invite to {}", s.nick(by), s.room(room))
         }
-        Event::Approved { .. } | Event::RequestEnded { .. } | Event::NamePreview { .. } => return None,
+        // Shown inside the room's conversation.
+        Event::Approved { .. } | Event::RequestEnded { .. } => return None,
+        Event::NamePreview { .. } => return None,
     })
 }
 
@@ -378,7 +379,7 @@ mod tests {
         let created = Event::RoomCreated { name: "catpie".into(), key: "k7m9xq".into(), max: 13 };
         assert_eq!(
             event(&created, 0, &P).unwrap(),
-            "* created #catpie for up to 13 people — invite with /chat #catpie k7m9xq"
+            "* created #catpie for up to 13 people — /invite @name, or share /chat #catpie k7m9xq"
         );
         let joined = Event::RoomJoined {
             name: "catpie".into(),
@@ -625,5 +626,14 @@ mod tests {
         assert_eq!(tone_of(&invited), Tone::Warn, "it wants an answer");
         let declined = Event::InviteDeclined { by: "bobroger".into(), room: "catpie".into() };
         assert_eq!(event(&declined, 0, &P).unwrap(), "* @bobroger declined your invite to #catpie");
+    }
+
+    #[test]
+    fn a_name_taken_meanwhile_reads_like_the_other_name_lines() {
+        let e = Event::Assigned { nick: "luffymoon".into(), renamed: true };
+        assert_eq!(
+            event(&e, 0, &P).unwrap(),
+            "* your name was taken just now — you're @luffymoon (restart to pick another name)"
+        );
     }
 }

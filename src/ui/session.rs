@@ -161,7 +161,7 @@ impl Session {
         if answer.starts_with('/') {
             return Reaction::say(format!("! pick your name first — Enter keeps @{preview}"));
         }
-        let base = answer.to_ascii_lowercase();
+        let base = answer.strip_prefix('@').unwrap_or(answer).to_ascii_lowercase();
         match crate::names::validate_base(&base) {
             Ok(()) => Reaction::send(Command::PreviewName { base }),
             Err(e) => Reaction::say(format!("! {e}")),
@@ -173,7 +173,9 @@ impl Session {
         if let Err(e) = crate::names::validate_base(base) {
             return Reaction::say(format!("! {e}"));
         }
-        let picked = crate::names::pick_name(base, |n| self.store.get(&Conv::Room(n.to_string())).is_some());
+        let ours =
+            |n: &str| self.store.get(&Conv::Room(n.to_string())).is_some() || self.store.pending().any(|p| p == n);
+        let picked = crate::names::pick_name(base, ours);
         match picked {
             Some(preview) => {
                 self.asking = Some(Asking::RoomName { preview, max });
@@ -185,8 +187,13 @@ impl Session {
 
     /// Enter keeps the preview; a name asks for a new one (a bad one keeps the old).
     fn answer_room_name(&mut self, preview: String, max: Option<u8>, answer: &str) -> Reaction {
+        if !answer.is_empty() && answer.chars().all(|c| c.is_ascii_digit()) {
+            self.asking = Some(Asking::RoomName { preview: preview.clone(), max });
+            return Reaction::say(format!("! Enter keeps #{preview} first — then it asks how many people"));
+        }
         if !answer.is_empty() {
-            let reaction = self.preview_room(&answer.to_ascii_lowercase(), max);
+            let base = answer.strip_prefix('#').unwrap_or(answer).to_ascii_lowercase();
+            let reaction = self.preview_room(&base, max);
             if self.asking.is_none() {
                 self.asking = Some(Asking::RoomName { preview, max });
             }
@@ -372,8 +379,6 @@ impl Session {
         }
     }
 
-    /// The room `nick` is asking to join: the one typed, else the current
-    /// room if they wait there, else the only room they wait in.
     /// The invitation `/accept` or `/decline` means: the room typed, else the only one.
     fn invited_room(&self, typed: Option<String>, cmd: &str) -> Result<String, String> {
         if let Some(room) = typed {
@@ -405,6 +410,8 @@ impl Session {
         }
     }
 
+    /// The room `nick` is asking to join: the one typed, else the current
+    /// room if they wait there, else the only room they wait in.
     fn waiting_room(&self, nick: &str, typed: Option<String>, cmd: &str) -> Result<String, String> {
         if let Some(room) = typed {
             return Ok(room);
@@ -560,9 +567,14 @@ mod tests {
         let mut s = naming("bobroger");
         let question = s.prompt();
         assert!(!s.cancel_prompt(), "Esc can't drop it");
-        assert_eq!(typed(&mut s, "Bob Smith").print, vec!["! name must be 1–9 letters or digits"]);
-        assert_eq!(typed(&mut s, "CHAT").print, vec!["! 'chat' is reserved"]);
-        assert_eq!(typed(&mut s, "/who").print, vec!["! pick your name first — Enter keeps @bobroger"]);
+        assert_eq!(typed(&mut s, "Bob Smith"), Reaction::say("! name must be 1–9 letters or digits"));
+        assert_eq!(typed(&mut s, "CHAT"), Reaction::say("! 'chat' is reserved"));
+        assert_eq!(typed(&mut s, "/who"), Reaction::say("! pick your name first — Enter keeps @bobroger"));
+        assert_eq!(
+            typed(&mut s, "@Luffy"),
+            Reaction::send(Command::PreviewName { base: "luffy".into() }),
+            "an @ is fine"
+        );
         assert_eq!(s.prompt(), question, "same question, same preview");
         assert!(typed(&mut s, "/quit").quit);
     }
@@ -915,5 +927,53 @@ mod tests {
         assert_eq!(typed(&mut s, "one\ntwo\n\n"), send(Target::Dm("bobroger".into()), "one\ntwo"));
         assert_eq!(typed(&mut s, &long).print, vec![format!("! message has more than {MAX_MESSAGE_LINES} lines")]);
         assert_eq!(typed(&mut s, "/msg @bobroger a\nb\n"), send(Target::Dm("bobroger".into()), "a\nb"));
+    }
+
+    #[test]
+    fn the_room_name_step_takes_a_hash_and_points_numbers_to_the_next_step() {
+        let mut s = session();
+        typed(&mut s, "/create cat");
+        let first = room_preview(&s);
+        assert_eq!(
+            typed(&mut s, "5"),
+            Reaction::say(format!("! Enter keeps #{first} first — then it asks how many people"))
+        );
+        assert_eq!(room_preview(&s), first);
+        assert_eq!(typed(&mut s, "#Dog"), Reaction::default());
+        assert!(room_preview(&s).starts_with("dog"), "{}", room_preview(&s));
+    }
+
+    #[test]
+    fn the_room_preview_skips_rooms_we_are_waiting_for() {
+        let mut s = session();
+        for w in crate::words::WORDS.iter().filter(|w| !["wolf", "owl"].contains(w)) {
+            let name = format!("cat{w}");
+            s.on_event(&Event::RoomCreated { name, key: "k7m9xq".into(), max: 13 }, 0);
+        }
+        s.on_event(&Event::JoinWaiting { name: "catowl".into(), members: 2, needs: 1 }, 0);
+        for _ in 0..30 {
+            typed(&mut s, "/create cat");
+            assert_eq!(room_preview(&s), "catwolf", "never the room we're knocking on");
+            s.cancel_prompt();
+        }
+    }
+
+    #[test]
+    fn a_failed_accept_clears_the_invitation() {
+        let mut s = session();
+        s.on_event(&Event::Invited { from: "bobroger".into(), room: "catpie".into() }, 0);
+        s.on_event(&Event::JoinEnded { name: "catpie".into(), why: crate::api::JoinEnd::NoRoom }, 0);
+        assert!(s.store.invites().is_empty());
+        assert_eq!(typed(&mut s, "/accept"), Reaction::say("! no invitations"));
+    }
+
+    #[test]
+    fn invite_from_the_corvo_tab_names_the_room_syntax() {
+        let mut s = session();
+        s.store.clear_current();
+        assert_eq!(
+            typed(&mut s, "/invite @bobroger"),
+            Reaction::say("! /invite works in a room tab, or name the room: /invite @nick #room")
+        );
     }
 }
