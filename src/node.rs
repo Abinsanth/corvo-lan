@@ -24,8 +24,8 @@ use crate::room::{RoomId, RoomKeys};
 mod rooms;
 
 pub use rooms::{
-    ADMIT_SETTLE, HERE_INTERVAL, JOIN_WAIT, KNOCK_EVERY, MAX_MEMBERS, MAX_ROOMS, MEMBER_TIMEOUT, MIN_MEMBERS,
-    PENDING_FOR, REQUEST_STALE, needed,
+    ADMIT_SETTLE, HERE_INTERVAL, INVITE_FOR, JOIN_WAIT, KNOCK_EVERY, MAX_INVITES, MAX_MEMBERS, MAX_ROOMS,
+    MEMBER_TIMEOUT, MIN_MEMBERS, PENDING_FOR, REQUEST_STALE, needed,
 };
 
 /// Longest chat text accepted, measured JSON-escaped (a control character
@@ -419,6 +419,9 @@ impl Node {
             Command::Deny { room, nick } => self.deny(&room, &nick),
             Command::PreviewName { base } => self.preview_name(base),
             Command::ConfirmName => self.confirm_name(),
+            Command::Invite { nick, room } => self.invite(&nick, &room),
+            Command::Accept { room } => self.accept(&room),
+            Command::Decline { room } => self.decline(&room),
             Command::ListPeers => {
                 let mut peers: Vec<PeerInfo> =
                     self.peers.iter().map(|(id, p)| PeerInfo { id: *id, nick: p.nick.clone(), addr: p.addr }).collect();
@@ -685,6 +688,8 @@ impl Node {
                 }
                 self.emit(Event::Renamed { old: nick, new });
             }
+            Frame::Invite { room, key } => self.on_invite(id, room, key, Instant::now()),
+            Frame::Decline { room } => self.on_decline(id, &room),
             Frame::Hello { .. } | Frame::Ping | Frame::Bye => {} // consumed by the peer task
         }
     }

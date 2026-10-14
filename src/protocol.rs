@@ -110,6 +110,15 @@ pub enum Frame {
         nonce: String,
         ct: String,
     },
+    /// An invitation to `room`, sent to one peer only: the room's name and join key.
+    Invite {
+        room: String,
+        key: String,
+    },
+    /// The invitation to `room` was turned down.
+    Decline {
+        room: String,
+    },
     Ping,
     Bye,
 }
@@ -185,5 +194,15 @@ mod tests {
         assert!(PeerId::try_from(format!("+a{}", "ab".repeat(31))).is_err(), "a sign");
         assert!(PeerId::try_from(format!("zz{}", "ab".repeat(31))).is_err());
         assert!(PeerId::try_from("ab".repeat(31)).is_err(), "too short");
+    }
+
+    #[test]
+    fn invite_frames_are_tagged() {
+        let invite = Frame::Invite { room: "catpie".into(), key: "k7m9xq".into() };
+        let json = serde_json::to_string(&invite).unwrap();
+        assert_eq!(json, r#"{"type":"invite","room":"catpie","key":"k7m9xq"}"#);
+        assert_eq!(serde_json::from_str::<Frame>(&json).unwrap(), invite);
+        let decline = Frame::Decline { room: "catpie".into() };
+        assert_eq!(serde_json::to_string(&decline).unwrap(), r#"{"type":"decline","room":"catpie"}"#);
     }
 }

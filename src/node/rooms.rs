@@ -20,7 +20,7 @@ use tracing::debug;
 use super::{MAX_TEXT_LEN, Node, NodeMsg};
 use crate::api::{Conv, Event, JoinEnd, RequestEnd};
 use crate::names;
-use crate::protocol::{PeerId, now_millis};
+use crate::protocol::{Frame, PeerId, now_millis};
 use crate::room::{self, ReplayGuard, RoomBody, RoomEnvelope, RoomId, RoomKeys, Secret};
 
 /// Rooms you can be in at once, counting ones you're creating or waiting to get into.
@@ -33,6 +33,10 @@ pub const JOIN_WAIT: Duration = Duration::from_secs(2);
 pub const KNOCK_EVERY: Duration = Duration::from_secs(10);
 /// How long a newcomer waits to be let in.
 pub const PENDING_FOR: Duration = Duration::from_secs(120);
+/// How long an invitation lasts, for the invitee and for the inviter's approval.
+pub const INVITE_FOR: Duration = Duration::from_secs(600);
+/// Invitations an invitee holds; a newer one drops the oldest.
+pub const MAX_INVITES: usize = 5;
 /// After a yes vote, wait this long for other votes before letting people in,
 /// so every member sees the same votes and picks the same people.
 pub const ADMIT_SETTLE: Duration = Duration::from_secs(1);
@@ -95,6 +99,8 @@ struct Request {
 
 struct Room {
     name: String,
+    /// The 6-character join key, for invitations.
+    key: String,
     max: u8,
     secret: Secret,
     keys: RoomKeys,
@@ -141,6 +147,14 @@ impl Room {
 }
 
 /// A join waiting at the door.
+/// An invitation someone sent us.
+struct Invite {
+    from: PeerId,
+    room: String,
+    key: String,
+    at: Instant,
+}
+
 struct PendingJoin {
     attempt: Attempt,
     name: String,
@@ -168,6 +182,10 @@ pub(super) struct Rooms {
     /// Peers we've already told the user have a skewed clock.
     skew_warned: HashSet<PeerId>,
     last_here: Option<Instant>,
+    /// Who we invited to which room, and when; their knock gets our approval.
+    invited: HashMap<(RoomId, PeerId), Instant>,
+    /// Invitations to us, oldest first.
+    invites: Vec<Invite>,
 }
 
 impl Rooms {
@@ -281,7 +299,7 @@ impl Node {
             Job::Create { name, key, max } => {
                 let secret = room::new_secret();
                 let keys = room::from_secret(&name, &secret);
-                self.hold_room(name.clone(), max, secret, keys, door, HashMap::new());
+                self.hold_room(name.clone(), key.clone(), max, secret, keys, door, HashMap::new());
                 self.emit(Event::RoomCreated { name, key, max });
             }
             Job::Join { name, key } => {
@@ -309,6 +327,7 @@ impl Node {
     fn hold_room(
         &mut self,
         name: String,
+        key: String,
         max: u8,
         secret: Secret,
         keys: RoomKeys,
@@ -319,6 +338,7 @@ impl Node {
         self.rooms.doors.insert(door.id, id);
         let room = Room {
             name,
+            key,
             max,
             secret,
             keys,
@@ -414,6 +434,98 @@ impl Node {
             Some(_) => Err(format!("@{nick} is already being let in")),
             None => Err(format!("@{nick} isn't waiting to join #{name}")),
         }
+    }
+
+    pub(super) fn invite(&mut self, nick: &str, name: &str) {
+        let Some(id) = self.rooms.id_of(name) else {
+            return self.emit(Event::Error(format!("you're not in #{name}")));
+        };
+        if nick == self.my_nick() {
+            return self.emit(Event::Error(format!("you're already in #{name}")));
+        }
+        let Some(peer) = self.peer_by_nick(nick) else {
+            return self.emit(Event::Error(format!("@{nick} is offline")));
+        };
+        let room = &self.rooms.joined[&id];
+        if room.members.contains_key(&peer) {
+            return self.emit(Event::Error(format!("@{nick} is already in #{name}")));
+        }
+        self.send_to(peer, Frame::Invite { room: name.to_string(), key: room.key.clone() });
+        self.rooms.invited.insert((id, peer), Instant::now());
+        self.emit(Event::Info(format!("invited @{nick} to #{name}")));
+    }
+
+    /// `from` knocked on room `id`: if we invited them, our invitation is our yes.
+    fn approve_invited(&mut self, id: RoomId, from: PeerId, now: Instant) {
+        let Some(at) = self.rooms.invited.remove(&(id, from)) else {
+            return;
+        };
+        if now.saturating_duration_since(at) >= INVITE_FOR {
+            return;
+        }
+        let (Some(room), Some(nick)) = (self.rooms.joined.get(&id), self.nick_of(from)) else {
+            return;
+        };
+        if room.requests.get(&from).is_some_and(|r| r.admitted.is_none() && !r.approvals.contains(&self.id)) {
+            let name = room.name.clone();
+            self.approve(&name, &nick);
+        }
+    }
+
+    /// `from` turned down our invitation to `name`; only counts if we invited them.
+    pub(super) fn on_decline(&mut self, from: PeerId, name: &str) {
+        let Some(id) = self.rooms.id_of(name) else {
+            return;
+        };
+        if self.rooms.invited.remove(&(id, from)).is_some()
+            && let Some(by) = self.nick_of(from)
+        {
+            self.emit(Event::InviteDeclined { by, room: name.to_string() });
+        }
+    }
+
+    /// `from` invites us to `name`. Bad shapes and rooms we're in are dropped.
+    pub(super) fn on_invite(&mut self, from: PeerId, name: String, key: String, now: Instant) {
+        if !names::is_valid_name(&name) || room::validate_key(&key).is_err() || self.rooms.holds(&name) {
+            debug!(%from, "ignoring invite to {name:?}");
+            return;
+        }
+        let Some(nick) = self.nick_of(from) else {
+            return;
+        };
+        let invites = &mut self.rooms.invites;
+        invites.retain(|i| i.room != name);
+        invites.push(Invite { from, room: name.clone(), key, at: now });
+        if invites.len() > MAX_INVITES {
+            invites.remove(0);
+        }
+        self.emit(Event::Invited { from: nick, room: name });
+    }
+
+    /// Joins `name` with the key its invitation carried.
+    pub(super) fn accept(&mut self, name: &str) {
+        let Some(pos) = self.rooms.invites.iter().position(|i| i.room == name) else {
+            return self.emit(Event::Error(format!("no invitation to #{name}")));
+        };
+        if self.rooms.holds(name) {
+            self.rooms.invites.remove(pos);
+            return self.emit(Event::Error(format!("you're already in #{name}")));
+        }
+        // At the room limit this says why, and the invitation stays for after a /leave.
+        if !self.room_slot_free() {
+            return;
+        }
+        let invite = self.rooms.invites.remove(pos);
+        self.join_room(&invite.room, &invite.key);
+    }
+
+    pub(super) fn decline(&mut self, name: &str) {
+        let Some(pos) = self.rooms.invites.iter().position(|i| i.room == name) else {
+            return self.emit(Event::Error(format!("no invitation to #{name}")));
+        };
+        let invite = self.rooms.invites.remove(pos);
+        self.send_to(invite.from, Frame::Decline { room: invite.room.clone() });
+        self.emit(Event::Info(format!("declined #{}", invite.room)));
     }
 
     pub(super) fn approve(&mut self, name: &str, nick: &str) {
@@ -584,6 +696,7 @@ impl Node {
                 };
                 let reply = RoomBody::Door { echo: nonce, members: small(room.size()), max: room.max };
                 self.send_to(from, self.seal(&door, reply));
+                self.approve_invited(id, from, now);
             }
             RoomBody::Leave => self.close_request(id, from, RequestEnd::Gone),
             _ => {}
@@ -681,7 +794,7 @@ impl Node {
                 let granter = Member { seen: now, floor: env.ts.saturating_sub(PROOF_GRACE_MS) };
                 let members = HashMap::from([(from, granter)]);
                 let (name, key) = (p.name.clone(), p.key.clone());
-                let id = self.hold_room(p.name, max, secret, keys.clone(), p.door, members);
+                let id = self.hold_room(p.name, p.key, max, secret, keys.clone(), p.door, members);
                 let probe = fresh_nonce();
                 if let Some(room) = self.rooms.joined.get_mut(&id) {
                     room.probe = Some(probe.clone());
@@ -835,6 +948,8 @@ impl Node {
     /// Every second: expire silent members, unanswered challenges and stale
     /// requests, and knock again while waiting; every `HERE_INTERVAL`: announce presence.
     pub(super) fn on_tick(&mut self, now: Instant) {
+        self.rooms.invites.retain(|i| now.saturating_duration_since(i.at) < INVITE_FOR);
+        self.rooms.invited.retain(|_, at| now.saturating_duration_since(*at) < INVITE_FOR);
         let expired: Vec<(RoomId, PeerId)> = self
             .rooms
             .joined
@@ -1659,5 +1774,223 @@ mod tests {
         assert_eq!(h.events(), vec![Event::RoomLeft { name: name.clone() }]);
         assert!(h.node.rooms.id_of(&name).is_none());
         assert!(h.node.rooms.doors.is_empty(), "the door closes too");
+    }
+
+    // ---- invitations: inviting ----
+
+    fn invite(h: &mut Harness, nick: &str, room: &str) {
+        h.node.handle_command(Command::Invite { nick: nick.into(), room: room.into() });
+    }
+
+    fn approved(events: &[Event], nick: &str) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::Approved { nick: n, by, .. } if n == nick && by == "annmoon"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn an_invite_goes_to_that_peer_only_with_the_key() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        h.sent(BOB);
+        h.sent(CAROL);
+        invite(&mut h, "bobroger", &made.name);
+        assert_eq!(h.sent(BOB), vec![Frame::Invite { room: made.name.clone(), key: made.key.clone() }]);
+        assert!(h.sent(CAROL).is_empty());
+        assert_eq!(h.events(), vec![Event::Info(format!("invited @bobroger to #{}", made.name))]);
+    }
+
+    #[tokio::test]
+    async fn inviting_checks_the_room_and_the_person() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        verify(&mut h, CAROL, &made.name, &made.keys);
+        h.events();
+        invite(&mut h, "bobroger", "dogpie");
+        invite(&mut h, "zedmoon", &made.name);
+        invite(&mut h, "annmoon", &made.name);
+        invite(&mut h, "carolwolf", &made.name);
+        let n = &made.name;
+        assert_eq!(
+            h.events(),
+            vec![
+                Event::Error("you're not in #dogpie".into()),
+                Event::Error("@zedmoon is offline".into()),
+                Event::Error(format!("you're already in #{n}")),
+                Event::Error(format!("@carolwolf is already in #{n}")),
+            ]
+        );
+        assert!(!h.sent(BOB).iter().any(|f| matches!(f, Frame::Invite { .. })));
+        assert!(!h.sent(CAROL).iter().any(|f| matches!(f, Frame::Invite { .. })));
+    }
+
+    #[tokio::test]
+    async fn an_invited_knock_is_approved_for_us() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        invite(&mut h, "bobroger", &made.name);
+        h.events();
+        knock(&mut h, CAROL, &made, 100);
+        knock(&mut h, BOB, &made, 100);
+        knock(&mut h, BOB, &made, 100); // the re-knock 10 s later
+        let events = h.events();
+        assert_eq!(approved(&events, "bobroger"), 1, "{events:?}");
+        assert_eq!(approved(&events, "carolwolf"), 0, "only the one we invited");
+    }
+
+    #[tokio::test]
+    async fn the_invite_counts_even_if_a_vote_opened_the_request() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        for member in [CAROL, DAVE, ERIN] {
+            verify(&mut h, member, &made.name, &made.keys);
+        }
+        invite(&mut h, "bobroger", &made.name);
+        h.events();
+        vote(&mut h, CAROL, &made, BOB, true);
+        knock(&mut h, BOB, &made, 100);
+        let events = h.events();
+        assert_eq!(approved(&events, "bobroger"), 1, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn the_invite_follows_a_rename() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        invite(&mut h, "bobroger", &made.name);
+        deliver(&mut h, BOB, Frame::Nick { nick: "bobpie".into() });
+        h.events();
+        knock(&mut h, BOB, &made, 100);
+        assert_eq!(approved(&h.events(), "bobpie"), 1);
+    }
+
+    #[tokio::test]
+    async fn only_an_invited_peer_can_decline() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        invite(&mut h, "bobroger", &made.name);
+        h.events();
+        deliver(&mut h, CAROL, Frame::Decline { room: made.name.clone() });
+        assert!(h.events().is_empty(), "carol wasn't invited");
+        deliver(&mut h, BOB, Frame::Decline { room: made.name.clone() });
+        assert_eq!(h.events(), vec![Event::InviteDeclined { by: "bobroger".into(), room: made.name.clone() }]);
+        deliver(&mut h, BOB, Frame::Decline { room: made.name.clone() });
+        assert!(h.events().is_empty(), "only once");
+        knock(&mut h, BOB, &made, 100);
+        assert_eq!(approved(&h.events(), "bobroger"), 0, "a declined invite no longer approves");
+    }
+
+    #[tokio::test]
+    async fn an_old_invite_no_longer_approves() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        invite(&mut h, "bobroger", &made.name);
+        h.node.on_tick(Instant::now() + INVITE_FOR);
+        h.events();
+        knock(&mut h, BOB, &made, 100);
+        assert_eq!(approved(&h.events(), "bobroger"), 0);
+    }
+
+    // ---- invitations: being invited ----
+
+    fn invite_from(h: &mut Harness, from: PeerId, room: &str) {
+        deliver(h, from, Frame::Invite { room: room.into(), key: KEY.into() });
+    }
+
+    fn invited_rooms(h: &Harness) -> Vec<&str> {
+        h.node.rooms.invites.iter().map(|i| i.room.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn invites_arrive_and_bad_ones_are_dropped() {
+        let mut h = with_peers();
+        invite_from(&mut h, BOB, NAME);
+        assert_eq!(h.events(), vec![Event::Invited { from: "bobroger".into(), room: NAME.into() }]);
+        deliver(&mut h, BOB, Frame::Invite { room: "CatPie".into(), key: KEY.into() });
+        deliver(&mut h, BOB, Frame::Invite { room: NAME.into(), key: "nope".into() });
+        assert!(h.events().is_empty());
+        assert_eq!(invited_rooms(&h), [NAME]);
+    }
+
+    #[tokio::test]
+    async fn an_invite_to_a_room_we_are_in_is_ignored() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        deliver(&mut h, BOB, Frame::Invite { room: made.name.clone(), key: made.key.clone() });
+        assert!(h.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_repeat_replaces_and_the_sixth_drops_the_oldest() {
+        let mut h = with_peers();
+        for room in ["apie", "bpie", "cpie", "dpie", "epie"] {
+            invite_from(&mut h, BOB, room);
+        }
+        invite_from(&mut h, CAROL, "cpie");
+        invite_from(&mut h, BOB, "fpie");
+        assert_eq!(invited_rooms(&h), ["bpie", "dpie", "epie", "cpie", "fpie"]);
+        assert_eq!(h.node.rooms.invites[3].from, CAROL);
+    }
+
+    #[tokio::test]
+    async fn accept_knocks_with_the_invited_key() {
+        let mut h = with_peers();
+        invite_from(&mut h, BOB, NAME);
+        h.events();
+        h.sent(CAROL);
+        h.node.handle_command(Command::Accept { room: NAME.into() });
+        h.pump().await; // the door keys finish deriving
+        let knock = h.sent(CAROL).iter().find_map(|f| try_open(&door(), f));
+        assert!(matches!(knock, Some(RoomBody::Knock { .. })), "{knock:?}");
+        assert!(invited_rooms(&h).is_empty());
+        h.node.handle_command(Command::Accept { room: NAME.into() });
+        assert!(h.events().contains(&Event::Error(format!("no invitation to #{NAME}"))));
+    }
+
+    #[tokio::test]
+    async fn accept_at_the_room_limit_keeps_the_invite() {
+        let mut h = with_peers();
+        for _ in 0..MAX_ROOMS {
+            create(&mut h, 13).await;
+        }
+        invite_from(&mut h, BOB, "owlpie");
+        h.events();
+        h.node.handle_command(Command::Accept { room: "owlpie".into() });
+        assert_eq!(h.events(), vec![Event::Error(format!("you're in {MAX_ROOMS} rooms (the max) — /leave one first"))]);
+        assert_eq!(invited_rooms(&h), ["owlpie"]);
+    }
+
+    #[tokio::test]
+    async fn accepting_a_room_you_joined_meanwhile_drops_the_invite() {
+        let mut h = with_peers();
+        invite_from(&mut h, BOB, "owlpie");
+        h.node.handle_command(Command::CreateRoom { name: "owlpie".into(), max: 13 });
+        h.pump().await;
+        h.events();
+        h.node.handle_command(Command::Accept { room: "owlpie".into() });
+        assert_eq!(h.events(), vec![Event::Error("you're already in #owlpie".into())]);
+        assert!(invited_rooms(&h).is_empty());
+    }
+
+    #[tokio::test]
+    async fn decline_tells_the_inviter() {
+        let mut h = with_peers();
+        invite_from(&mut h, BOB, NAME);
+        h.events();
+        h.sent(BOB);
+        h.node.handle_command(Command::Decline { room: NAME.into() });
+        assert_eq!(h.sent(BOB), vec![Frame::Decline { room: NAME.into() }]);
+        assert_eq!(h.events(), vec![Event::Info(format!("declined #{NAME}"))]);
+        h.node.handle_command(Command::Decline { room: NAME.into() });
+        assert_eq!(h.events(), vec![Event::Error(format!("no invitation to #{NAME}"))]);
+    }
+
+    #[tokio::test]
+    async fn invites_expire() {
+        let mut h = with_peers();
+        invite_from(&mut h, BOB, NAME);
+        h.node.on_tick(Instant::now() + INVITE_FOR);
+        assert!(invited_rooms(&h).is_empty());
     }
 }

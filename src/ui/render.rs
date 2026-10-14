@@ -264,7 +264,11 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             )
         }
         // Shown inside the room's conversation.
-        Event::Approved { .. } | Event::RequestEnded { .. } | Event::NamePreview { .. } => return None,
+        Event::Approved { .. }
+        | Event::RequestEnded { .. }
+        | Event::NamePreview { .. }
+        | Event::Invited { .. }
+        | Event::InviteDeclined { .. } => return None,
     })
 }
 

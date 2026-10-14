@@ -229,7 +229,12 @@ impl Store {
                     push(c, Line { ts: now, kind: LineKind::Notice(format!("@{nick} left")) });
                 }
             }
-            Event::Peers { .. } | Event::Error(_) | Event::Info(_) | Event::NamePreview { .. } => {}
+            Event::Peers { .. }
+            | Event::Error(_)
+            | Event::Info(_)
+            | Event::NamePreview { .. }
+            | Event::Invited { .. }
+            | Event::InviteDeclined { .. } => {}
         }
     }
 
