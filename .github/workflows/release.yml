@@ -95,19 +95,25 @@ jobs:
           New-Item -ItemType Directory -Force $site | Out-Null
           Copy-Item "$env:NAME.zip", "$env:NAME.zip.sha256" $site
           $server = Start-Process python -ArgumentList '-m', 'http.server', '8765', '--directory', $site -PassThru
-          Start-Sleep -Seconds 2
           try {
+            $up = $false
+            foreach ($i in 1..30) {
+              try { Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8765/$env:NAME.zip.sha256" | Out-Null; $up = $true; break } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $up) { throw 'the local server never came up' }
             $env:CORVO_LAN_BASE_URL = 'http://127.0.0.1:8765'
             $env:CORVO_LAN_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'corvo lan bin'
             $exe = Join-Path $env:CORVO_LAN_INSTALL_DIR 'corvo-lan.exe'
             Get-Content -Raw install.ps1 | Invoke-Expression
             & $exe --version
+            if ($LASTEXITCODE -ne 0) { throw 'corvo-lan --version failed' }
             $held = [IO.File]::Open($exe, 'Open', 'Read', 'Read, Delete')
             try { Get-Content -Raw install.ps1 | Invoke-Expression } finally { $held.Close() }
             if (-not (Test-Path (Join-Path $env:CORVO_LAN_INSTALL_DIR 'corvo-lan.old.exe'))) { throw 'the held exe was not moved aside' }
             & $exe --version
+            if ($LASTEXITCODE -ne 0) { throw 'corvo-lan --version failed' }
           } finally {
-            Stop-Process -Id $server.Id
+            Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
           }
       - uses: actions/upload-artifact@v4
         with:
