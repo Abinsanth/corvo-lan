@@ -5,6 +5,7 @@ use std::io::IsTerminal;
 
 use crate::api::{Conv, Event, JoinEnd, LeaveReason};
 use crate::convo::Store;
+use crate::names::{display, display_in};
 
 /// ANSI colour on or off.
 #[derive(Debug, Clone, Copy)]
@@ -43,13 +44,13 @@ impl Style {
         if self.color { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
     }
 
-    /// `@nick` in its stable colour (cleaned first).
+    /// `@nickName` in its stable colour (cleaned first).
     pub fn nick(&self, nick: &str) -> String {
-        self.paint(&nick_color(nick).to_string(), &format!("@{}", clean(nick)))
+        self.paint(&nick_color(nick).to_string(), &format!("@{}", clean(&display(nick))))
     }
 
     pub fn room(&self, room: &str) -> String {
-        self.paint("1", &format!("#{}", clean(room)))
+        self.paint("1", &format!("#{}", clean(&display(room))))
     }
 
     pub fn dim(&self, s: &str) -> String {
@@ -69,7 +70,7 @@ impl Style {
 
     /// A whole line of our own text, in the tone its wording implies.
     pub fn toned(&self, text: &str) -> String {
-        self.tone(tone_of_text(text), text)
+        self.tone(tone_of_text(text), &display_in(text))
     }
 }
 
@@ -130,7 +131,7 @@ pub fn tone_of_notice(text: &str) -> Tone {
 /// A message body for line mode: each line cleaned, continuations indented so
 /// a peer can't make one look like a new message.
 pub fn body(text: &str) -> String {
-    text.split('\n').map(clean).collect::<Vec<_>>().join("\n  │ ")
+    text.split('\n').map(|l| clean(&display_in(l))).collect::<Vec<_>>().join("\n  │ ")
 }
 
 /// "1 mention", "2 mentions".
@@ -209,7 +210,7 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             "{} {} for up to {max} people — /invite @name, or share /chat #{} {}",
             s.tone(Tone::Good, "* created"),
             s.room(name),
-            clean(name),
+            clean(&display(name)),
             clean(key)
         ),
         Event::RoomJoined { name, members, .. } if members.is_empty() => {
@@ -237,15 +238,19 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             }
             out
         }
-        Event::Error(msg) => s.tone(Tone::Bad, &format!("! {}", clean(msg))),
-        Event::Info(msg) => s.tone(tone_of(event), &format!("* {}", clean(msg))),
+        Event::Error(msg) => s.tone(Tone::Bad, &format!("! {}", clean(&display_in(msg)))),
+        Event::Info(msg) => s.tone(tone_of(event), &format!("* {}", clean(&display_in(msg)))),
         Event::JoinWaiting { name, members, needs } => {
             let who = if members == needs {
                 format!("its {members} member{}", if *members == 1 { "" } else { "s" })
             } else {
                 format!("{needs} of its {members} members")
             };
-            format!("* waiting to be let into {} — {who} must approve (/leave #{} to stop)", s.room(name), clean(name))
+            format!(
+                "* waiting to be let into {} — {who} must approve (/leave #{} to stop)",
+                s.room(name),
+                clean(&display(name))
+            )
         }
         Event::JoinEnded { name, why } => {
             let text = match why {
@@ -257,7 +262,7 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             s.tone(Tone::Bad, &text)
         }
         Event::JoinRequest { room, nick, .. } => {
-            let n = clean(nick);
+            let n = clean(&display(nick));
             s.tone(
                 Tone::Warn,
                 &format!("* {} wants to join {} — /approve @{n} or /deny @{n}", s.nick(nick), s.room(room)),
@@ -364,12 +369,12 @@ mod tests {
     fn messages_show_time_sigils_and_direction() {
         let room =
             Event::Message { conv: Conv::Room("catpie".into()), from: "bobroger".into(), text: "hi".into(), ts: 0 };
-        assert_eq!(event(&room, 0, &P).unwrap(), format!("{} #catpie @bobroger: hi", t(0)));
+        assert_eq!(event(&room, 0, &P).unwrap(), format!("{} #catPie @bobRoger: hi", t(0)));
         let dm_in =
             Event::Message { conv: Conv::Dm("bobroger".into()), from: "bobroger".into(), text: "psst".into(), ts: 0 };
-        assert_eq!(event(&dm_in, 0, &P).unwrap(), format!("{} @bobroger → you: psst", t(0)));
+        assert_eq!(event(&dm_in, 0, &P).unwrap(), format!("{} @bobRoger → you: psst", t(0)));
         let dm_out = Event::Sent { conv: Conv::Dm("bobroger".into()), text: "yo".into(), ts: 0 };
-        assert_eq!(event(&dm_out, 0, &P).unwrap(), format!("{} you → @bobroger: yo", t(0)));
+        assert_eq!(event(&dm_out, 0, &P).unwrap(), format!("{} you → @bobRoger: yo", t(0)));
         let room_out = Event::Sent { conv: Conv::Room("catpie".into()), text: "mine".into(), ts: 0 };
         assert_eq!(event(&room_out, 0, &P), None);
     }
@@ -379,7 +384,7 @@ mod tests {
         let created = Event::RoomCreated { name: "catpie".into(), key: "k7m9xq".into(), max: 13 };
         assert_eq!(
             event(&created, 0, &P).unwrap(),
-            "* created #catpie for up to 13 people — /invite @name, or share /chat #catpie k7m9xq"
+            "* created #catPie for up to 13 people — /invite @name, or share /chat #catPie k7m9xq"
         );
         let joined = Event::RoomJoined {
             name: "catpie".into(),
@@ -387,13 +392,13 @@ mod tests {
             max: 13,
             members: vec!["bobroger".into(), "carolwolf".into()],
         };
-        assert_eq!(event(&joined, 0, &P).unwrap(), "* joined #catpie with @bobroger, @carolwolf");
+        assert_eq!(event(&joined, 0, &P).unwrap(), "* joined #catPie with @bobRoger, @carolWolf");
         let member = Event::MemberJoined { room: "catpie".into(), nick: "carolwolf".into() };
-        assert_eq!(event(&member, 0, &P).unwrap(), format!("{} * @carolwolf joined #catpie", t(0)));
+        assert_eq!(event(&member, 0, &P).unwrap(), format!("{} * @carolWolf joined #catPie", t(0)));
         let lost = Event::PeerLeft { id: PeerId::test(1), nick: "bobroger".into(), reason: LeaveReason::Lost };
-        assert_eq!(event(&lost, 0, &P).unwrap(), format!("{} * @bobroger went offline (connection lost)", t(0)));
+        assert_eq!(event(&lost, 0, &P).unwrap(), format!("{} * @bobRoger went offline (connection lost)", t(0)));
         let assigned = Event::Assigned { nick: "annmoon".into(), renamed: false };
-        assert_eq!(event(&assigned, 0, &P).unwrap(), "* you're @annmoon — restart to pick another name");
+        assert_eq!(event(&assigned, 0, &P).unwrap(), "* you're @annMoon — restart to pick another name");
         let peers = Event::Peers {
             you: PeerId::test(0x7f3a_9c0d_12e4_5b68),
             nick: "annmoon".into(),
@@ -404,13 +409,13 @@ mod tests {
             }],
         };
         let text = event(&peers, 0, &P).unwrap();
-        let you = format!("\n  {:<16} 7f3a 9c0d 12e4 5b68", "you @annmoon");
-        let bob = format!("\n  {:<16} a1b2 c3d4 e5f6 0718  10.0.0.2:5000", "@bobroger");
+        let you = format!("\n  {:<16} 7f3a 9c0d 12e4 5b68", "you @annMoon");
+        let bob = format!("\n  {:<16} a1b2 c3d4 e5f6 0718  10.0.0.2:5000", "@bobRoger");
         assert_eq!(text, format!("* 1 peer(s) online:{you}{bob}"));
         let alone = Event::Peers { you: PeerId::test(0x7f3a_9c0d_12e4_5b68), nick: "annmoon".into(), peers: vec![] };
         assert_eq!(
             event(&alone, 0, &P).unwrap(),
-            "* no peers connected — you are @annmoon, fingerprint 7f3a 9c0d 12e4 5b68"
+            "* no peers connected — you are @annMoon, fingerprint 7f3a 9c0d 12e4 5b68"
         );
     }
 
@@ -495,11 +500,11 @@ mod tests {
             0,
         );
         let c = chats(&store, &P);
-        assert!(c.contains("#catpie") && c.contains("current"), "{c}");
-        assert!(c.contains("@bobroger") && c.contains("1 new") && c.contains("offline"), "{c}");
-        assert!(rooms(&store, &P).contains("#catpie            2/13 · key k7m9xq · @bobroger"));
+        assert!(c.contains("#catPie") && c.contains("current"), "{c}");
+        assert!(c.contains("@bobRoger") && c.contains("1 new") && c.contains("offline"), "{c}");
+        assert!(rooms(&store, &P).contains("#catPie            2/13 · key k7m9xq · @bobRoger"));
         store.apply(&Event::JoinWaiting { name: "dogpie".into(), members: 3, needs: 1 }, 0);
-        assert!(rooms(&store, &P).contains("#dogpie            waiting to be let in"), "{}", rooms(&store, &P));
+        assert!(rooms(&store, &P).contains("#dogPie            waiting to be let in"), "{}", rooms(&store, &P));
     }
 
     #[test]
@@ -508,21 +513,21 @@ mod tests {
         let line = |e: Event| event(&e, 0, &P);
         assert_eq!(
             line(Event::JoinWaiting { name: name(), members: 4, needs: 2 }).unwrap(),
-            "* waiting to be let into #catpie — 2 of its 4 members must approve (/leave #catpie to stop)"
+            "* waiting to be let into #catPie — 2 of its 4 members must approve (/leave #catPie to stop)"
         );
         assert_eq!(
             line(Event::JoinWaiting { name: name(), members: 1, needs: 1 }).unwrap(),
-            "* waiting to be let into #catpie — its 1 member must approve (/leave #catpie to stop)"
+            "* waiting to be let into #catPie — its 1 member must approve (/leave #catPie to stop)"
         );
         let ended = |why| line(Event::JoinEnded { name: name(), why }).unwrap();
-        assert_eq!(ended(JoinEnd::NoRoom), "! no room #catpie with that key");
-        assert_eq!(ended(JoinEnd::Full), "! #catpie is full");
-        assert_eq!(ended(JoinEnd::Denied { by: "bobroger".into() }), "! @bobroger didn't let you into #catpie");
-        assert_eq!(ended(JoinEnd::TimedOut), "! nobody let you into #catpie — try again later");
+        assert_eq!(ended(JoinEnd::NoRoom), "! no room #catPie with that key");
+        assert_eq!(ended(JoinEnd::Full), "! #catPie is full");
+        assert_eq!(ended(JoinEnd::Denied { by: "bobroger".into() }), "! @bobRoger didn't let you into #catPie");
+        assert_eq!(ended(JoinEnd::TimedOut), "! nobody let you into #catPie — try again later");
         let request = Event::JoinRequest { room: name(), nick: "bobroger".into(), have: 0, need: 1 };
         assert_eq!(
             line(request.clone()).unwrap(),
-            "* @bobroger wants to join #catpie — /approve @bobroger or /deny @bobroger"
+            "* @bobRoger wants to join #catPie — /approve @bobRoger or /deny @bobRoger"
         );
         assert_eq!(tone_of(&request), Tone::Warn, "flashes so it's seen from any tab");
         assert_eq!(tone_of(&Event::JoinEnded { name: name(), why: JoinEnd::Full }), Tone::Bad);
@@ -567,10 +572,10 @@ mod tests {
         assert_eq!(tone_of_text("* an update check is already running"), Tone::Warn);
         assert_eq!(tone_of_text("* installed v0.3.0. Restart corvo-lan to use it."), Tone::Good);
         assert_eq!(tone_of_text("* you have 0.2.0. Newer:"), Tone::Plain);
-        assert_eq!(tone_of_notice("@carolwolf joined"), Tone::Good);
-        assert_eq!(tone_of_notice("created #catpie — key 1-x — share both to invite"), Tone::Good);
-        assert_eq!(tone_of_notice("joined #catpie"), Tone::Good);
-        assert_eq!(tone_of_notice("@bobroger left"), Tone::Bad);
+        assert_eq!(tone_of_notice("@carolWolf joined"), Tone::Good);
+        assert_eq!(tone_of_notice("created #catPie — key 1-x — share both to invite"), Tone::Good);
+        assert_eq!(tone_of_notice("joined #catPie"), Tone::Good);
+        assert_eq!(tone_of_notice("@bobRoger left"), Tone::Bad);
         assert_eq!(tone_of_notice("something else"), Tone::Dim);
     }
 
@@ -604,7 +609,7 @@ mod tests {
             ts: 0,
         };
         let out = event(&forged, 0, &P).unwrap();
-        assert_eq!(out, format!("{} #catpie @bobroger: hi\n  │ [14:02] #catpie @alice: fake\u{fffd}!", t(0)));
+        assert_eq!(out, format!("{} #catPie @bobRoger: hi\n  │ [14:02] #catPie @alice: fake\u{fffd}!", t(0)));
     }
 
     #[test]
@@ -622,10 +627,10 @@ mod tests {
     #[test]
     fn invitation_lines() {
         let invited = Event::Invited { from: "alicemoon".into(), room: "catpie".into() };
-        assert_eq!(event(&invited, 0, &P).unwrap(), "* @alicemoon invites you to #catpie — /accept or /decline");
+        assert_eq!(event(&invited, 0, &P).unwrap(), "* @aliceMoon invites you to #catPie — /accept or /decline");
         assert_eq!(tone_of(&invited), Tone::Warn, "it wants an answer");
         let declined = Event::InviteDeclined { by: "bobroger".into(), room: "catpie".into() };
-        assert_eq!(event(&declined, 0, &P).unwrap(), "* @bobroger declined your invite to #catpie");
+        assert_eq!(event(&declined, 0, &P).unwrap(), "* @bobRoger declined your invite to #catPie");
     }
 
     #[test]
@@ -633,7 +638,7 @@ mod tests {
         let e = Event::Assigned { nick: "luffymoon".into(), renamed: true };
         assert_eq!(
             event(&e, 0, &P).unwrap(),
-            "* your name was taken just now — you're @luffymoon (restart to pick another name)"
+            "* your name was taken just now — you're @luffyMoon (restart to pick another name)"
         );
     }
 }

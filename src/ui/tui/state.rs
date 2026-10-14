@@ -690,21 +690,21 @@ mod tests {
         let mut t = TuiState::new(false);
         t.editor.set("hi @car".into());
         t.complete(&bobs());
-        assert_eq!(t.editor.text(), "hi @carolwolf ");
+        assert_eq!(t.editor.text(), "hi @carolWolf ");
         assert_eq!(t.popup, None);
 
         t.editor.set("é @b".into());
         t.complete(&bobs());
         assert_eq!(t.editor.text(), "é @bob", "fills the shared prefix");
-        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobroger", "@bobkite"]);
+        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobRoger", "@bobKite"]);
         t.move_selection(1);
         t.accept();
-        assert_eq!(t.editor.text(), "é @bobkite ");
+        assert_eq!(t.editor.text(), "é @bobKite ");
         assert_eq!(t.popup, None);
 
         t.editor.set("line one\n@car".into());
         t.complete(&bobs());
-        assert_eq!(t.editor.text(), "line one\n@carolwolf ");
+        assert_eq!(t.editor.text(), "line one\n@carolWolf ");
 
         t.editor.set("@zed".into());
         t.complete(&bobs());
@@ -720,7 +720,7 @@ mod tests {
         assert_eq!(t.popup.as_ref().unwrap().selected, 1);
         t.editor.insert('k');
         t.refresh_popup(&bobs());
-        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobkite"]);
+        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobKite"]);
         assert_eq!(t.popup.as_ref().unwrap().selected, 0);
         t.editor.insert(' ');
         t.refresh_popup(&bobs());

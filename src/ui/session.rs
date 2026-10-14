@@ -868,9 +868,9 @@ mod tests {
         assert_eq!(s.store.current(), Some(&Conv::Dm("carolwolf".into())));
         assert_eq!(
             typed(&mut s, "/chat carol").print,
-            vec!["! \"carol\" matches @carolwolf, #carolpie — be more specific"]
+            vec!["! \"carol\" matches @carolWolf, #carolPie — be more specific"]
         );
-        assert_eq!(typed(&mut s, "/chat bob").print, vec!["! \"bob\" matches @bobkite, @bobroger — be more specific"]);
+        assert_eq!(typed(&mut s, "/chat bob").print, vec!["! \"bob\" matches @bobKite, @bobRoger — be more specific"]);
         assert_eq!(
             typed(&mut s, "/chat ann").print,
             vec!["! no one or no room called \"ann\" — use @name for people or #name for rooms"],
@@ -888,7 +888,7 @@ mod tests {
         }
         assert_eq!(
             typed(&mut s, "/chat zed").print,
-            vec!["! \"zed\" matches @zed0owl, @zed1owl, @zed2owl, @zed3owl, @zed4owl, … — be more specific"]
+            vec!["! \"zed\" matches @zed0Owl, @zed1Owl, @zed2Owl, @zed3Owl, @zed4Owl, … — be more specific"]
         );
     }
 

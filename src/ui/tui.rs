@@ -631,13 +631,13 @@ mod tests {
         let mut state = TuiState::new(false);
         state.editor.set("@b".into());
         apply_key(&mut s, &mut state, Action::Complete);
-        assert_eq!(state.popup.as_ref().unwrap().matches, vec!["@bobkite", "@bobroger"]);
+        assert_eq!(state.popup.as_ref().unwrap().matches, vec!["@bobKite", "@bobRoger"]);
         apply_key(&mut s, &mut state, Action::Down);
         apply_key(&mut s, &mut state, Action::Up);
         apply_key(&mut s, &mut state, Action::Complete);
         assert_eq!(state.popup.as_ref().unwrap().selected, 1, "Tab moves down the list");
         assert_eq!(apply_key(&mut s, &mut state, Action::Send), KeyOutcome::Stay, "Enter picks, doesn't send");
-        assert_eq!(state.editor.text(), "@bobroger ");
+        assert_eq!(state.editor.text(), "@bobRoger ");
 
         state.editor.set("@b".into());
         apply_key(&mut s, &mut state, Action::Complete);
@@ -647,7 +647,7 @@ mod tests {
 
         apply_key(&mut s, &mut state, Action::Complete);
         apply_key(&mut s, &mut state, Action::Insert('r'));
-        assert_eq!(state.popup.as_ref().unwrap().matches, vec!["@bobroger"], "typing refreshes the list");
+        assert_eq!(state.popup.as_ref().unwrap().matches, vec!["@bobRoger"], "typing refreshes the list");
         apply_key(&mut s, &mut state, Action::Left);
         assert!(state.popup.is_none(), "moving the cursor closes it");
     }
