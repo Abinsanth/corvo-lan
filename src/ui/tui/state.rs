@@ -680,7 +680,7 @@ mod tests {
     }
 
     fn bobs() -> Candidates {
-        Candidates { nicks: vec!["bobRoger".into(), "bobKite".into(), "carolFox".into()], rooms: vec![] }
+        Candidates { nicks: vec!["bobRoger".into(), "bobKite".into(), "carolFox".into()], ..Default::default() }
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Tab completion for `@names`, `#rooms` and `/commands`. Pure; both
 //! frontends use it.
 
+use std::collections::BTreeSet;
+
 use crate::api::Conv;
 use crate::convo::Store;
 use crate::ui::input::COMMANDS;
@@ -12,6 +14,8 @@ pub struct Candidates {
     pub nicks: Vec<String>,
     /// Joined rooms.
     pub rooms: Vec<String>,
+    /// People asking to join any of my rooms, for `/approve` and `/deny`.
+    pub waiting: Vec<String>,
 }
 
 impl Candidates {
@@ -37,7 +41,10 @@ impl Candidates {
             })
             .collect();
         by_name(&mut rooms);
-        Candidates { nicks, rooms }
+        let waiting: BTreeSet<&String> = store.conversations().iter().flat_map(|c| c.waiting.keys()).collect();
+        let mut waiting: Vec<String> = waiting.into_iter().cloned().collect();
+        by_name(&mut waiting);
+        Candidates { nicks, rooms, waiting }
     }
 }
 
@@ -63,6 +70,9 @@ pub fn complete(before: &str, cands: &Candidates) -> Option<Completion> {
     let sigil = token.chars().next()?;
     let part = token[sigil.len_utf8()..].to_lowercase();
     let pool: Vec<&str> = match sigil {
+        '@' if before.starts_with("/approve ") || before.starts_with("/deny ") => {
+            cands.waiting.iter().map(String::as_str).collect()
+        }
         '@' => cands.nicks.iter().map(String::as_str).collect(),
         '#' => cands.rooms.iter().map(String::as_str).collect(),
         '/' if before[..start].trim().is_empty() && !part.starts_with('/') => {
@@ -98,6 +108,7 @@ mod tests {
         Candidates {
             nicks: vec!["bobRoger".into(), "bobKite".into(), "carolFox".into()],
             rooms: vec!["catPieR".into()],
+            waiting: vec!["daveOak".into()],
         }
     }
 
@@ -118,6 +129,16 @@ mod tests {
         assert_eq!(complete("hello ", &cands()), None);
         assert_eq!(complete("", &cands()), None);
         assert_eq!(complete("line one\n@car", &cands()).unwrap().start, 9);
+    }
+
+    #[test]
+    fn approve_and_deny_complete_who_is_waiting() {
+        assert_eq!(matches("/approve @"), vec!["@daveOak"]);
+        assert_eq!(matches("/deny @d"), vec!["@daveOak"]);
+        assert_eq!(matches("/approve @b"), Vec::<String>::new(), "only people who asked");
+        assert_eq!(matches("/msg @d"), Vec::<String>::new(), "elsewhere it's everyone online");
+        assert_eq!(matches("/invite #c"), vec!["#catPieR"]);
+        assert_eq!(matches("/inv"), vec!["/invite"]);
     }
 
     #[test]
@@ -160,8 +181,12 @@ mod tests {
         );
         s.apply(&Event::RoomJoined { name: "catR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         s.switch(Conv::Room("dogR".into()));
+        for (room, nick) in [("dogR", "eveOwl"), ("catR", "daveOak"), ("dogR", "daveOak")] {
+            s.apply(&Event::JoinRequest { room: room.into(), nick: nick.into(), have: 0, need: 1 }, 0);
+        }
         let c = Candidates::from_store(&s);
         assert_eq!(c.nicks, vec!["zoeOwl", "bobRoger", "carolFox"]);
+        assert_eq!(c.waiting, vec!["daveOak", "eveOwl"], "everyone waiting in any of my rooms, once");
         assert_eq!(c.rooms, vec!["catR", "dogR"]);
     }
 }
