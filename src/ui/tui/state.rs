@@ -288,6 +288,8 @@ pub fn tabs(session: &Session) -> Vec<Tab> {
 pub enum Hit {
     Tab(usize),
     Person(String),
+    /// A room's name or key in the sidebar: copies its invite.
+    Invite(String),
 }
 
 /// Completion choices shown above the input.
@@ -427,6 +429,8 @@ impl TuiState {
 
     pub fn select_tab(&mut self, session: &mut Session, idx: usize) {
         self.popup = None;
+        // A question left open would take whatever is typed in the new tab.
+        session.cancel_prompt();
         match tabs(session).get(idx) {
             Some(Tab::Status) => {
                 session.store.clear_current();
@@ -678,7 +682,7 @@ mod tests {
     }
 
     fn bobs() -> Candidates {
-        Candidates { nicks: vec!["bobRoger".into(), "bobKite".into(), "carolFox".into()], rooms: vec![] }
+        Candidates { nicks: vec!["bobRoger".into(), "bobKite".into(), "carolFox".into()], ..Default::default() }
     }
 
     #[test]

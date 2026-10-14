@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 
 use self::state::{Action, Hit, TuiState, WHEEL_STEP, action_for, goes_to_status};
 use super::Ctx;
+use super::clip;
 use super::complete::Candidates;
 use super::render::{Tone, tone_of, tone_of_text};
 use super::session::{Reaction, Session};
@@ -195,6 +196,7 @@ fn apply_key(session: &mut Session, state: &mut TuiState, action: Action) -> Key
         Action::GoTab(i) => state.select_tab(session, i),
         Action::PageUp => state.scroll.page_up(total, height),
         Action::PageDown => state.scroll.page_down(total, height),
+        Action::Esc if state.editor.is_empty() && session.cancel_prompt() => {}
         Action::Esc if state.editor.is_empty() => state.scroll.to_bottom(),
         Action::Esc => state.editor.clear(),
         Action::Complete => state.complete(&Candidates::from_store(&session.store)),
@@ -229,22 +231,35 @@ fn follow_current(state: &mut TuiState, before: Option<Conv>, session: &Session)
 /// A line the user sent. Returns the reaction for `Ctx::act`, with its printed
 /// lines already moved to the corvo tab; `None` if nothing should happen.
 fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Instant) -> Option<Reaction> {
-    if text.trim().is_empty() {
+    let asking = session.prompt().is_some();
+    if text.trim().is_empty() && !asking {
         return None;
     }
-    state.history.push(&text);
-    if state.on_status && !text.starts_with('/') {
+    if !text.trim().is_empty() {
+        state.history.push(&text);
+    }
+    if state.on_status && !text.starts_with('/') && !asking {
         say(state, "! this is the corvo tab — switch to a chat (Shift-Tab) to send messages", now);
         return None;
     }
     let before = session.store.current().cloned();
     let shown = if state.on_status { None } else { before.clone() };
     let mut reaction = session.on_line(&text, shown.as_ref());
+    let complained = reaction.print.iter().any(|l| l.starts_with("! "));
     for line in std::mem::take(&mut reaction.print) {
         say(state, &line, now);
     }
     if session.store.current().cloned() != before {
         follow_current(state, before, session);
+    }
+    if let Some(question) = session.prompt().filter(|_| !complained) {
+        state.flash(&question, now);
+    }
+    if reaction.copy.is_some()
+        && let Some(line) = state.status_lines().last()
+    {
+        let text = line.text.clone();
+        state.flash(&text, now);
     }
     Some(reaction)
 }
@@ -368,6 +383,10 @@ async fn on_terminal_event(
                 MouseEventKind::ScrollDown => state.scroll.by(WHEEL_STEP as isize, total, height),
                 MouseEventKind::Down(MouseButton::Left) => match state.hit(m.column, m.row) {
                     Some(Hit::Tab(i)) => state.select_tab(&mut ctx.session, i),
+                    Some(Hit::Invite(room)) => {
+                        let reaction = on_send(&mut ctx.session, state, format!("/invite #{room}"), now);
+                        return act(ctx, reaction).await;
+                    }
                     Some(Hit::Person(nick)) if Some(nick.as_str()) != ctx.session.store.me() => {
                         let reaction = on_send(&mut ctx.session, state, format!("/chat @{nick}"), now);
                         return act(ctx, reaction).await;
@@ -386,7 +405,12 @@ async fn on_terminal_event(
 /// Says whether to quit.
 async fn act(ctx: &mut Ctx, reaction: Option<Reaction>) -> anyhow::Result<bool> {
     match reaction {
-        Some(reaction) => ctx.act(reaction).await,
+        Some(mut reaction) => {
+            if let Some(text) = reaction.copy.take() {
+                clip::copy(&text);
+            }
+            ctx.act(reaction).await
+        }
         None => Ok(false),
     }
 }
@@ -416,6 +440,71 @@ mod tests {
         assert!(state.flash_text(now).is_some());
         let r = on_send(&mut s, &mut state, "/who".into(), now).unwrap();
         assert_eq!(r.commands, vec![crate::api::Command::ListPeers]);
+    }
+
+    #[test]
+    fn the_create_question_is_answered_from_any_tab_and_esc_drops_it() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        state.on_status = true;
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        assert!(state.flash_text(now).is_some_and(|t| t.contains("how many people")), "the question flashes");
+        let r = on_send(&mut s, &mut state, String::new(), now).expect("Enter answers");
+        assert_eq!(r.commands, vec![crate::api::Command::CreateRoom { base: "cat".into(), max: 13 }]);
+
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        let r = on_send(&mut s, &mut state, "4".into(), now).expect("not refused on the corvo tab");
+        assert_eq!(r.commands, vec![crate::api::Command::CreateRoom { base: "cat".into(), max: 4 }]);
+
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        state.editor.insert('7');
+        apply_key(&mut s, &mut state, Action::Esc);
+        assert!(s.prompt().is_some(), "the first Esc clears the input");
+        apply_key(&mut s, &mut state, Action::Esc);
+        assert_eq!(s.prompt(), None);
+        assert_eq!(on_send(&mut s, &mut state, String::new(), now), None, "Enter does nothing again");
+    }
+
+    #[test]
+    fn switching_tabs_drops_the_create_question() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        s.on_line("/chat @bobRoger", None);
+        state.on_status = false;
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        state.step_tab(&mut s, 1);
+        assert_eq!(s.prompt(), None);
+        state.step_tab(&mut s, 1);
+        let r = on_send(&mut s, &mut state, "10".into(), now).unwrap();
+        assert_eq!(
+            r.commands,
+            vec![crate::api::Command::Send { to: Target::Dm("bobRoger".into()), text: "10".into() }]
+        );
+    }
+
+    #[test]
+    fn a_bad_answer_keeps_its_error_on_screen() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        on_send(&mut s, &mut state, "hello".into(), now);
+        assert!(s.prompt().is_some());
+        assert!(state.flash_text(now).is_some_and(|t| t.starts_with("! a room holds")), "{:?}", state.flash_text(now));
+    }
+
+    #[test]
+    fn an_invite_flashes_and_keeps_the_text_to_copy() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "k7m9xq".into(), max: 13 }, 0);
+        state.on_status = false;
+        let r = on_send(&mut s, &mut state, "/invite".into(), now).unwrap();
+        assert_eq!(r.copy.as_deref(), Some("/chat #catPieR k7m9xq"));
+        assert!(state.flash_text(now).is_some_and(|t| t.starts_with("* invite copied")));
     }
 
     #[test]

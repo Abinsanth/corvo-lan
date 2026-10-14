@@ -95,7 +95,8 @@ After about two seconds you get a name, and you're connected to everyone else ru
 
 ```
 /create cat 5              # a room for up to 5 people, e.g. #catPieR with key k7m9xq
-/chat #catPieR k7m9xq      # someone else asks to join with the name and key
+/invite                    # copy "/chat #catPieR k7m9xq" to send to someone
+/chat #catPieR k7m9xq      # they paste it to ask to join
 /approve @bobRoger         # someone in the room lets them in (or /deny @bobRoger)
 /chat @bobRoger            # private chat
 /msg @bobRoger hi          # one-off private message
@@ -113,14 +114,20 @@ people in the room and everyone online on the right. `Shift-Tab`,
 and `/commands`, `Alt+Enter` (or `Shift+Enter` where your terminal supports it)
 adds a new line, `PgUp`/`PgDn` or the mouse wheel scroll, and clicking a name
 opens a private chat. Command output and errors appear in the `corvo` tab. To
-select text (say, a room key), hold Shift (Option on macOS) while dragging.
+select text, hold Shift (Option on macOS) while dragging.
 
 ### Rooms
 
-A room holds 2–13 people (13 if you don't say), and you can be in up to 3
-rooms at once. Its key is 6 characters made up by the app. Anyone with the
-room's name and key can *ask* to join; the people already inside see the
-request and approve or deny it. A request waits up to 2 minutes.
+A room holds 2–13 people (`/create cat` asks how many; Enter means 13), and you
+can be in up to 3 rooms at once. Its key is 6 characters made up by the app.
+Anyone with the room's name and key can *ask* to join; the people already
+inside see the request and approve or deny it. A request waits up to 2 minutes.
+
+A room's sidebar shows its key, how full it is and who's waiting to get in.
+Click the room name or key, or type `/invite`, to copy the line someone pastes
+to ask to join. Copying uses your terminal's clipboard support (OSC 52); macOS
+Terminal.app doesn't have it, so there you select the line with Option-drag
+instead.
 
 How many approvals a newcomer needs depends on how many people are in the room
 (online) right now:

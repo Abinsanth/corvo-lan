@@ -17,6 +17,7 @@ commands:
   /chat #room <key>      ask to join a room (just /chat #room once you're in)
   /create <name> [n]     create a private room for n people, 2–13 (asks if you leave it out)
   /approve @nick [#room] let someone who asked into a room; /deny @nick turns them away
+  /invite [#room]        copy the line that asks to join this room (or click its key)
   /leave [#room]         leave the current or named room
   /close [@nick]         close the current or named private chat
   /rooms  /chats  /who   list rooms, chats, connected people
@@ -36,6 +37,8 @@ pub struct Reaction {
     pub print: Vec<String>,
     pub quit: bool,
     pub update: Option<UpdateAction>,
+    /// Text for the clipboard.
+    pub copy: Option<String>,
 }
 
 impl Reaction {
@@ -54,11 +57,13 @@ pub struct Session {
     color: bool,
     /// Text is always plain; the TUI colours lines itself.
     style: Style,
+    /// `/create <base>` without a head count: the next line answers it.
+    asking: Option<String>,
 }
 
 impl Session {
     pub fn new(color: bool) -> Self {
-        Session { store: Store::new(), color, style: Style::plain() }
+        Session { store: Store::new(), color, style: Style::plain(), asking: None }
     }
 
     pub fn color(&self) -> bool {
@@ -79,7 +84,39 @@ impl Session {
     /// plain text goes there even if a join switched us while the user typed.
     /// If the prompt showed none, the user means where they've just arrived.
     pub fn on_line(&mut self, line: &str, shown: Option<&Conv>) -> Reaction {
+        if let Some(base) = self.asking.take()
+            && !line.trim_start().starts_with('/')
+        {
+            return self.answer_head_count(base, line.trim());
+        }
         self.on_input(parse_line(line), shown)
+    }
+
+    /// The question the input is waiting on, if any.
+    pub fn prompt(&self) -> Option<String> {
+        self.asking.as_ref().map(|base| {
+            format!("how many people in #{base}…? {MIN_MEMBERS}–{MAX_MEMBERS}, Enter for {MAX_MEMBERS}, Esc to cancel")
+        })
+    }
+
+    /// Drops the question; says whether there was one.
+    pub fn cancel_prompt(&mut self) -> bool {
+        self.asking.take().is_some()
+    }
+
+    fn answer_head_count(&mut self, base: String, answer: &str) -> Reaction {
+        if answer.is_empty() {
+            return Reaction::send(Command::CreateRoom { base, max: MAX_MEMBERS });
+        }
+        match answer.parse::<u8>() {
+            Ok(max) if (MIN_MEMBERS..=MAX_MEMBERS).contains(&max) => Reaction::send(Command::CreateRoom { base, max }),
+            _ => {
+                self.asking = Some(base);
+                Reaction::say(format!(
+                    "! a room holds {MIN_MEMBERS}–{MAX_MEMBERS} people — type a number, or Esc to cancel"
+                ))
+            }
+        }
     }
 
     fn on_input(&mut self, input: Input, shown: Option<&Conv>) -> Reaction {
@@ -133,12 +170,39 @@ impl Session {
                 Err(e) => Reaction::say(format!("! {e}")),
             },
             Input::Create { base, max } => match max.as_deref().map(str::parse::<u8>) {
-                None => Reaction::send(Command::CreateRoom { base, max: MAX_MEMBERS }),
+                None => match crate::names::validate_base(&base) {
+                    Ok(()) => {
+                        self.asking = Some(base);
+                        Reaction::default()
+                    }
+                    Err(e) => Reaction::say(format!("! {e}")),
+                },
                 Some(Ok(max)) if (MIN_MEMBERS..=MAX_MEMBERS).contains(&max) => {
                     Reaction::send(Command::CreateRoom { base, max })
                 }
                 Some(_) => Reaction::say(format!("! a room holds {MIN_MEMBERS}–{MAX_MEMBERS} people")),
             },
+            Input::Invite(room) => {
+                let Some(room) = room.or_else(|| match self.store.current() {
+                    Some(Conv::Room(name)) => Some(name.clone()),
+                    _ => None,
+                }) else {
+                    return Reaction::say("! /invite works in a room tab, or name the room: /invite #room");
+                };
+                match self.store.get(&Conv::Room(room.clone())).and_then(|c| c.key.clone()) {
+                    Some(key) => {
+                        let line = format!("/chat #{room} {key}");
+                        Reaction {
+                            print: vec![format!(
+                                "* invite copied: {line} (if it didn't copy, Shift/Option-drag to select it)"
+                            )],
+                            copy: Some(line),
+                            ..Default::default()
+                        }
+                    }
+                    None => Reaction::say(format!("! you're not in #{room}")),
+                }
+            }
             Input::Approve { nick, room } => match self.waiting_room(&nick, room, "approve") {
                 Ok(room) => Reaction::send(Command::Approve { room, nick }),
                 Err(e) => Reaction::say(format!("! {e}")),
@@ -333,10 +397,37 @@ mod tests {
     }
 
     #[test]
+    fn create_asks_for_the_head_count_when_left_out() {
+        let mut s = session();
+        let create = |max| Reaction::send(Command::CreateRoom { base: "cat".into(), max });
+        let question = Some("how many people in #cat…? 2–13, Enter for 13, Esc to cancel".to_string());
+        assert_eq!(typed(&mut s, "/create cat"), Reaction::default());
+        assert_eq!(s.prompt(), question);
+        assert_eq!(typed(&mut s, ""), create(13), "Enter takes the most");
+        assert_eq!(s.prompt(), None);
+
+        typed(&mut s, "/create cat");
+        assert_eq!(typed(&mut s, "20").print, vec!["! a room holds 2–13 people — type a number, or Esc to cancel"]);
+        assert_eq!(s.prompt(), question, "still asking");
+        assert_eq!(typed(&mut s, " 5 "), create(5));
+
+        typed(&mut s, "/create cat");
+        assert_eq!(typed(&mut s, "/who"), Reaction::send(Command::ListPeers), "a command drops the question");
+        assert_eq!(s.prompt(), None);
+
+        typed(&mut s, "/create cat");
+        assert!(s.cancel_prompt());
+        assert_eq!(s.prompt(), None);
+        assert!(!s.cancel_prompt());
+
+        assert_eq!(typed(&mut s, "/create chat").print, vec!["! 'chat' is reserved"], "the name is checked first");
+        assert_eq!(s.prompt(), None);
+    }
+
+    #[test]
     fn create_takes_an_optional_head_count() {
         let mut s = session();
         let create = |max| Reaction::send(Command::CreateRoom { base: "cat".into(), max });
-        assert_eq!(typed(&mut s, "/create cat"), create(13));
         assert_eq!(typed(&mut s, "/create cat 2"), create(2));
         for bad in ["1", "14", "x", "300"] {
             assert_eq!(typed(&mut s, &format!("/create cat {bad}")).print, vec!["! a room holds 2–13 people"]);
@@ -356,6 +447,27 @@ mod tests {
 
     fn approve(room: &str) -> Reaction {
         Reaction::send(Command::Approve { room: room.into(), nick: "bobRoger".into() })
+    }
+
+    #[test]
+    fn invite_copies_the_join_line() {
+        let mut s = bob_waits_in(&["catPieR"]);
+        let copied = Reaction {
+            copy: Some("/chat #catPieR k7m9xq".into()),
+            print: vec![
+                "* invite copied: /chat #catPieR k7m9xq (if it didn't copy, Shift/Option-drag to select it)".into(),
+            ],
+            ..Default::default()
+        };
+        s.store.switch(Conv::Room("catPieR".into()));
+        assert_eq!(typed(&mut s, "/invite"), copied);
+        typed(&mut s, "/chat @bobRoger");
+        assert_eq!(typed(&mut s, "/invite #catPieR"), copied);
+        assert_eq!(
+            typed(&mut s, "/invite").print,
+            vec!["! /invite works in a room tab, or name the room: /invite #room"]
+        );
+        assert_eq!(typed(&mut s, "/invite #nopeMoonR").print, vec!["! you're not in #nopeMoonR"]);
     }
 
     #[test]
