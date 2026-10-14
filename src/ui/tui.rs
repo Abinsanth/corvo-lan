@@ -138,6 +138,15 @@ enum KeyOutcome {
 
 /// Applies an editing, scrolling or tab key. Sending and quitting are left to the caller.
 fn apply_key(session: &mut Session, state: &mut TuiState, action: Action) -> KeyOutcome {
+    if state.help {
+        match action {
+            Action::Insert('q' | 'Q') | Action::Esc => state.help = false,
+            Action::Quit => return KeyOutcome::Quit,
+            Action::Redraw => return KeyOutcome::Redraw,
+            _ => {}
+        }
+        return KeyOutcome::Stay;
+    }
     let edits =
         matches!(action, Action::Insert(_) | Action::Backspace | Action::Delete | Action::KillRow | Action::KillWord);
     if state.popup.is_some() {
@@ -268,6 +277,10 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     let asked = session.prompt();
     let shown = if state.on_status { None } else { before.clone() };
     let mut reaction = session.on_line(&text, shown.as_ref());
+    if reaction.help {
+        state.popup = None;
+        state.help = true;
+    }
     let complained = reaction.print.iter().any(|l| l.starts_with("! "));
     for line in std::mem::take(&mut reaction.print) {
         say(state, &line, now);
@@ -393,6 +406,7 @@ async fn on_terminal_event(
             }
             Some(KeyOutcome::Stay) | None => None,
         },
+        TermEvent::Paste(_) | TermEvent::Mouse(_) if state.help => None,
         TermEvent::Paste(text) => {
             state.popup = None;
             state.editor.insert_str(&text);
@@ -719,6 +733,33 @@ mod tests {
         apply_key(&mut s, &mut state, Action::NextTab);
         assert!(state.popup.is_none());
         assert_eq!(state.current_tab(&s), 1);
+    }
+
+    #[test]
+    fn help_opens_a_box_that_takes_every_key_until_q_or_esc() {
+        let mut s = session();
+        s.on_line("/chat @bobroger", None);
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        let r = on_send(&mut s, &mut state, "/h".into(), now).unwrap();
+        assert!(state.help, "/h opens the box");
+        assert!(r.commands.is_empty());
+        assert!(state.status_lines().next().is_none(), "nothing is printed to the corvo tab");
+        let tab = state.current_tab(&s);
+        for key in [Action::Insert('x'), Action::Send, Action::NextTab, Action::Complete, Action::PageUp] {
+            assert_eq!(apply_key(&mut s, &mut state, key.clone()), KeyOutcome::Stay, "{key:?}");
+        }
+        assert!(state.help, "other keys leave it open");
+        assert!(state.editor.is_empty(), "typing doesn't reach the input");
+        assert_eq!(state.current_tab(&s), tab, "tabs don't switch");
+        assert!(!state.scroll.is_scrolled());
+        assert_eq!(apply_key(&mut s, &mut state, Action::Quit), KeyOutcome::Quit, "Ctrl-C still quits");
+        for close in [Action::Insert('q'), Action::Insert('Q'), Action::Esc] {
+            state.help = true;
+            assert_eq!(apply_key(&mut s, &mut state, close.clone()), KeyOutcome::Stay);
+            assert!(!state.help, "{close:?} closes it");
+            assert!(state.editor.is_empty(), "{close:?} isn't typed");
+        }
     }
 
     #[test]

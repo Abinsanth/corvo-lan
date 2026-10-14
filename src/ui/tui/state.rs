@@ -398,6 +398,8 @@ pub struct TuiState {
     pub view: (usize, usize),
     /// The completion list, while open.
     pub popup: Option<Popup>,
+    /// The help box is open: it takes every key until q, Q or Esc.
+    pub help: bool,
     status: VecDeque<StatusLine>,
     flash: Option<(String, Instant)>,
     hits: Vec<(Rect, Hit)>,
@@ -413,6 +415,7 @@ impl TuiState {
             color,
             view: (0, 0),
             popup: None,
+            help: false,
             status: VecDeque::new(),
             flash: None,
             hits: Vec::new(),

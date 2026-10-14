@@ -105,7 +105,7 @@ Then you're connected to everyone else running it. With `--nick` it skips the qu
 /who                       # who's connected
 /update [yes]              # check for and install a newer version
 /close [@nick]             # close a private chat (TUI)
-/help  /h                  # all commands
+/help  /h                  # show commands (q or Esc closes it)
 /quit  /q                  # leave
 ```
 
