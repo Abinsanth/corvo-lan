@@ -3,9 +3,11 @@ use std::net::SocketAddr;
 use anyhow::anyhow;
 use clap::Parser;
 
-use lan_chat::names;
-use lan_chat::node::{self, NodeConfig};
-use lan_chat::ui;
+use corvo_lan::identity;
+use corvo_lan::names;
+use corvo_lan::node::{self, NodeConfig};
+use corvo_lan::ui;
+use corvo_lan::update;
 
 /// Serverless peer-to-peer chat for your local network.
 #[derive(Parser)]
@@ -20,16 +22,22 @@ struct Args {
     /// Connect to a peer directly, e.g. 192.168.1.20:54321 (repeatable)
     #[arg(long = "peer", value_name = "IP:PORT")]
     peers: Vec<SocketAddr>,
-    /// Write debug logs to ./lan-chat.log
+    /// Write debug logs to ./corvo-lan.log
     #[arg(long)]
     debug: bool,
+    /// Start in line mode instead of the full-screen UI
+    #[arg(long)]
+    line: bool,
+    /// Don't check GitHub for a newer version at startup (or set CORVO_LAN_NO_UPDATE_CHECK=1)
+    #[arg(long)]
+    no_update_check: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     if args.debug {
-        let file = std::fs::File::create("lan-chat.log")?;
+        let file = std::fs::File::create("corvo-lan.log")?;
         tracing_subscriber::fmt()
             .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
@@ -40,7 +48,12 @@ async fn main() -> anyhow::Result<()> {
     let base = args.nick.or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "anon".into());
     names::validate_base(&base).map_err(|e| anyhow!("invalid --nick {base:?}: {e}"))?;
 
+    // Holds the identity lock until the app exits.
+    let identity = identity::load()?;
     let handle = node::start(NodeConfig {
+        keys: identity.keys.clone(),
+        known_peers: identity.known_peers.clone(),
+        notice: identity.notice.clone(),
         base,
         listen: SocketAddr::from(([0, 0, 0, 0], args.port)),
         discovery: true,
@@ -49,5 +62,6 @@ async fn main() -> anyhow::Result<()> {
         fixed_word: None,
     })
     .await?;
-    ui::line::run(handle).await
+    let env_off = update::check_disabled_by(std::env::var("CORVO_LAN_NO_UPDATE_CHECK").ok().as_deref());
+    ui::run(handle, ui::Options { line: args.line, check_updates: !args.no_update_check && !env_off }).await
 }

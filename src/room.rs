@@ -92,7 +92,7 @@ pub fn validate_key(key: &str) -> Result<(), String> {
 /// Slow on purpose (Argon2id, ~19 MiB): call it off the async actor.
 pub fn derive(name: &str, key: &str) -> RoomKeys {
     let params = Params::new(19_456, 2, 1, Some(32)).expect("valid Argon2 params");
-    let salt = format!("lan-chat room v2:{name}");
+    let salt = format!("corvo-lan room v3:{name}");
     let mut secret = [0u8; 32];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
         .hash_password_into(key.as_bytes(), salt.as_bytes(), &mut secret)
@@ -100,17 +100,17 @@ pub fn derive(name: &str, key: &str) -> RoomKeys {
     let hk = Hkdf::<Sha256>::new(None, &secret);
     let mut id = [0u8; 16];
     let mut enc = [0u8; 32];
-    hk.expand(b"lan-chat v2 room-id", &mut id).expect("16 bytes is a valid length");
-    hk.expand(b"lan-chat v2 room-enc", &mut enc).expect("32 bytes is a valid length");
+    hk.expand(b"corvo-lan v3 room-id", &mut id).expect("16 bytes is a valid length");
+    hk.expand(b"corvo-lan v3 room-enc", &mut enc).expect("32 bytes is a valid length");
     RoomKeys { id, enc }
 }
 
 /// Binds the frame to its room and to the peer it travels from, so a frame
 /// relabelled to another sender fails to open.
-fn aad(id: &RoomId, sender: PeerId) -> [u8; 24] {
-    let mut aad = [0u8; 24];
+fn aad(id: &RoomId, sender: PeerId) -> [u8; 48] {
+    let mut aad = [0u8; 48];
     aad[..16].copy_from_slice(id);
-    aad[16..].copy_from_slice(&sender.0.to_be_bytes());
+    aad[16..].copy_from_slice(&sender.0);
     aad
 }
 
@@ -180,8 +180,8 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
 
-    const ALICE: PeerId = PeerId(1);
-    const BOB: PeerId = PeerId(2);
+    const ALICE: PeerId = PeerId::test(1);
+    const BOB: PeerId = PeerId::test(2);
 
     /// Argon2 is slow, so derive the shared test room once.
     fn keys() -> &'static RoomKeys {

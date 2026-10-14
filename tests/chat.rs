@@ -4,8 +4,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use lan_chat::api::{Command, Conv, Event, LeaveReason, Target};
-use lan_chat::node::{self, NodeConfig, NodeHandle};
+use corvo_lan::api::{Command, Conv, Event, LeaveReason, Target};
+use corvo_lan::identity::Keys;
+use corvo_lan::node::{self, NodeConfig, NodeHandle};
 use tokio::time::timeout;
 
 struct Peer {
@@ -19,6 +20,9 @@ async fn spawn_node(base: &str, peers: &[SocketAddr]) -> Peer {
 
 async fn spawn_node_with_word(base: &str, peers: &[SocketAddr], word: Option<&str>) -> Peer {
     let mut node = node::start(NodeConfig {
+        keys: Keys::generate(),
+        known_peers: None,
+        notice: None,
         base: base.into(),
         listen: "127.0.0.1:0".parse().unwrap(),
         discovery: false,
@@ -111,8 +115,8 @@ async fn join_room(p: &mut Peer, name: &str, key: &str) -> Vec<String> {
 #[tokio::test]
 async fn names_are_assigned_from_the_base() {
     let (alice, bob) = pair().await;
-    assert!(alice.nick.starts_with("alice") && lan_chat::names::is_valid_nick(&alice.nick));
-    assert!(bob.nick.starts_with("bob") && lan_chat::names::is_valid_nick(&bob.nick));
+    assert!(alice.nick.starts_with("alice") && corvo_lan::names::is_valid_nick(&alice.nick));
+    assert!(bob.nick.starts_with("bob") && corvo_lan::names::is_valid_nick(&bob.nick));
 }
 
 #[tokio::test]
@@ -226,15 +230,27 @@ async fn crash_is_reported_as_connection_lost() {
 }
 
 #[tokio::test]
-async fn who_lists_connected_peers() {
+async fn who_lists_connected_peers_and_our_fingerprint() {
     let (mut alice, bob) = pair().await;
     send(&alice, Command::ListPeers).await;
-    let Event::Peers(peers) = wait_for(&mut alice.node, "peer list", |e| matches!(e, Event::Peers(_))).await else {
+    let Event::Peers { you, nick, peers } =
+        wait_for(&mut alice.node, "peer list", |e| matches!(e, Event::Peers { .. })).await
+    else {
         unreachable!()
     };
+    assert_eq!(you, alice.node.id);
+    assert_eq!(nick, alice.nick);
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0].nick, bob.nick);
     assert_eq!(peers[0].id, bob.node.id);
+}
+
+#[tokio::test]
+async fn meeting_someone_new_shows_their_fingerprint() {
+    let mut alice = spawn_node("alice", &[]).await;
+    let bob = spawn_node("bob", &[alice.node.local_addr]).await;
+    let expected = format!("first time meeting @{} ({})", bob.nick, bob.node.id.fingerprint());
+    wait_for(&mut alice.node, "first meeting", |e| matches!(e, Event::Info(t) if *t == expected)).await;
 }
 
 #[tokio::test]

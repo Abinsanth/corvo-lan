@@ -3,8 +3,8 @@
 **/*.rs.bk
 *.pdb
 
-# App runtime output (`lan-chat --debug`)
-lan-chat.log
+# App runtime output (`corvo-lan --debug`)
+corvo-lan.log
 *.log
 
 # Secrets and credentials — never commit these
