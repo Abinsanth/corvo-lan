@@ -1,9 +1,5 @@
 //! Parses a typed line. Pure: knows nothing about the current conversation.
 
-/// Default and maximum `/history` length.
-pub const HISTORY_DEFAULT: usize = 20;
-pub const HISTORY_MAX: usize = 1000;
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Input {
     /// Plain text for the current conversation.
@@ -31,15 +27,10 @@ pub enum Input {
     Leave(Option<String>),
     Rooms,
     Chats,
-    History(usize),
     /// `/update` checks; `/update yes` installs the newest release.
     Update {
         confirm: bool,
     },
-    /// Switch to line mode (from the TUI).
-    Line,
-    /// Switch to the full-screen UI (from line mode).
-    Tui,
     /// Close the current or named DM.
     Close(Option<String>),
     Who,
@@ -54,12 +45,12 @@ const SIGIL_HINT: &str = "use @name for people or #name for rooms";
 /// Every command name `parse_line` accepts, aliases included. Completion and
 /// typo hints read it, so keep it in step with the match below.
 pub const COMMANDS: &[&str] = &[
-    "msg", "m", "chat", "c", "create", "leave", "close", "rooms", "chats", "his", "who", "update", "line", "tui",
-    "help", "h", "?", "quit", "q",
+    "msg", "m", "chat", "c", "create", "leave", "close", "rooms", "chats", "who", "update", "help", "h", "?", "quit",
+    "q",
 ];
 
 /// Names that were dropped, and the command that replaced each.
-const RENAMED: &[(&str, &str)] = &[("exit", "quit"), ("history", "his")];
+const RENAMED: &[(&str, &str)] = &[("exit", "quit")];
 
 pub fn parse_line(line: &str) -> Input {
     if line.trim().is_empty() {
@@ -107,26 +98,10 @@ pub fn parse_line(line: &str) -> Input {
             [room] if room.starts_with('#') => Input::Leave(Some(room[1..].to_string())),
             _ => Input::Error("usage: /leave [#room]".into()),
         },
-        "his" => match words.as_slice() {
-            [] => Input::History(HISTORY_DEFAULT),
-            [n] => match n.parse::<usize>() {
-                Ok(n) if n > 0 => Input::History(n.min(HISTORY_MAX)),
-                _ => Input::Error("usage: /his [n]".into()),
-            },
-            _ => Input::Error("usage: /his [n]".into()),
-        },
         "update" => match words.as_slice() {
             [] => Input::Update { confirm: false },
             ["yes"] => Input::Update { confirm: true },
             _ => Input::Error("usage: /update [yes]".into()),
-        },
-        "line" => match words.as_slice() {
-            [] => Input::Line,
-            _ => Input::Error("usage: /line".into()),
-        },
-        "tui" => match words.as_slice() {
-            [] => Input::Tui,
-            _ => Input::Error("usage: /tui".into()),
         },
         "close" => match words.as_slice() {
             [] => Input::Close(None),
@@ -139,6 +114,8 @@ pub fn parse_line(line: &str) -> Input {
         "who" => Input::Who,
         "help" | "h" | "?" => Input::Help,
         "quit" | "q" => Input::Quit,
+        "line" | "tui" => Input::Error("/line is gone — corvo-lan always uses the full-screen view".into()),
+        "his" | "history" => Input::Error("/his is gone — scroll with PgUp/PgDn or the mouse wheel".into()),
         "nick" => Input::Error("names are assigned by the system and can't be changed".into()),
         other => Input::Error(unknown(other)),
     }
@@ -239,11 +216,8 @@ mod tests {
 
     #[test]
     fn history_and_the_rest() {
-        assert_eq!(parse_line("/his"), Input::History(HISTORY_DEFAULT));
-        assert_eq!(parse_line("/his 5"), Input::History(5));
-        assert_eq!(parse_line("/his 99999"), Input::History(HISTORY_MAX));
-        assert_eq!(parse_line("/his 0"), err("usage: /his [n]"));
-        assert_eq!(parse_line("/his x"), err("usage: /his [n]"));
+        assert_eq!(parse_line("/his"), err("/his is gone — scroll with PgUp/PgDn or the mouse wheel"));
+        assert_eq!(parse_line("/history 5"), err("/his is gone — scroll with PgUp/PgDn or the mouse wheel"));
         assert_eq!(parse_line("/chats"), Input::Chats);
         assert_eq!(parse_line("/who"), Input::Who);
         for help in ["/help", "/h", "/?"] {
@@ -258,7 +232,6 @@ mod tests {
     #[test]
     fn removed_and_mistyped_commands_get_a_hint() {
         assert_eq!(parse_line("/exit"), err("unknown command /exit — did you mean /quit?"));
-        assert_eq!(parse_line("/history 5"), err("unknown command /history — did you mean /his?"));
         assert_eq!(parse_line("/qiut"), err("unknown command /qiut — did you mean /quit?"));
         assert_eq!(parse_line("/hlep"), err("unknown command /hlep — did you mean /help?"));
         assert_eq!(parse_line("/ms hi"), err("unknown command /ms — did you mean /msg?"));
@@ -291,12 +264,12 @@ mod tests {
 
     #[test]
     fn mode_and_close_commands() {
-        assert_eq!(parse_line("/line"), Input::Line);
-        assert_eq!(parse_line("/tui"), Input::Tui);
+        for gone in ["/line", "/tui", "/line now"] {
+            assert_eq!(parse_line(gone), err("/line is gone — corvo-lan always uses the full-screen view"), "{gone}");
+        }
         assert_eq!(parse_line("/close"), Input::Close(None));
         assert_eq!(parse_line("/close @bobRoger"), Input::Close(Some("bobRoger".into())));
         assert_eq!(parse_line("/close #catPieR"), err("use /leave for rooms"));
         assert_eq!(parse_line("/close bob"), err("usage: /close [@nick]"));
-        assert_eq!(parse_line("/line now"), err("usage: /line"));
     }
 }

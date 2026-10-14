@@ -4,7 +4,7 @@
 pub mod state;
 pub mod view;
 
-use std::io::{IsTerminal, Stdout, stdout};
+use std::io::{Stdout, stdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -24,10 +24,10 @@ use ratatui::crossterm::terminal::{
 use tokio::sync::mpsc;
 
 use self::state::{Action, Hit, TuiState, WHEEL_STEP, action_for, goes_to_status};
+use super::Ctx;
 use super::complete::Candidates;
 use super::render::{Tone, tone_of, tone_of_text};
-use super::session::{Mode, Reaction, Session};
-use super::{Ctx, Exit};
+use super::session::{Reaction, Session};
 use crate::api::{Command, Conv, Event};
 use crate::protocol::now_millis;
 
@@ -274,15 +274,6 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
     follow_current(state, before, session);
 }
 
-/// The full-screen UI writes escape codes, so without a terminal it hands back to line mode.
-fn without_terminal(ctx: &Ctx, is_terminal: bool) -> Option<Exit> {
-    if is_terminal {
-        return None;
-    }
-    ctx.notify("! the full-screen UI needs a terminal");
-    Some(Exit::Switch(Mode::Line))
-}
-
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// A ratatui terminal on a cleared screen. Never `Terminal::clear`: it asks the
@@ -293,17 +284,14 @@ fn open_terminal() -> std::io::Result<Term> {
     Ok(terminal)
 }
 
-pub async fn run(ctx: &mut Ctx) -> anyhow::Result<Exit> {
-    if let Some(exit) = without_terminal(ctx, stdout().is_terminal()) {
-        return Ok(exit);
-    }
-    // Any setup failure drops the guard (restoring the terminal) and falls back to line mode.
+/// Runs until the user quits. The caller has checked there's a terminal.
+pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
+    // Any setup failure drops the guard, restoring the terminal before the error prints.
     let (mut terminal, guard) = match TerminalGuard::enter().and_then(|guard| Ok((open_terminal()?, guard))) {
         Ok(setup) => setup,
         Err(e) => {
             restore_terminal();
-            ctx.notify(format!("* couldn't start the full-screen UI ({e}); using line mode"));
-            return Ok(Exit::Switch(Mode::Line));
+            return Err(anyhow::anyhow!("corvo-lan needs a terminal ({e})"));
         }
     };
     let (tx, mut input) = mpsc::unbounded_channel();
@@ -312,17 +300,17 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<Exit> {
     state.on_status = ctx.session.store.current().is_none();
     let mut tick = tokio::time::interval(TICK);
 
-    let exit = loop {
+    loop {
         let now = Instant::now();
         terminal.draw(|f| view::draw(f, &ctx.session, &mut state, now))?;
         tokio::select! {
             ev = input.recv() => {
                 let Some(ev) = ev else {
                     let _ = ctx.commands.send(Command::Quit).await;
-                    break Exit::Quit;
+                    break;
                 };
-                if let Some(exit) = on_terminal_event(ctx, &mut state, &mut terminal, ev).await? {
-                    break exit;
+                if on_terminal_event(ctx, &mut state, &mut terminal, ev).await? {
+                    break;
                 }
             }
             event = ctx.events.recv() => match event {
@@ -330,8 +318,7 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<Exit> {
                 None => {
                     drop(reader);
                     drop(guard);
-                    eprintln!("! chat core stopped unexpectedly");
-                    return Ok(Exit::Quit);
+                    return Err(anyhow::anyhow!("chat core stopped unexpectedly"));
                 }
             },
             Some(notice) = ctx.notices.recv() => {
@@ -342,10 +329,10 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<Exit> {
             }
             _ = tick.tick() => {}
         }
-    };
+    }
     drop(reader);
     drop(guard);
-    Ok(exit)
+    Ok(())
 }
 
 async fn on_terminal_event(
@@ -353,7 +340,7 @@ async fn on_terminal_event(
     state: &mut TuiState,
     terminal: &mut Term,
     ev: TermEvent,
-) -> anyhow::Result<Option<Exit>> {
+) -> anyhow::Result<bool> {
     let now = Instant::now();
     let reaction = match ev {
         TermEvent::Key(key) => match action_for(key).map(|a| apply_key(&mut ctx.session, state, a)) {
@@ -396,10 +383,11 @@ async fn on_terminal_event(
     act(ctx, reaction).await
 }
 
-async fn act(ctx: &mut Ctx, reaction: Option<Reaction>) -> anyhow::Result<Option<Exit>> {
+/// Says whether to quit.
+async fn act(ctx: &mut Ctx, reaction: Option<Reaction>) -> anyhow::Result<bool> {
     match reaction {
         Some(reaction) => ctx.act(reaction).await,
-        None => Ok(None),
+        None => Ok(false),
     }
 }
 
@@ -407,11 +395,9 @@ async fn act(ctx: &mut Ctx, reaction: Option<Reaction>) -> anyhow::Result<Option
 mod tests {
     use super::*;
     use crate::api::{Conv, Event, PeerId, Target};
-    use crate::ui::render::Style;
 
     fn session() -> Session {
-        let mut s = Session::new(Style::plain());
-        s.set_mode(Mode::Tui);
+        let mut s = Session::new(false);
         s.on_event(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
         s
@@ -557,25 +543,6 @@ mod tests {
         apply_key(&mut s, &mut state, Action::NextTab);
         assert!(state.popup.is_none());
         assert_eq!(state.current_tab(&s), 1);
-    }
-
-    #[test]
-    fn without_a_terminal_it_stays_in_line_mode() {
-        let (commands, _cmd_rx) = mpsc::channel(1);
-        let (_event_tx, events) = mpsc::unbounded_channel();
-        let (notice_tx, mut notices) = mpsc::unbounded_channel();
-        let ctx = Ctx {
-            session: session(),
-            commands,
-            events,
-            notices: mpsc::unbounded_channel().1,
-            notice_tx: notice_tx.clone(),
-            updater: crate::ui::updates::Updater::new(notice_tx),
-        };
-        assert_eq!(without_terminal(&ctx, true), None);
-        assert!(notices.try_recv().is_err(), "nothing to say on a terminal");
-        assert_eq!(without_terminal(&ctx, false), Some(Exit::Switch(Mode::Line)));
-        assert_eq!(notices.try_recv().unwrap().text, "! the full-screen UI needs a terminal");
     }
 
     #[test]

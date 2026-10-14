@@ -408,8 +408,6 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
 mod tests {
     use super::*;
     use crate::api::{Event, PeerId};
-    use crate::ui::render::Style;
-    use crate::ui::session::Mode;
     use crate::ui::tui::state::FLASH_FOR;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -417,8 +415,7 @@ mod tests {
     use ratatui::style::Color;
 
     fn session() -> Session {
-        let mut s = Session::new(Style::plain());
-        s.set_mode(Mode::Tui);
+        let mut s = Session::new(false);
         s.on_event(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "carolFox".into() }, 0);
