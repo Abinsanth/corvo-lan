@@ -1,6 +1,7 @@
 pub mod api;
 pub mod convo;
 pub mod discovery;
+pub mod identity;
 pub mod names;
 pub mod node;
 pub mod peer;
