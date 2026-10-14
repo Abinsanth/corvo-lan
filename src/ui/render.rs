@@ -97,7 +97,7 @@ pub fn tone_of(event: &Event) -> Tone {
         | Event::RoomLeft { .. }
         | Event::JoinEnded { .. }
         | Event::Error(_) => Tone::Bad,
-        Event::JoinRequest { .. } => Tone::Warn,
+        Event::JoinRequest { .. } | Event::Invited { .. } => Tone::Warn,
         Event::Info(text) if WARN_MARKERS.iter().any(|m| text.contains(m)) => Tone::Warn,
         _ => Tone::Plain,
     }
@@ -264,11 +264,13 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             )
         }
         // Shown inside the room's conversation.
-        Event::Approved { .. }
-        | Event::RequestEnded { .. }
-        | Event::NamePreview { .. }
-        | Event::Invited { .. }
-        | Event::InviteDeclined { .. } => return None,
+        Event::Invited { from, room } => {
+            format!("* {} invites you to {} — /accept or /decline", s.nick(from), s.room(room))
+        }
+        Event::InviteDeclined { by, room } => {
+            format!("* {} declined your invite to {}", s.nick(by), s.room(room))
+        }
+        Event::Approved { .. } | Event::RequestEnded { .. } | Event::NamePreview { .. } => return None,
     })
 }
 
@@ -614,5 +616,14 @@ mod tests {
         }
         assert!(chats(&s, &P).contains("3 new, 2 mentions"), "{}", chats(&s, &P));
         assert_eq!(mention_count(1), "1 mention");
+    }
+
+    #[test]
+    fn invitation_lines() {
+        let invited = Event::Invited { from: "alicemoon".into(), room: "catpie".into() };
+        assert_eq!(event(&invited, 0, &P).unwrap(), "* @alicemoon invites you to #catpie — /accept or /decline");
+        assert_eq!(tone_of(&invited), Tone::Warn, "it wants an answer");
+        let declined = Event::InviteDeclined { by: "bobroger".into(), room: "catpie".into() };
+        assert_eq!(event(&declined, 0, &P).unwrap(), "* @bobroger declined your invite to #catpie");
     }
 }

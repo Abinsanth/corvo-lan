@@ -228,6 +228,16 @@ fn follow_current(state: &mut TuiState, before: Option<Conv>, session: &Session)
     }
 }
 
+/// A click on a room's key: copy its join line and flash what was copied.
+fn on_copy(session: &Session, state: &mut TuiState, room: &str, now: Instant) -> Reaction {
+    let mut reaction = session.copy_join_line(room);
+    for line in std::mem::take(&mut reaction.print) {
+        say(state, &line, now);
+        state.flash(&line, now);
+    }
+    reaction
+}
+
 /// A line the user sent. Returns the reaction for `Ctx::act`, with its printed
 /// lines already moved to the corvo tab; `None` if nothing should happen.
 fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Instant) -> Option<Reaction> {
@@ -254,12 +264,6 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     }
     if let Some(question) = session.prompt().filter(|_| !complained) {
         state.flash(&question, now);
-    }
-    if reaction.copy.is_some()
-        && let Some(line) = state.status_lines().last()
-    {
-        let text = line.text.clone();
-        state.flash(&text, now);
     }
     Some(reaction)
 }
@@ -389,8 +393,8 @@ async fn on_terminal_event(
                 MouseEventKind::Down(MouseButton::Left) => match state.hit(m.column, m.row) {
                     Some(Hit::Tab(i)) => state.select_tab(&mut ctx.session, i),
                     Some(Hit::Invite(room)) => {
-                        let reaction = on_send(&mut ctx.session, state, format!("/invite #{room}"), now);
-                        return act(ctx, reaction).await;
+                        let reaction = on_copy(&ctx.session, state, &room, now);
+                        return act(ctx, Some(reaction)).await;
                     }
                     Some(Hit::Person(nick)) if Some(nick.as_str()) != ctx.session.store.me() => {
                         let reaction = on_send(&mut ctx.session, state, format!("/chat @{nick}"), now);
@@ -515,15 +519,14 @@ mod tests {
     }
 
     #[test]
-    fn an_invite_flashes_and_keeps_the_text_to_copy() {
+    fn clicking_a_key_copies_the_join_line() {
         let mut s = session();
         let mut state = TuiState::new(false);
         let now = Instant::now();
         s.on_event(&Event::RoomCreated { name: "catpie".into(), key: "k7m9xq".into(), max: 13 }, 0);
-        state.on_status = false;
-        let r = on_send(&mut s, &mut state, "/invite".into(), now).unwrap();
+        let r = on_copy(&s, &mut state, "catpie", now);
         assert_eq!(r.copy.as_deref(), Some("/chat #catpie k7m9xq"));
-        assert!(state.flash_text(now).is_some_and(|t| t.starts_with("* invite copied")));
+        assert!(state.flash_text(now).is_some_and(|t| t.starts_with("* copied: /chat #catpie k7m9xq")));
     }
 
     #[test]

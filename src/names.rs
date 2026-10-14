@@ -8,9 +8,9 @@ use crate::words::WORDS;
 pub const MAX_BASE_LEN: usize = 9;
 
 /// Command names and a few words that would read as commands or as "everyone".
-pub const RESERVED: [&str; 19] = [
+pub const RESERVED: [&str; 21] = [
     "msg", "chat", "chats", "create", "approve", "deny", "invite", "leave", "rooms", "history", "who", "tui", "line",
-    "help", "quit", "exit", "me", "all", "system",
+    "help", "quit", "exit", "me", "all", "system", "accept", "decline",
 ];
 
 /// A base is what the user types, lowercased: 1–9 ASCII letters or digits, not reserved.
@@ -88,7 +88,7 @@ mod tests {
         assert!(validate_base("élan").is_err());
         assert_eq!(validate_base("chat"), Err("'chat' is reserved".into()));
         assert!(validate_base("exit").is_err());
-        for cmd in ["approve", "deny", "invite"] {
+        for cmd in ["approve", "deny", "invite", "accept", "decline"] {
             assert!(validate_base(cmd).is_err(), "{cmd}");
         }
     }

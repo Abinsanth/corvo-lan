@@ -16,6 +16,8 @@ pub struct Candidates {
     pub rooms: Vec<String>,
     /// People asking to join any of my rooms, for `/approve` and `/deny`.
     pub waiting: Vec<String>,
+    /// Rooms we're invited to, for /accept and /decline.
+    pub invited: Vec<String>,
 }
 
 impl Candidates {
@@ -44,7 +46,9 @@ impl Candidates {
         let waiting: BTreeSet<&String> = store.conversations().iter().flat_map(|c| c.waiting.keys()).collect();
         let mut waiting: Vec<String> = waiting.into_iter().cloned().collect();
         by_name(&mut waiting);
-        Candidates { nicks, rooms, waiting }
+        let mut invited: Vec<String> = store.invites().iter().map(|(_, room)| room.clone()).collect();
+        by_name(&mut invited);
+        Candidates { nicks, rooms, waiting, invited }
     }
 }
 
@@ -74,6 +78,9 @@ pub fn complete(before: &str, cands: &Candidates) -> Option<Completion> {
             cands.waiting.iter().map(String::as_str).collect()
         }
         '@' => cands.nicks.iter().map(String::as_str).collect(),
+        '#' if before.starts_with("/accept ") || before.starts_with("/decline ") => {
+            cands.invited.iter().map(String::as_str).collect()
+        }
         '#' => cands.rooms.iter().map(String::as_str).collect(),
         '/' if before[..start].trim().is_empty() && !part.starts_with('/') => {
             let mut names = COMMANDS.to_vec();
@@ -109,6 +116,7 @@ mod tests {
             nicks: vec!["bobroger".into(), "bobkite".into(), "carolwolf".into()],
             rooms: vec!["catpie".into()],
             waiting: vec!["daveoak".into()],
+            invited: vec![],
         }
     }
 
@@ -188,5 +196,15 @@ mod tests {
         assert_eq!(c.nicks, vec!["zoeowl", "bobroger", "carolwolf"]);
         assert_eq!(c.waiting, vec!["daveoak", "eveowl"], "everyone waiting in any of my rooms, once");
         assert_eq!(c.rooms, vec!["catR", "dogR"]);
+    }
+
+    #[test]
+    fn accept_and_decline_complete_invited_rooms() {
+        let mut s = Store::new();
+        s.apply(&Event::Invited { from: "bobroger".into(), room: "catpie".into() }, 0);
+        let c = Candidates::from_store(&s);
+        assert_eq!(complete("/accept #c", &c).unwrap().matches, vec!["#catpie"]);
+        assert_eq!(complete("/decline #", &c).unwrap().matches, vec!["#catpie"]);
+        assert!(complete("/chat #c", &c).is_none(), "not a room we're in");
     }
 }

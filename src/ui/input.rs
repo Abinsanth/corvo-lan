@@ -34,8 +34,14 @@ pub enum Input {
         nick: String,
         room: Option<String>,
     },
-    /// Copy the join line for the current or named room.
-    Invite(Option<String>),
+    /// Invite someone to the named room, or the current one.
+    Invite {
+        nick: String,
+        room: Option<String>,
+    },
+    /// Answer an invitation; the room if typed, else the only one.
+    Accept(Option<String>),
+    Decline(Option<String>),
     Leave(Option<String>),
     Rooms,
     Chats,
@@ -57,8 +63,8 @@ const SIGIL_HINT: &str = "use @name for people or #name for rooms";
 /// Every command name `parse_line` accepts, aliases included. Completion and
 /// typo hints read it, so keep it in step with the match below.
 pub const COMMANDS: &[&str] = &[
-    "msg", "m", "chat", "c", "create", "invite", "approve", "deny", "leave", "close", "rooms", "chats", "who",
-    "update", "help", "h", "?", "quit", "q",
+    "msg", "m", "chat", "c", "create", "invite", "accept", "decline", "approve", "deny", "leave", "close", "rooms",
+    "chats", "who", "update", "help", "h", "?", "quit", "q",
 ];
 
 /// Names that were dropped, and the command that replaced each.
@@ -122,10 +128,20 @@ pub fn parse_line(line: &str) -> Input {
             if name == "approve" { Input::Approve { nick, room } } else { Input::Deny { nick, room } }
         }
         "invite" => match words.as_slice() {
-            [] => Input::Invite(None),
-            [room] if room.starts_with('#') => Input::Invite(Some(lower(&room[1..]))),
-            _ => Input::Error("usage: /invite [#room]".into()),
+            [nick] if nick.starts_with('@') => Input::Invite { nick: lower(&nick[1..]), room: None },
+            [nick, room] if nick.starts_with('@') && room.starts_with('#') => {
+                Input::Invite { nick: lower(&nick[1..]), room: Some(lower(&room[1..])) }
+            }
+            _ => Input::Error("usage: /invite @nick [#room]".into()),
         },
+        "accept" | "decline" => {
+            let room = match words.as_slice() {
+                [] => None,
+                [room] if room.starts_with('#') => Some(lower(&room[1..])),
+                _ => return Input::Error(format!("usage: /{name} [#room]")),
+            };
+            if name == "accept" { Input::Accept(room) } else { Input::Decline(room) }
+        }
         "leave" => match words.as_slice() {
             [] => Input::Leave(None),
             [room] if room.starts_with('#') => Input::Leave(Some(lower(&room[1..]))),
@@ -269,15 +285,26 @@ mod tests {
         );
         assert_eq!(parse_line("/deny @Bobroger"), Input::Deny { nick: "bobroger".into(), room: None });
         assert_eq!(parse_line("/leave #CatPie"), Input::Leave(Some("catpie".into())));
-        assert_eq!(parse_line("/invite #CatPie"), Input::Invite(Some("catpie".into())));
+        assert_eq!(
+            parse_line("/invite @BobRoger #CatPie"),
+            Input::Invite { nick: "bobroger".into(), room: Some("catpie".into()) }
+        );
         assert_eq!(parse_line("/close @BobRoger"), Input::Close(Some("bobroger".into())));
     }
 
     #[test]
-    fn invite_takes_an_optional_room() {
-        assert_eq!(parse_line("/invite"), Input::Invite(None));
-        assert_eq!(parse_line("/invite #catpie"), Input::Invite(Some("catpie".into())));
-        assert_eq!(parse_line("/invite catpie"), err("usage: /invite [#room]"));
+    fn invite_accept_and_decline_parse() {
+        assert_eq!(parse_line("/invite @bobroger"), Input::Invite { nick: "bobroger".into(), room: None });
+        assert_eq!(
+            parse_line("/invite @BobRoger #CatPie"),
+            Input::Invite { nick: "bobroger".into(), room: Some("catpie".into()) }
+        );
+        assert_eq!(parse_line("/invite"), err("usage: /invite @nick [#room]"));
+        assert_eq!(parse_line("/invite #catpie"), err("usage: /invite @nick [#room]"));
+        assert_eq!(parse_line("/accept"), Input::Accept(None));
+        assert_eq!(parse_line("/accept #CatPie"), Input::Accept(Some("catpie".into())));
+        assert_eq!(parse_line("/decline #catpie"), Input::Decline(Some("catpie".into())));
+        assert_eq!(parse_line("/decline catpie"), err("usage: /decline [#room]"));
     }
 
     #[test]
