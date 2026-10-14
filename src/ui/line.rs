@@ -3,10 +3,16 @@
 
 use std::sync::{Arc, Mutex};
 
+use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
-use rustyline::{DefaultEditor, ExternalPrinter as _};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{CompletionType, Config, Context, Editor, ExternalPrinter as _, Helper};
 use tokio::sync::mpsc;
 
+use super::complete::{Candidates, complete};
 use super::render::Style;
 use super::{Ctx, Exit};
 use crate::api::{Command, Conv};
@@ -39,9 +45,37 @@ fn banner_due(entered: bool, from_tui: bool) -> bool {
     entered || from_tui
 }
 
+/// Tab completion for rustyline, from a snapshot the UI task keeps fresh.
+struct CorvoHelper {
+    cands: Arc<Mutex<Candidates>>,
+}
+
+impl Completer for CorvoHelper {
+    type Candidate = String;
+
+    fn complete(&self, line: &str, pos: usize, _: &Context<'_>) -> rustyline::Result<(usize, Vec<String>)> {
+        let cands = self.cands.lock().map(|c| c.clone()).unwrap_or_default();
+        Ok(match complete(&line[..pos], &cands) {
+            // A single match goes in with a space, ready for the next word.
+            Some(c) if c.matches.len() == 1 => (c.start, vec![format!("{} ", c.matches[0])]),
+            Some(c) => (c.start, c.matches),
+            None => (pos, Vec::new()),
+        })
+    }
+}
+
+impl Hinter for CorvoHelper {
+    type Hint = String;
+}
+impl Highlighter for CorvoHelper {}
+impl Validator for CorvoHelper {}
+impl Helper for CorvoHelper {}
+
 pub struct LineFrontend {
     out: std::sync::mpsc::Sender<String>,
     prompt: Arc<Mutex<(String, Option<Conv>)>>,
+    /// What Tab completes from; refreshed with the prompt.
+    cands: Arc<Mutex<Candidates>>,
     lines: mpsc::UnboundedReceiver<Typed>,
     /// Lets the input thread show one prompt. Dropped on shutdown.
     resume: Option<std::sync::mpsc::Sender<()>>,
@@ -56,7 +90,10 @@ impl LineFrontend {
     /// Starts the input thread paused: it shows no prompt (and reads nothing)
     /// until `run` asks, so it never competes with the TUI for the keyboard.
     pub fn new(style: Style, from_tui: bool) -> anyhow::Result<Self> {
-        let mut editor = DefaultEditor::new()?;
+        let cands = Arc::new(Mutex::new(Candidates::default()));
+        let config = Config::builder().completion_type(CompletionType::List).build();
+        let mut editor: Editor<CorvoHelper, DefaultHistory> = Editor::with_config(config)?;
+        editor.set_helper(Some(CorvoHelper { cands: cands.clone() }));
         // The external printer redraws the prompt around output; it needs a real
         // terminal, so piped stdin falls back to plain println.
         let out = match editor.create_external_printer() {
@@ -95,18 +132,26 @@ impl LineFrontend {
                 }
             }
         });
-        Ok(LineFrontend { out, prompt, lines, resume: Some(resume_tx), style, entered: false, from_tui })
+        Ok(LineFrontend { out, prompt, cands, lines, resume: Some(resume_tx), style, entered: false, from_tui })
     }
 
     fn print(&self, s: impl Into<String>) {
         let _ = self.out.send(s.into());
     }
 
-    /// Updates the prompt and lets the input thread show it.
-    fn ready(&self, ctx: &Ctx) {
+    /// Brings the prompt and the completion snapshot up to date.
+    fn sync(&self, ctx: &Ctx) {
         if let Ok(mut p) = self.prompt.lock() {
             *p = ctx.session.prompt_state();
         }
+        if let Ok(mut c) = self.cands.lock() {
+            *c = Candidates::from_store(&ctx.session.store);
+        }
+    }
+
+    /// Updates the prompt and lets the input thread show it.
+    fn ready(&self, ctx: &Ctx) {
+        self.sync(ctx);
         if let Some(resume) = &self.resume {
             let _ = resume.send(());
         }
@@ -129,9 +174,7 @@ impl LineFrontend {
                         if let Some(text) = ctx.session.on_event(&event, now_millis()) {
                             self.print(text);
                         }
-                        if let Ok(mut p) = self.prompt.lock() {
-                            *p = ctx.session.prompt_state();
-                        }
+                        self.sync(ctx);
                     }
                     None => {
                         // A prompt is showing; wait for it to return before exiting.
@@ -187,6 +230,21 @@ mod tests {
         assert!(!readline_gives_up(&glitch(), 1));
         assert!(!readline_gives_up(&glitch(), 2));
         assert!(readline_gives_up(&glitch(), 3));
+    }
+
+    #[test]
+    fn the_completer_uses_the_snapshot() {
+        use rustyline::history::DefaultHistory;
+        let cands =
+            Arc::new(Mutex::new(Candidates { nicks: vec!["bobRoger".into(), "bobKite".into()], rooms: vec![] }));
+        let helper = CorvoHelper { cands: cands.clone() };
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        assert_eq!(helper.complete("hi @bobR", 8, &ctx).unwrap(), (3, vec!["@bobRoger ".to_string()]));
+        assert_eq!(helper.complete("@b", 2, &ctx).unwrap(), (0, vec!["@bobRoger".to_string(), "@bobKite".into()]));
+        assert_eq!(helper.complete("@b and more", 2, &ctx).unwrap().0, 0, "only the text before the cursor counts");
+        cands.lock().unwrap().nicks.clear();
+        assert!(helper.complete("@b", 2, &ctx).unwrap().1.is_empty());
     }
 
     #[test]

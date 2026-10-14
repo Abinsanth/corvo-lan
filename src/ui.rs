@@ -1,6 +1,7 @@
 //! The UI: a shared `Session` and two frontends (line mode and the full-screen
 //! TUI) that take turns owning the terminal.
 
+pub mod complete;
 pub mod input;
 pub mod line;
 pub mod render;
