@@ -59,10 +59,13 @@ function Install-CorvoLan {
         if (Test-Path $exe) {
             try { Move-Item $exe $old; $movedAside = $true } catch { $movedAside = $false }
         }
+        # Copy beside the target and rename, so a failure never leaves half an exe.
         try {
-            Copy-Item -Force $new $exe
+            Copy-Item -Force $new "$exe.new"
+            Move-Item -Force "$exe.new" $exe
         } catch {
-            if ($movedAside) { Move-Item $old $exe }
+            Remove-Item -Force -ErrorAction SilentlyContinue "$exe.new"
+            if ($movedAside) { Move-Item -Force $old $exe }
             throw "corvo-lan install: couldn't write $exe; close corvo-lan and try again"
         }
     } finally {
@@ -70,10 +73,15 @@ function Install-CorvoLan {
     }
 
     Write-Output "installed $(& $exe --version) to $installDir"
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (($userPath -split ';') -notcontains $installDir) {
+    # Read the raw value: the expanded one would freeze %VARS% and turn the
+    # value into a plain string when written back.
+    $key = Get-Item 'HKCU:\Environment'
+    $userPath = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+    $entries = @($userPath -split ';' | ForEach-Object { $_.TrimEnd('\') })
+    if ($entries -notcontains $installDir.TrimEnd('\')) {
         $newPath = if ($userPath) { "$userPath;$installDir" } else { $installDir }
-        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+        Set-ItemProperty -Path 'HKCU:\Environment' -Name Path -Value $newPath -Type ExpandString
+        $env:Path = "$env:Path;$installDir"
         Write-Output ''
         Write-Output "added $installDir to your PATH. Open a new terminal, then run: corvo-lan"
     } else {
