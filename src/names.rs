@@ -14,9 +14,9 @@ pub const MAX_BASE_LEN: usize = 6;
 const MAX_SEEN_BASE_LEN: usize = 9;
 
 /// Command names and a few words that would read as commands or as "everyone".
-pub const RESERVED: [&str; 21] = [
+pub const RESERVED: [&str; 22] = [
     "msg", "chat", "chats", "create", "approve", "deny", "invite", "leave", "rooms", "history", "who", "tui", "line",
-    "help", "quit", "exit", "me", "all", "system", "accept", "decline",
+    "help", "quit", "exit", "me", "all", "system", "accept", "decline", "kick",
 ];
 
 /// A base is what the user types, lowercased: 1–6 ASCII letters or digits, not reserved.
@@ -131,7 +131,7 @@ mod tests {
         assert!(validate_base("élan").is_err());
         assert_eq!(validate_base("chat"), Err("'chat' is reserved".into()));
         assert!(validate_base("exit").is_err());
-        for cmd in ["approve", "deny", "invite", "accept", "decline"] {
+        for cmd in ["approve", "deny", "invite", "accept", "decline", "kick"] {
             assert!(validate_base(cmd).is_err(), "{cmd}");
         }
     }

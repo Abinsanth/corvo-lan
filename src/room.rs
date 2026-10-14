@@ -76,21 +76,38 @@ pub enum RoomBody {
         members: u8,
         max: u8,
     },
-    /// Door channel, approver to a newcomer: the room secret (hex).
+    /// Door channel, approver to a newcomer: the room secret (hex), its epoch,
+    /// who made it, and how often each peer has been kicked from the room.
     Grant {
         secret: String,
         max: u8,
+        epoch: u32,
+        by: PeerId,
+        kicks: Vec<(PeerId, u8)>,
     },
     /// Door channel, member to a newcomer: not let in, because the room is
-    /// `full` or a member said no.
+    /// `full`, a member said no, or they're `banned` (kicked twice).
     Refuse {
         full: bool,
+        banned: bool,
     },
     /// Room channel: a member approves (`yes`) or denies `peer`'s request.
     Vote {
         peer: PeerId,
         asked: u64,
         yes: bool,
+    },
+    /// Room channel: a member wants `peer` out of the room.
+    Kick {
+        peer: PeerId,
+    },
+    /// Room channel, sent to one member at a time, never broadcast: the room's
+    /// new secret (hex), made by `by`, with the kick counts.
+    Rekey {
+        epoch: u32,
+        by: PeerId,
+        secret: String,
+        kicks: Vec<(PeerId, u8)>,
     },
 }
 
@@ -116,18 +133,18 @@ pub fn new_secret() -> Secret {
 /// ~19 MiB): call it off the async actor.
 pub fn derive(name: &str, key: &str) -> RoomKeys {
     let params = Params::new(19_456, 2, 1, Some(32)).expect("valid Argon2 params");
-    let salt = format!("corvo-lan room v4:{name}");
+    let salt = format!("corvo-lan room v5:{name}");
     let mut stretched = [0u8; 32];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
         .hash_password_into(key.as_bytes(), salt.as_bytes(), &mut stretched)
         .expect("salt and output lengths are valid");
-    expand(None, &stretched, b"corvo-lan v4 door-id", b"corvo-lan v4 door-enc")
+    expand(None, &stretched, b"corvo-lan v5 door-id", b"corvo-lan v5 door-enc")
 }
 
 /// The room keys for a room name and its secret. The secret is random, so
 /// no stretching is needed.
 pub fn from_secret(name: &str, secret: &Secret) -> RoomKeys {
-    expand(Some(name.as_bytes()), secret, b"corvo-lan v4 room-id", b"corvo-lan v4 room-enc")
+    expand(Some(name.as_bytes()), secret, b"corvo-lan v5 room-id", b"corvo-lan v5 room-enc")
 }
 
 fn expand(salt: Option<&[u8]>, ikm: &[u8], id_label: &[u8], enc_label: &[u8]) -> RoomKeys {
@@ -269,9 +286,11 @@ mod tests {
         let bodies = [
             RoomBody::Knock { nonce: "ab".into(), asked: 5 },
             RoomBody::Door { echo: "ab".into(), members: 3, max: 13 },
-            RoomBody::Grant { secret: to_hex(&[1; 32]), max: 4 },
-            RoomBody::Refuse { full: true },
+            RoomBody::Grant { secret: to_hex(&[1; 32]), max: 4, epoch: 2, by: ALICE, kicks: vec![(BOB, 1)] },
+            RoomBody::Refuse { full: false, banned: true },
             RoomBody::Vote { peer: BOB, asked: 5, yes: false },
+            RoomBody::Kick { peer: BOB },
+            RoomBody::Rekey { epoch: 3, by: ALICE, secret: to_hex(&[2; 32]), kicks: vec![] },
         ];
         for body in bodies {
             let env = RoomEnvelope { ts: 1, body };

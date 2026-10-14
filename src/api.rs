@@ -58,6 +58,11 @@ pub enum Command {
         room: String,
         nick: String,
     },
+    /// Our vote to remove `nick` from `room`.
+    Kick {
+        room: String,
+        nick: String,
+    },
     /// While picking our name: show the name `base` would get.
     PreviewName {
         base: String,
@@ -100,6 +105,8 @@ pub enum JoinEnd {
     },
     /// Nobody let us in within `PENDING_FOR`.
     TimedOut,
+    /// Kicked from this room twice.
+    Banned,
 }
 
 /// Why someone's request to join one of our rooms is closed.
@@ -221,6 +228,27 @@ pub enum Event {
     MemberLeft {
         room: String,
         nick: String,
+    },
+    /// `room` moved to a new key because someone left or was removed.
+    Rekeyed {
+        room: String,
+    },
+    /// `by` voted to remove `nick` from `room`; `have` of `need` votes so far.
+    KickVote {
+        room: String,
+        nick: String,
+        by: String,
+        have: u8,
+        need: u8,
+    },
+    /// `nick` was voted out of `room`.
+    MemberRemoved {
+        room: String,
+        nick: String,
+    },
+    /// We were voted out of `room`; it's closed as if we'd left.
+    Removed {
+        room: String,
     },
     /// `you`/`nick` are ours, so `/who` can show our fingerprint.
     Peers {

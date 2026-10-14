@@ -23,6 +23,9 @@ use crate::names;
 use crate::protocol::{Frame, PeerId, now_millis};
 use crate::room::{self, ReplayGuard, RoomBody, RoomEnvelope, RoomId, RoomKeys, Secret};
 
+mod kick;
+mod rekey;
+
 /// Rooms you can be in at once, counting ones you're creating or waiting to get into.
 pub const MAX_ROOMS: usize = 3;
 pub const MIN_MEMBERS: u8 = 2;
@@ -99,16 +102,39 @@ struct Request {
     admitted: Option<Instant>,
 }
 
+/// A room's secret and where it came from.
+struct Keying {
+    secret: Secret,
+    /// Bumped by every re-key.
+    epoch: u32,
+    /// Who made the secret; when two re-keys cross, the lower id wins.
+    by: PeerId,
+    /// Times each peer has been kicked from the room.
+    kicks: HashMap<PeerId, u8>,
+}
+
 struct Room {
     name: String,
     /// The 6-character join key, for invitations.
     key: String,
     max: u8,
     secret: Secret,
+    /// Bumped by every re-key; with `keyed_by`, decides between crossing re-keys.
+    epoch: u32,
+    /// Who made the current secret.
+    keyed_by: PeerId,
+    /// Times each peer has been kicked from this room; kept after they leave.
+    kicks: HashMap<PeerId, u8>,
+    /// Live kick votes: target → voter → when.
+    kick_votes: HashMap<PeerId, HashMap<PeerId, Instant>>,
     keys: RoomKeys,
     door: RoomKeys,
     /// Other members, all proven.
     members: HashMap<PeerId, Member>,
+    /// Peers removed from the room, and when. For `GONE_FOR` they can't
+    /// prove themselves under any key, so the re-key that leaves them out
+    /// lands first; letting them back in through the door ends it sooner.
+    gone: HashMap<PeerId, Instant>,
     challenges: HashMap<PeerId, Challenge>,
     requests: HashMap<PeerId, Request>,
     /// Recently closed requests (their `asked`, and when), so a vote still on
@@ -119,9 +145,32 @@ struct Room {
     replay: ReplayGuard,
     door_replay: ReplayGuard,
     told_alone: bool,
+    /// A re-key timer is running; the epoch when it started.
+    rekey_pending: Option<u32>,
+    /// If our epoch is still the noted one at that moment, re-key ourselves.
+    rekey_backup: Option<(Instant, u32)>,
+    /// Keys we moved away from lately.
+    previous: Vec<rekey::OldKey>,
+    /// When we last re-sent the key to someone still on an old one.
+    resent: HashMap<PeerId, Instant>,
 }
 
 impl Room {
+    /// The kick counts as `Grant` and `Rekey` carry them, in a stable order.
+    fn kick_list(&self) -> Vec<(PeerId, u8)> {
+        let mut list: Vec<(PeerId, u8)> = self.kicks.iter().map(|(p, n)| (*p, *n)).collect();
+        list.sort();
+        list
+    }
+
+    /// Takes in another member's counts; the higher count wins.
+    fn merge_kicks(&mut self, kicks: &[(PeerId, u8)]) {
+        for (peer, n) in kicks {
+            let count = self.kicks.entry(*peer).or_default();
+            *count = (*count).max(*n);
+        }
+    }
+
     /// Members including us.
     fn size(&self) -> usize {
         self.members.len() + 1
@@ -188,6 +237,8 @@ pub(super) struct Rooms {
     invited: HashMap<(RoomId, PeerId), Instant>,
     /// Invitations to us, oldest first.
     invites: Vec<Invite>,
+    /// Ids our rooms had before their latest re-keys → their ids now.
+    old_ids: HashMap<RoomId, RoomId>,
 }
 
 impl Rooms {
@@ -199,6 +250,11 @@ impl Rooms {
         self.deriving.contains_key(name)
             || self.joined.values().any(|r| r.name == name)
             || self.joining.values().any(|p| p.name == name)
+    }
+
+    /// `id`, or what it became if the room has re-keyed since.
+    fn current_id(&self, id: RoomId) -> RoomId {
+        if self.joined.contains_key(&id) { id } else { self.old_ids.get(&id).copied().unwrap_or(id) }
     }
 
     fn id_of(&self, name: &str) -> Option<RoomId> {
@@ -299,7 +355,8 @@ impl Node {
         }
         match job {
             Job::Create { name, key, max } => {
-                self.hold_room(name.clone(), key.clone(), max, room::new_secret(), door, HashMap::new());
+                let keying = Keying { secret: room::new_secret(), epoch: 0, by: self.id, kicks: HashMap::new() };
+                self.hold_room(name.clone(), key.clone(), max, keying, door, HashMap::new());
                 self.emit(Event::RoomCreated { name, key, max });
             }
             Job::Join { name, key } => {
@@ -329,21 +386,26 @@ impl Node {
         name: String,
         key: String,
         max: u8,
-        secret: Secret,
+        keying: Keying,
         door: RoomKeys,
         members: HashMap<PeerId, Member>,
     ) -> RoomId {
-        let keys = room::from_secret(&name, &secret);
+        let keys = room::from_secret(&name, &keying.secret);
         let id = keys.id;
         self.rooms.doors.insert(door.id, id);
         let room = Room {
             name,
             key,
             max,
-            secret,
+            secret: keying.secret,
+            epoch: keying.epoch,
+            keyed_by: keying.by,
+            kicks: keying.kicks,
+            kick_votes: HashMap::new(),
             keys,
             door,
             members,
+            gone: HashMap::new(),
             challenges: HashMap::new(),
             requests: HashMap::new(),
             closed: HashMap::new(),
@@ -351,6 +413,10 @@ impl Node {
             replay: ReplayGuard::default(),
             door_replay: ReplayGuard::default(),
             told_alone: false,
+            rekey_pending: None,
+            rekey_backup: None,
+            previous: Vec::new(),
+            resent: HashMap::new(),
         };
         self.rooms.joined.insert(id, room);
         id
@@ -393,6 +459,7 @@ impl Node {
         };
         if let Some(room) = self.rooms.joined.remove(&id) {
             self.rooms.doors.remove(&room.door.id);
+            self.rooms.old_ids.retain(|_, current| *current != id);
             self.broadcast(self.seal(&room.keys, RoomBody::Leave));
             self.emit(Event::RoomLeft { name: room.name });
         }
@@ -449,6 +516,9 @@ impl Node {
         let room = &self.rooms.joined[&id];
         if room.members.contains_key(&peer) {
             return self.emit(Event::Error(format!("@{nick} is already in #{name}")));
+        }
+        if room.banned(peer) {
+            return self.emit(Event::Error(format!("@{nick} is banned from #{name}")));
         }
         self.send_to(peer, Frame::Invite { room: name.to_string(), key: room.key.clone() });
         self.rooms.invited.insert((id, peer), Instant::now());
@@ -572,7 +642,7 @@ impl Node {
         let vote = RoomBody::Vote { peer, asked: request.asked, yes: false };
         let (keys, door) = (room.keys.clone(), room.door.clone());
         self.broadcast(self.seal(&keys, vote));
-        self.send_to(peer, self.seal(&door, RoomBody::Refuse { full: false }));
+        self.send_to(peer, self.seal(&door, RoomBody::Refuse { full: false, banned: false }));
         let by = self.my_nick();
         self.emit(Event::RequestEnded { room: name.into(), nick: nick.into(), why: RequestEnd::Denied { by } });
     }
@@ -580,6 +650,7 @@ impl Node {
     /// Lets in, in order of asking, whoever has enough approvals while slots
     /// last; refuses the rest as full. Approvers send the secret or the refusal.
     pub(super) fn settle(&mut self, id: RoomId) {
+        let id = self.rooms.current_id(id);
         let me = self.id;
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
@@ -601,6 +672,7 @@ impl Node {
                 free -= 1;
                 let request = room.requests.get_mut(&peer).expect("listed above");
                 request.admitted = Some(now);
+                room.gone.remove(&peer);
                 if request.approvals.contains(&me) {
                     grants.push(peer);
                 }
@@ -609,13 +681,19 @@ impl Node {
             }
         }
         let (name, door, max) = (room.name.clone(), room.door.clone(), room.max);
-        let secret = room::to_hex(&room.secret);
+        let grant = RoomBody::Grant {
+            secret: room::to_hex(&room.secret),
+            max,
+            epoch: room.epoch,
+            by: room.keyed_by,
+            kicks: room.kick_list(),
+        };
         for peer in grants {
-            self.send_to(peer, self.seal(&door, RoomBody::Grant { secret: secret.clone(), max }));
+            self.send_to(peer, self.seal(&door, grant.clone()));
         }
         for (peer, approved) in refusals {
             if approved {
-                self.send_to(peer, self.seal(&door, RoomBody::Refuse { full: true }));
+                self.send_to(peer, self.seal(&door, RoomBody::Refuse { full: true, banned: false }));
             }
             if let Some(nick) = self.nick_of(peer) {
                 self.emit(Event::RequestEnded { room: name.clone(), nick, why: RequestEnd::Full });
@@ -643,6 +721,8 @@ impl Node {
                 return;
             }
             self.on_room_envelope(id, from, env, now);
+        } else if let Some(&current) = self.rooms.old_ids.get(&id) {
+            self.on_old_key_frame(current, id, from, nonce, ct, now);
         } else if let Some(&room_id) = self.rooms.doors.get(&id) {
             let Some(room) = self.rooms.joined.get_mut(&room_id) else {
                 return;
@@ -687,10 +767,14 @@ impl Node {
         match env.body {
             RoomBody::Knock { nonce, asked } => {
                 let door = room.door.clone();
+                if room.banned(from) {
+                    self.send_to(from, self.seal(&door, RoomBody::Refuse { full: false, banned: true }));
+                    return;
+                }
                 if let Some(request) = room.requests.get_mut(&from) {
                     request.seen = now;
                 } else if room.full() {
-                    self.send_to(from, self.seal(&door, RoomBody::Refuse { full: true }));
+                    self.send_to(from, self.seal(&door, RoomBody::Refuse { full: true, banned: false }));
                     return;
                 } else if room.requests.len() < MAX_REQUESTS {
                     let request = Request { asked, seen: now, approvals: HashSet::new(), admitted: None };
@@ -740,7 +824,7 @@ impl Node {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
-        if peer == me || room.members.contains_key(&peer) {
+        if peer == me || room.members.contains_key(&peer) || room.banned(peer) {
             return;
         }
         let name = room.name.clone();
@@ -796,7 +880,7 @@ impl Node {
                 self.emit(Event::JoinWaiting { name, members, needs });
                 self.after(PENDING_FOR, NodeMsg::JoinExpired(door, attempt));
             }
-            RoomBody::Grant { secret, max } => {
+            RoomBody::Grant { secret, max, epoch, by, kicks } => {
                 let Some(secret) = room::from_hex(&secret).and_then(|s| Secret::try_from(s).ok()) else {
                     return;
                 };
@@ -810,7 +894,8 @@ impl Node {
                 let granter = Member { seen: now, floor: env.ts.saturating_sub(PROOF_GRACE_MS) };
                 let members = HashMap::from([(from, granter)]);
                 let (name, key) = (p.name.clone(), p.key.clone());
-                let id = self.hold_room(p.name, p.key, max, secret, p.door, members);
+                let keying = Keying { secret, epoch, by, kicks: kicks.into_iter().collect() };
+                let id = self.hold_room(p.name, p.key, max, keying, p.door, members);
                 let probe = fresh_nonce();
                 if let Some(room) = self.rooms.joined.get_mut(&id) {
                     room.probe = Some(probe.clone());
@@ -820,12 +905,13 @@ impl Node {
                 let members = self.nick_of(from).into_iter().collect();
                 self.emit(Event::RoomJoined { name, key, max, members });
             }
-            RoomBody::Refuse { full } => {
+            RoomBody::Refuse { full, banned } => {
                 let Some(p) = self.rooms.joining.remove(&door) else {
                     return;
                 };
-                let why = match (full, self.nick_of(from)) {
-                    (false, Some(by)) => JoinEnd::Denied { by },
+                let why = match (banned, full, self.nick_of(from)) {
+                    (true, _, _) => JoinEnd::Banned,
+                    (false, false, Some(by)) => JoinEnd::Denied { by },
                     _ => JoinEnd::Full,
                 };
                 self.emit(Event::JoinEnded { name: p.name, why });
@@ -839,6 +925,10 @@ impl Node {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
+        // Whoever was removed may hold this key, even a newer one made before their removal was seen.
+        if room.gone.get(&from).is_some_and(|at| now.saturating_duration_since(*at) < rekey::GONE_FOR) {
+            return;
+        }
         // Anyone may probe, member or not: answer privately, echoing their nonce.
         if let RoomBody::Probe { nonce } = &env.body {
             let reply = RoomBody::Here { name: room.name.clone(), echo: Some(nonce.clone()) };
@@ -852,7 +942,7 @@ impl Node {
         }
         // Unknown sender: is this the answer to our challenge, or to the probe we sent on arrival?
         let proven = match (&env.body, room.challenges.get(&from)) {
-            (RoomBody::Here { name, echo: Some(e) }, c) if *name == room.name => {
+            (RoomBody::Here { name, echo: Some(e) }, c) if *name == room.name && !room.banned(from) => {
                 c.is_some_and(|c| c.nonce == *e) || room.probe.as_ref() == Some(e)
             }
             _ => false,
@@ -923,6 +1013,8 @@ impl Node {
             }
             RoomBody::Leave => self.drop_member(id, from),
             RoomBody::Vote { peer, asked, yes } => self.on_vote(id, from, peer, asked, yes, now),
+            RoomBody::Rekey { epoch, by, secret, kicks } => self.on_rekey(id, epoch, by, &secret, &kicks),
+            RoomBody::Kick { peer } => self.on_kick_vote(id, from, peer, now),
             _ => {}
         }
     }
@@ -939,16 +1031,28 @@ impl Node {
         }
     }
 
-    fn drop_member(&mut self, id: RoomId, member: PeerId) {
+    /// Takes `member` out of room `id`, starting a re-key; true if they were a
+    /// member. For `GONE_FOR` they only get back in through the door.
+    fn forget_member(&mut self, id: RoomId, member: PeerId) -> bool {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
-            return;
+            return false;
         };
         room.challenges.remove(&member);
-        if room.members.remove(&member).is_some() {
-            let room = room.name.clone();
-            if let Some(nick) = self.nick_of(member) {
-                self.emit(Event::MemberLeft { room, nick });
-            }
+        room.kick_votes.remove(&member);
+        let was = room.members.remove(&member).is_some();
+        if was {
+            room.gone.insert(member, Instant::now());
+            self.schedule_rekey(id);
+        }
+        was
+    }
+
+    fn drop_member(&mut self, id: RoomId, member: PeerId) {
+        if self.forget_member(id, member)
+            && let Some(room) = self.rooms.joined.get(&id)
+            && let Some(nick) = self.nick_of(member)
+        {
+            self.emit(Event::MemberLeft { room: room.name.clone(), nick });
         }
     }
 
@@ -994,10 +1098,31 @@ impl Node {
         for (id, peer) in stale {
             self.close_request(id, peer, RequestEnd::Gone);
         }
+        let backups: Vec<RoomId> = self
+            .rooms
+            .joined
+            .iter()
+            .filter(|(_, r)| r.rekey_backup.is_some_and(|(at, epoch)| now >= at && r.epoch == epoch))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in backups {
+            self.rekey(id);
+        }
         for room in self.rooms.joined.values_mut() {
             room.challenges.retain(|_, c| now.saturating_duration_since(c.started) < CHALLENGE_TIMEOUT);
             room.closed.retain(|_, (_, at)| now.saturating_duration_since(*at) < REQUEST_STALE);
+            room.previous.retain(|k| now < k.until);
+            room.resent.retain(|_, at| now.saturating_duration_since(*at) < HERE_INTERVAL);
+            room.gone.retain(|_, at| now.saturating_duration_since(*at) < rekey::GONE_FOR);
+            room.kick_votes.retain(|_, votes| {
+                votes.retain(|_, at| now.saturating_duration_since(*at) < kick::KICK_VOTE_FOR);
+                !votes.is_empty()
+            });
         }
+        let joined = &self.rooms.joined;
+        self.rooms
+            .old_ids
+            .retain(|old, current| joined.get(current).is_some_and(|r| r.previous.iter().any(|k| k.keys.id == *old)));
         let mut knocks = Vec::new();
         for p in self.rooms.joining.values_mut() {
             if p.waiting && now.saturating_duration_since(p.last_knock) >= KNOCK_EVERY {
@@ -1019,62 +1144,62 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{BOB, CAROL, Harness, ME};
+    pub(super) use super::super::tests::{BOB, CAROL, Harness, ME};
     use super::*;
     use crate::api::{Command, JoinEnd, RequestEnd, Target};
     use crate::protocol::Frame;
 
-    const DAVE: PeerId = PeerId::test(0x4000_0000_0000_0000);
-    const ERIN: PeerId = PeerId::test(0x5000_0000_0000_0000);
-    const NAME: &str = "catpie";
-    const KEY: &str = "k7m9xq";
-    const SECRET: room::Secret = [9; 32];
+    pub(super) const DAVE: PeerId = PeerId::test(0x4000_0000_0000_0000);
+    pub(super) const ERIN: PeerId = PeerId::test(0x5000_0000_0000_0000);
+    pub(super) const NAME: &str = "catpie";
+    pub(super) const KEY: &str = "k7m9xq";
+    pub(super) const SECRET: room::Secret = [9; 32];
 
     /// The door keys a newcomer derives for `NAME` and `KEY`.
-    fn door() -> RoomKeys {
+    pub(super) fn door() -> RoomKeys {
         room::derive(NAME, KEY)
     }
 
-    fn here(name: &str, echo: Option<&str>) -> RoomBody {
+    pub(super) fn here(name: &str, echo: Option<&str>) -> RoomBody {
         RoomBody::Here { name: name.into(), echo: echo.map(String::from) }
     }
 
     /// A room frame as `from` would send it, stamped `ts`.
-    fn frame_at(from: PeerId, keys: &RoomKeys, ts: u64, body: RoomBody) -> Frame {
+    pub(super) fn frame_at(from: PeerId, keys: &RoomKeys, ts: u64, body: RoomBody) -> Frame {
         room::seal(keys, from, &RoomEnvelope { ts, body })
     }
 
-    fn frame_from(from: PeerId, keys: &RoomKeys, body: RoomBody) -> Frame {
+    pub(super) fn frame_from(from: PeerId, keys: &RoomKeys, body: RoomBody) -> Frame {
         frame_at(from, keys, now_millis(), body)
     }
 
-    fn deliver(h: &mut Harness, from: PeerId, frame: Frame) {
+    pub(super) fn deliver(h: &mut Harness, from: PeerId, frame: Frame) {
         let conn = h.node.peers[&from].conn;
         h.node.on_frame(conn, from, frame);
     }
 
-    fn open_body(keys: &RoomKeys, frame: &Frame) -> RoomBody {
+    pub(super) fn open_body(keys: &RoomKeys, frame: &Frame) -> RoomBody {
         try_open(keys, frame).unwrap_or_else(|| panic!("doesn't open: {frame:?}"))
     }
 
-    fn try_open(keys: &RoomKeys, frame: &Frame) -> Option<RoomBody> {
+    pub(super) fn try_open(keys: &RoomKeys, frame: &Frame) -> Option<RoomBody> {
         let Frame::Room { nonce, ct, .. } = frame else { return None };
         room::open(keys, ME, nonce, ct).map(|(env, _)| env.body)
     }
 
     /// The bodies among `frames` that open with `keys`.
-    fn bodies(keys: &RoomKeys, frames: &[Frame]) -> Vec<RoomBody> {
+    pub(super) fn bodies(keys: &RoomKeys, frames: &[Frame]) -> Vec<RoomBody> {
         frames.iter().filter_map(|f| try_open(keys, f)).collect()
     }
 
-    fn probe_nonce(keys: &RoomKeys, frame: &Frame) -> String {
+    pub(super) fn probe_nonce(keys: &RoomKeys, frame: &Frame) -> String {
         match open_body(keys, frame) {
             RoomBody::Probe { nonce } => nonce,
             other => panic!("expected a probe, got {other:?}"),
         }
     }
 
-    fn with_peers() -> Harness {
+    pub(super) fn with_peers() -> Harness {
         let mut h = Harness::new();
         h.connect(BOB, "bobroger", true);
         h.connect(CAROL, "carolwolf", true);
@@ -1084,15 +1209,59 @@ mod tests {
         h
     }
 
-    struct Made {
-        name: String,
-        key: String,
-        id: RoomId,
-        keys: RoomKeys,
-        door: RoomKeys,
+    pub(super) struct Made {
+        pub(super) name: String,
+        pub(super) key: String,
+        pub(super) id: RoomId,
+        pub(super) keys: RoomKeys,
+        pub(super) door: RoomKeys,
     }
 
-    async fn create(h: &mut Harness, max: u8) -> Made {
+    /// Lower than `ME`, so re-keying is its job, not ours.
+    pub(super) const ZED: PeerId = PeerId::test(1);
+    pub(super) const FRED: PeerId = PeerId::test(0x6000_0000_0000_0000);
+    pub(super) const GWEN: PeerId = PeerId::test(0x7000_0000_0000_0000);
+
+    /// A room we made, with every one of `members` proven; events and sends so far drained.
+    pub(super) async fn room_with(h: &mut Harness, members: &[PeerId]) -> Made {
+        let made = create(h, 13).await;
+        for m in members {
+            verify(h, *m, &made.name, &made.keys);
+        }
+        h.events();
+        for m in members {
+            h.sent(*m);
+        }
+        made
+    }
+
+    pub(super) fn room_of<'a>(h: &'a Harness, name: &str) -> &'a Room {
+        &h.node.rooms.joined[&h.node.rooms.id_of(name).expect("in the room")]
+    }
+
+    /// Room `name`'s keys right now.
+    pub(super) fn keys_now(h: &Harness, name: &str) -> RoomKeys {
+        room_of(h, name).keys.clone()
+    }
+
+    /// The `Rekey`s among `frames` that open with `keys`: (epoch, maker, secret).
+    pub(super) fn rekeys(keys: &RoomKeys, frames: &[Frame]) -> Vec<(u32, PeerId, Secret)> {
+        bodies(keys, frames)
+            .into_iter()
+            .filter_map(|b| match b {
+                RoomBody::Rekey { epoch, by, secret, .. } => {
+                    Some((epoch, by, room::from_hex(&secret).unwrap().try_into().unwrap()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(super) fn rekey_body(epoch: u32, by: PeerId, secret: Secret) -> RoomBody {
+        RoomBody::Rekey { epoch, by, secret: room::to_hex(&secret), kicks: vec![] }
+    }
+
+    pub(super) async fn create(h: &mut Harness, max: u8) -> Made {
         let name = names::pick_name("cat", |n| h.node.rooms.holds(n)).unwrap();
         h.node.handle_command(Command::CreateRoom { name: name.clone(), max });
         h.pump().await;
@@ -1111,27 +1280,27 @@ mod tests {
     }
 
     /// `member` announces itself, answers our challenge, and becomes a member.
-    fn verify(h: &mut Harness, member: PeerId, name: &str, keys: &RoomKeys) {
+    pub(super) fn verify(h: &mut Harness, member: PeerId, name: &str, keys: &RoomKeys) {
         deliver(h, member, frame_from(member, keys, here(name, None)));
         let challenge = probe_nonce(keys, h.sent(member).last().expect("challenge sent"));
         deliver(h, member, frame_from(member, keys, here(name, Some(&challenge))));
     }
 
-    fn knock(h: &mut Harness, from: PeerId, made: &Made, asked: u64) {
+    pub(super) fn knock(h: &mut Harness, from: PeerId, made: &Made, asked: u64) {
         deliver(h, from, frame_from(from, &made.door, RoomBody::Knock { nonce: "n1".into(), asked }));
     }
 
-    fn approve(h: &mut Harness, made: &Made, nick: &str) {
+    pub(super) fn approve(h: &mut Harness, made: &Made, nick: &str) {
         h.node.handle_command(Command::Approve { room: made.name.clone(), nick: nick.into() });
     }
 
-    fn vote(h: &mut Harness, from: PeerId, made: &Made, peer: PeerId, yes: bool) {
+    pub(super) fn vote(h: &mut Harness, from: PeerId, made: &Made, peer: PeerId, yes: bool) {
         deliver(h, from, frame_from(from, &made.keys, RoomBody::Vote { peer, asked: 100, yes }));
     }
 
-    fn granted(made: &Made, frames: &[Frame]) -> bool {
+    pub(super) fn granted(made: &Made, frames: &[Frame]) -> bool {
         bodies(&made.door, frames).iter().any(|b| match b {
-            RoomBody::Grant { secret, max } => {
+            RoomBody::Grant { secret, max, .. } => {
                 let secret: room::Secret = room::from_hex(secret).unwrap().try_into().unwrap();
                 assert_eq!(room::from_secret(&made.name, &secret).id, made.keys.id, "the real secret");
                 assert!(*max >= MIN_MEMBERS);
@@ -1141,11 +1310,11 @@ mod tests {
         })
     }
 
-    fn refused(made: &Made, frames: &[Frame], full: bool) -> bool {
-        bodies(&made.door, frames).contains(&RoomBody::Refuse { full })
+    pub(super) fn refused(made: &Made, frames: &[Frame], full: bool) -> bool {
+        bodies(&made.door, frames).contains(&RoomBody::Refuse { full, banned: false })
     }
 
-    fn request_ended(room: &str, nick: &str, why: RequestEnd) -> Event {
+    pub(super) fn request_ended(room: &str, nick: &str, why: RequestEnd) -> Event {
         Event::RequestEnded { room: room.into(), nick: nick.into(), why }
     }
 
@@ -1208,6 +1377,22 @@ mod tests {
     }
 
     // ---- members: requests and votes ----
+
+    #[tokio::test(start_paused = true)]
+    async fn a_grant_carries_the_epoch_its_maker_and_kick_counts() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        h.node.rooms.joined.get_mut(&made.id).unwrap().kicks.insert(DAVE, 1);
+        knock(&mut h, BOB, &made, 100);
+        approve(&mut h, &made, "bobroger");
+        h.pump().await; // Settle
+        let grant = bodies(&made.door, &h.sent(BOB))
+            .into_iter()
+            .find(|b| matches!(b, RoomBody::Grant { .. }))
+            .expect("granted");
+        let RoomBody::Grant { epoch, by, kicks, .. } = grant else { unreachable!() };
+        assert_eq!((epoch, by, kicks), (0, ME, vec![(DAVE, 1)]));
+    }
 
     #[tokio::test]
     async fn knock_gets_a_private_door_reply_and_announces_once() {
@@ -1468,8 +1653,21 @@ mod tests {
 
     // ---- newcomers ----
 
+    #[tokio::test(start_paused = true)]
+    async fn a_newcomer_keeps_what_its_grant_carried() {
+        let mut h = with_peers();
+        let (nonce, _) = start_join(&mut h).await;
+        door_says(&mut h, BOB, &nonce, 2, 13);
+        let grant =
+            RoomBody::Grant { secret: room::to_hex(&SECRET), max: 13, epoch: 3, by: CAROL, kicks: vec![(DAVE, 1)] };
+        deliver(&mut h, BOB, frame_from(BOB, &door(), grant));
+        let room = &h.node.rooms.joined[&h.node.rooms.id_of(NAME).unwrap()];
+        assert_eq!((room.epoch, room.keyed_by), (3, CAROL));
+        assert_eq!(room.kicks.get(&DAVE), Some(&1));
+    }
+
     /// Starts joining `NAME`; returns the knock's nonce and ask time.
-    async fn start_join(h: &mut Harness) -> (String, u64) {
+    pub(super) async fn start_join(h: &mut Harness) -> (String, u64) {
         h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: KEY.into() });
         h.pump().await; // Derived
         h.sent(CAROL);
@@ -1479,7 +1677,7 @@ mod tests {
         }
     }
 
-    fn door_says(h: &mut Harness, from: PeerId, nonce: &str, members: u8, max: u8) {
+    pub(super) fn door_says(h: &mut Harness, from: PeerId, nonce: &str, members: u8, max: u8) {
         deliver(h, from, frame_from(from, &door(), RoomBody::Door { echo: nonce.into(), members, max }));
     }
 
@@ -1493,7 +1691,7 @@ mod tests {
         door_says(&mut h, DAVE, "stale", 4, 13);
         assert!(h.events().is_empty(), "announced once");
 
-        let grant = RoomBody::Grant { secret: room::to_hex(&SECRET), max: 13 };
+        let grant = RoomBody::Grant { secret: room::to_hex(&SECRET), max: 13, epoch: 0, by: BOB, kicks: vec![] };
         deliver(&mut h, BOB, frame_from(BOB, &door(), grant.clone()));
         assert_eq!(
             h.events(),
@@ -1559,7 +1757,7 @@ mod tests {
         let (nonce, _) = start_join(&mut h).await;
         door_says(&mut h, BOB, &nonce, 2, 13);
         h.events();
-        deliver(&mut h, CAROL, frame_from(CAROL, &door(), RoomBody::Refuse { full: false }));
+        deliver(&mut h, CAROL, frame_from(CAROL, &door(), RoomBody::Refuse { full: false, banned: false }));
         assert_eq!(
             h.events(),
             vec![Event::JoinEnded { name: NAME.into(), why: JoinEnd::Denied { by: "carolwolf".into() } }]
@@ -1567,7 +1765,7 @@ mod tests {
         let (nonce, _) = start_join(&mut h).await;
         door_says(&mut h, BOB, &nonce, 2, 13);
         h.events();
-        deliver(&mut h, BOB, frame_from(BOB, &door(), RoomBody::Refuse { full: true }));
+        deliver(&mut h, BOB, frame_from(BOB, &door(), RoomBody::Refuse { full: true, banned: false }));
         assert_eq!(h.events(), vec![Event::JoinEnded { name: NAME.into(), why: JoinEnd::Full }]);
     }
 
@@ -1581,7 +1779,7 @@ mod tests {
         assert_eq!(h.events(), vec![Event::RoomLeft { name: NAME.into() }]);
         assert_eq!(bodies(&door(), &h.sent(BOB)), vec![RoomBody::Leave]);
         assert_eq!(h.node.rooms.count(), 0);
-        let grant = RoomBody::Grant { secret: room::to_hex(&SECRET), max: 13 };
+        let grant = RoomBody::Grant { secret: room::to_hex(&SECRET), max: 13, epoch: 0, by: BOB, kicks: vec![] };
         deliver(&mut h, BOB, frame_from(BOB, &door(), grant));
         assert!(h.events().is_empty(), "a late grant is ignored");
     }
