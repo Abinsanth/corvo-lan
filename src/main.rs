@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use anyhow::anyhow;
 use clap::Parser;
 
-use corvo_lan::identity::Keys;
+use corvo_lan::identity;
 use corvo_lan::names;
 use corvo_lan::node::{self, NodeConfig};
 use corvo_lan::ui;
@@ -48,8 +48,12 @@ async fn main() -> anyhow::Result<()> {
     let base = args.nick.or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "anon".into());
     names::validate_base(&base).map_err(|e| anyhow!("invalid --nick {base:?}: {e}"))?;
 
+    // Holds the identity lock until the app exits.
+    let identity = identity::load()?;
     let handle = node::start(NodeConfig {
-        keys: Keys::generate(),
+        keys: identity.keys.clone(),
+        known_peers: identity.known_peers.clone(),
+        notice: identity.notice.clone(),
         base,
         listen: SocketAddr::from(([0, 0, 0, 0], args.port)),
         discovery: true,

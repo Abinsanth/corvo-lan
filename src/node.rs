@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -14,6 +15,7 @@ use tracing::{debug, warn};
 use crate::api::{Command, Conv, Event, LeaveReason, PeerInfo, Target};
 use crate::discovery::{self, Sighting};
 use crate::identity::Keys;
+use crate::known::{self, Judgement};
 use crate::names;
 use crate::peer::{self, ConnId, Me};
 use crate::protocol::{Frame, MAX_FRAME_LEN, PeerId, now_millis};
@@ -44,6 +46,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub struct NodeConfig {
     /// This machine's keypair; `keys.public` is our `PeerId`.
     pub keys: Keys,
+    /// Where known peers are saved; `None` keeps them in memory (tests, throwaway identities).
+    pub known_peers: Option<PathBuf>,
+    /// Shown once at startup, e.g. that this run uses a throwaway identity.
+    pub notice: Option<String>,
     /// What the user typed for `--nick`; the system adds a word.
     pub base: String,
     /// TCP listen address; port 0 lets the OS choose.
@@ -148,6 +154,13 @@ pub fn keep_new_connection(me: PeerId, them: PeerId, existing: ConnKey, new: Con
     new.outbound == preferred_outbound
 }
 
+/// A unix-millis time as a local `YYYY-MM-DD`.
+fn day(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "a while ago".into())
+}
+
 struct PeerEntry {
     conn: ConnId,
     nick: String,
@@ -209,6 +222,7 @@ struct Node {
     listener: Option<TcpListener>,
     manual_peers: Vec<SocketAddr>,
     rooms: rooms::Rooms,
+    known: known::Store,
     background: Vec<JoinHandle<()>>,
 }
 
@@ -227,6 +241,14 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
     node.fixed_word = config.fixed_word;
     node.listener = Some(listener);
     node.manual_peers = config.manual_peers;
+    let (store, store_notice) = match config.known_peers {
+        Some(path) => known::Store::load(path),
+        None => (known::Store::in_memory(), None),
+    };
+    node.known = store;
+    for notice in config.notice.into_iter().chain(store_notice) {
+        node.emit(Event::Info(notice));
+    }
 
     if config.discovery {
         let nick_rx = node.nick.subscribe();
@@ -276,6 +298,7 @@ impl Node {
             listener: None,
             manual_peers: Vec::new(),
             rooms: rooms::Rooms::default(),
+            known: known::Store::in_memory(),
             background: Vec::new(),
         }
     }
@@ -368,7 +391,7 @@ impl Node {
                 let mut peers: Vec<PeerInfo> =
                     self.peers.iter().map(|(id, p)| PeerInfo { id: *id, nick: p.nick.clone(), addr: p.addr }).collect();
                 peers.sort_by(|a, b| a.nick.cmp(&b.nick));
-                self.emit(Event::Peers(peers));
+                self.emit(Event::Peers { you: self.id, peers });
             }
             Command::Quit => {} // handled in `run`
         }
@@ -507,11 +530,32 @@ impl Node {
         let nick = entry.nick.clone();
         let clash = nick == self.my_nick();
         self.peers.insert(id, entry);
-        self.emit(Event::PeerJoined { id, nick });
+        self.emit(Event::PeerJoined { id, nick: nick.clone() });
+        self.meet(id, &nick);
         if clash && self.id > id {
             self.reroll_name();
         }
         Verdict::Keep
+    }
+
+    /// Checks a newly joined peer's key against the ones we've met, then remembers it.
+    fn meet(&mut self, id: PeerId, nick: &str) {
+        let online: Vec<PeerId> = self.peers.keys().copied().filter(|k| *k != id).collect();
+        match self.known.judge(id, nick, &online) {
+            Judgement::Known => {}
+            Judgement::FirstMeeting => {
+                self.emit(Event::Info(format!("first time meeting @{nick} ({})", id.fingerprint())));
+            }
+            Judgement::KeyChanged { last_seen } => {
+                let base = names::base_of(nick).unwrap_or(nick);
+                self.emit(Event::Info(format!(
+                    "@{nick} has a different key from the {base} you met before (last seen {}). Compare fingerprints in /who.",
+                    day(last_seen)
+                )));
+            }
+        }
+        self.known.record(id, nick, now_millis());
+        self.known.save();
     }
 
     /// We and a peer drew the same name at the same moment and we have the
@@ -627,6 +671,18 @@ pub(super) mod tests {
         }
 
         pub(in crate::node) fn connect_verdict(&mut self, id: PeerId, nick: &str, key: ConnKey) -> Verdict {
+            // Harness peers are old friends, so joins stay free of key notices.
+            self.node.known.record(id, nick, 0);
+            self.connect_unknown(id, nick, key)
+        }
+
+        /// Connects a peer this node has never met.
+        pub(in crate::node) fn connect_stranger(&mut self, id: PeerId, nick: &str) -> bool {
+            self.connect_unknown(id, nick, ConnKey { outbound: false, dialer_port: 40000 + self.next_conn as u16 })
+                == Verdict::Keep
+        }
+
+        fn connect_unknown(&mut self, id: PeerId, nick: &str, key: ConnKey) -> Verdict {
             let (out, rx) = mpsc::channel(64);
             let conn = self.next_conn;
             self.next_conn += 1;
@@ -940,5 +996,50 @@ pub(super) mod tests {
         assert_eq!(h.connect_verdict(BOB, "bobRoger", out(5000)), Verdict::Keep);
         assert_eq!(h.connect_verdict(BOB, "bobRoger", out(6000)), Verdict::Retire);
         assert_eq!(h.connect_verdict(ME, "annMoon", out(7000)), Verdict::Close);
+    }
+
+    #[test]
+    fn meeting_a_new_key_says_so_once() {
+        let mut h = Harness::new();
+        assert!(h.connect_stranger(BOB, "bobRoger"));
+        let fp = BOB.fingerprint();
+        assert_eq!(
+            h.events(),
+            vec![
+                Event::PeerJoined { id: BOB, nick: "bobRoger".into() },
+                Event::Info(format!("first time meeting @bobRoger ({fp})")),
+            ]
+        );
+        h.node.handle_msg(NodeMsg::PeerGone { conn: 1, id: BOB, reason: LeaveReason::Quit });
+        h.events();
+        assert!(h.connect_stranger(BOB, "bobOtter"));
+        assert_eq!(h.events(), vec![Event::PeerJoined { id: BOB, nick: "bobOtter".into() }]);
+    }
+
+    #[test]
+    fn a_familiar_name_with_a_new_key_warns() {
+        let mut h = Harness::new();
+        h.node.known.record(BOB, "bobRoger", 0);
+        assert!(h.connect_stranger(CAROL, "bobMoon"));
+        let events = h.events();
+        let Some(Event::Info(text)) = events.get(1) else { panic!("{events:?}") };
+        assert!(text.starts_with("@bobMoon has a different key from the bob you met before (last seen "), "{text}");
+        assert!(text.ends_with("). Compare fingerprints in /who."), "{text}");
+    }
+
+    #[test]
+    fn who_includes_our_own_id() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bobRoger", true);
+        h.events();
+        h.node.handle_command(Command::ListPeers);
+        match h.events().as_slice() {
+            [Event::Peers { you, peers }] => {
+                assert_eq!(*you, ME);
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].id, BOB);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

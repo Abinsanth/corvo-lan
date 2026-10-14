@@ -21,6 +21,8 @@ async fn spawn_node(base: &str, peers: &[SocketAddr]) -> Peer {
 async fn spawn_node_with_word(base: &str, peers: &[SocketAddr], word: Option<&str>) -> Peer {
     let mut node = node::start(NodeConfig {
         keys: Keys::generate(),
+        known_peers: None,
+        notice: None,
         base: base.into(),
         listen: "127.0.0.1:0".parse().unwrap(),
         discovery: false,
@@ -228,15 +230,26 @@ async fn crash_is_reported_as_connection_lost() {
 }
 
 #[tokio::test]
-async fn who_lists_connected_peers() {
+async fn who_lists_connected_peers_and_our_fingerprint() {
     let (mut alice, bob) = pair().await;
     send(&alice, Command::ListPeers).await;
-    let Event::Peers(peers) = wait_for(&mut alice.node, "peer list", |e| matches!(e, Event::Peers(_))).await else {
+    let Event::Peers { you, peers } =
+        wait_for(&mut alice.node, "peer list", |e| matches!(e, Event::Peers { .. })).await
+    else {
         unreachable!()
     };
+    assert_eq!(you, alice.node.id);
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0].nick, bob.nick);
     assert_eq!(peers[0].id, bob.node.id);
+}
+
+#[tokio::test]
+async fn meeting_someone_new_shows_their_fingerprint() {
+    let mut alice = spawn_node("alice", &[]).await;
+    let bob = spawn_node("bob", &[alice.node.local_addr]).await;
+    let expected = format!("first time meeting @{} ({})", bob.nick, bob.node.id.fingerprint());
+    wait_for(&mut alice.node, "first meeting", |e| matches!(e, Event::Info(t) if *t == expected)).await;
 }
 
 #[tokio::test]

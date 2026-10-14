@@ -119,7 +119,10 @@ pub enum Event {
         room: String,
         nick: String,
     },
-    Peers(Vec<PeerInfo>),
+    Peers {
+        you: PeerId,
+        peers: Vec<PeerInfo>,
+    },
     /// User-facing problem, e.g. a wrong room key.
     Error(String),
     /// User-facing notice.

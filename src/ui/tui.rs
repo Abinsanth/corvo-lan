@@ -24,7 +24,7 @@ use ratatui::crossterm::terminal::{
 use tokio::sync::mpsc;
 
 use self::state::{Action, Hit, TuiState, WHEEL_STEP, action_for, goes_to_status};
-use super::render::{tone_of, tone_of_text};
+use super::render::{Tone, tone_of, tone_of_text};
 use super::session::{Mode, Reaction, Session};
 use super::{Ctx, Exit};
 use crate::api::{Command, Conv, Event};
@@ -228,7 +228,7 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
         && let Some(text) = text
     {
         state.push_status(now_millis(), &text, tone_of(event));
-        if matches!(event, Event::Error(_)) {
+        if matches!(event, Event::Error(_)) || tone_of(event) == Tone::Warn {
             state.flash(&text, now);
         }
     }
@@ -440,6 +440,10 @@ mod tests {
         assert_eq!(state.scroll.unseen(), 1);
         on_event(&mut s, &mut state, &Event::RoomLeft { name: "catPieR".into() }, now);
         assert!(state.on_status, "leaving the room you're viewing falls back to corvo");
+        let warn = Event::Info("@bobMoon has a different key from the bob you met before (last seen 2026-10-12). Compare fingerprints in /who.".into());
+        let later = now + Duration::from_secs(60);
+        on_event(&mut s, &mut state, &warn, later);
+        assert!(state.flash_text(later).is_some_and(|t| t.contains("different key")), "warnings flash");
     }
 
     #[test]
