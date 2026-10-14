@@ -96,9 +96,9 @@ async fn trio() -> (Peer, Peer, Peer) {
     (alice, bob, carol)
 }
 
-/// `p` creates a room from `base`; returns its (name, key).
+/// `p` creates `{base}pie`; returns its (name, key).
 async fn create_room(p: &mut Peer, base: &str) -> (String, String) {
-    send(p, Command::CreateRoom { base: base.into(), max: 13 }).await;
+    send(p, Command::CreateRoom { name: format!("{base}pie"), max: 13 }).await;
     match wait_for(&mut p.node, "room created", |e| matches!(e, Event::RoomCreated { .. })).await {
         Event::RoomCreated { name, key, .. } => (name, key),
         _ => unreachable!(),

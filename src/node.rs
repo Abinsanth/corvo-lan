@@ -412,7 +412,7 @@ impl Node {
                     Target::Room(name) => self.send_room(&name, text),
                 }
             }
-            Command::CreateRoom { base, max } => self.create_room(&base, max),
+            Command::CreateRoom { name, max } => self.create_room(&name, max),
             Command::JoinRoom { name, key } => self.join_room(&name, &key),
             Command::LeaveRoom { name } => self.leave_room(&name),
             Command::Approve { room, nick } => self.approve(&room, &nick),

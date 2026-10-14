@@ -66,8 +66,10 @@ pub struct Session {
 enum Asking {
     /// Startup: keep the previewed name or type another. Only a name ends it.
     Name { preview: String },
-    /// `/create <base>` without a head count.
-    HeadCount { base: String },
+    /// `/create`, step 1: keep the previewed room name or type another. `max` if typed with it.
+    RoomName { preview: String, max: Option<u8> },
+    /// `/create`, step 2: how many people.
+    HeadCount { name: String },
 }
 
 impl Session {
@@ -102,10 +104,14 @@ impl Session {
             let preview = preview.clone();
             return self.answer_name(&preview, line.trim());
         }
-        if let Some(Asking::HeadCount { base }) = self.asking.take()
+        if let Some(asking) = self.asking.take()
             && !line.trim_start().starts_with('/')
         {
-            return self.answer_head_count(base, line.trim());
+            return match asking {
+                Asking::RoomName { preview, max } => self.answer_room_name(preview, max, line.trim()),
+                Asking::HeadCount { name } => self.answer_head_count(name, line.trim()),
+                Asking::Name { .. } => unreachable!("answered above"),
+            };
         }
         self.on_input(parse_line(line), shown)
     }
@@ -114,8 +120,11 @@ impl Session {
     pub fn prompt(&self) -> Option<String> {
         self.asking.as_ref().map(|asking| match asking {
             Asking::Name { preview } => format!("you'll be @{preview} — Enter to keep it, or type a name"),
-            Asking::HeadCount { base } => format!(
-                "how many people in #{base}…? {MIN_MEMBERS}–{MAX_MEMBERS}, Enter for {MAX_MEMBERS}, Esc to cancel"
+            Asking::RoomName { preview, .. } => {
+                format!("new room #{preview} — Enter to keep it, or type another name")
+            }
+            Asking::HeadCount { name } => format!(
+                "how many people in #{name}? {MIN_MEMBERS}–{MAX_MEMBERS}, Enter for {MAX_MEMBERS}, Esc to cancel"
             ),
         })
     }
@@ -146,14 +155,47 @@ impl Session {
         }
     }
 
-    fn answer_head_count(&mut self, base: String, answer: &str) -> Reaction {
+    /// Offers a room name for `base` that isn't one of ours.
+    fn preview_room(&mut self, base: &str, max: Option<u8>) -> Reaction {
+        if let Err(e) = crate::names::validate_base(base) {
+            return Reaction::say(format!("! {e}"));
+        }
+        let picked = crate::names::pick_name(base, |n| self.store.get(&Conv::Room(n.to_string())).is_some());
+        match picked {
+            Some(preview) => {
+                self.asking = Some(Asking::RoomName { preview, max });
+                Reaction::default()
+            }
+            None => Reaction::say(format!("! you're already in every #{base}… room")),
+        }
+    }
+
+    /// Enter keeps the preview; a name asks for a new one (a bad one keeps the old).
+    fn answer_room_name(&mut self, preview: String, max: Option<u8>, answer: &str) -> Reaction {
+        if !answer.is_empty() {
+            let reaction = self.preview_room(&answer.to_ascii_lowercase(), max);
+            if self.asking.is_none() {
+                self.asking = Some(Asking::RoomName { preview, max });
+            }
+            return reaction;
+        }
+        match max {
+            Some(max) => Reaction::send(Command::CreateRoom { name: preview, max }),
+            None => {
+                self.asking = Some(Asking::HeadCount { name: preview });
+                Reaction::default()
+            }
+        }
+    }
+
+    fn answer_head_count(&mut self, name: String, answer: &str) -> Reaction {
         if answer.is_empty() {
-            return Reaction::send(Command::CreateRoom { base, max: MAX_MEMBERS });
+            return Reaction::send(Command::CreateRoom { name, max: MAX_MEMBERS });
         }
         match answer.parse::<u8>() {
-            Ok(max) if (MIN_MEMBERS..=MAX_MEMBERS).contains(&max) => Reaction::send(Command::CreateRoom { base, max }),
+            Ok(max) if (MIN_MEMBERS..=MAX_MEMBERS).contains(&max) => Reaction::send(Command::CreateRoom { name, max }),
             _ => {
-                self.asking = Some(Asking::HeadCount { base });
+                self.asking = Some(Asking::HeadCount { name });
                 Reaction::say(format!(
                     "! a room holds {MIN_MEMBERS}–{MAX_MEMBERS} people — type a number, or Esc to cancel"
                 ))
@@ -211,19 +253,14 @@ impl Session {
                 Ok(Conv::Room(_)) => Reaction::default(),
                 Err(e) => Reaction::say(format!("! {e}")),
             },
-            Input::Create { base, max } => match max.as_deref().map(str::parse::<u8>) {
-                None => match crate::names::validate_base(&base) {
-                    Ok(()) => {
-                        self.asking = Some(Asking::HeadCount { base });
-                        Reaction::default()
-                    }
-                    Err(e) => Reaction::say(format!("! {e}")),
-                },
-                Some(Ok(max)) if (MIN_MEMBERS..=MAX_MEMBERS).contains(&max) => {
-                    Reaction::send(Command::CreateRoom { base, max })
-                }
-                Some(_) => Reaction::say(format!("! a room holds {MIN_MEMBERS}–{MAX_MEMBERS} people")),
-            },
+            Input::Create { base, max } => {
+                let max = match max.as_deref().map(str::parse::<u8>) {
+                    None => None,
+                    Some(Ok(max)) if (MIN_MEMBERS..=MAX_MEMBERS).contains(&max) => Some(max),
+                    Some(_) => return Reaction::say(format!("! a room holds {MIN_MEMBERS}–{MAX_MEMBERS} people")),
+                };
+                self.preview_room(&base, max)
+            }
             Input::Invite(room) => {
                 let Some(room) = room.or_else(|| match self.store.current() {
                     Some(Conv::Room(name)) => Some(name.clone()),
@@ -413,7 +450,9 @@ mod tests {
     #[test]
     fn creating_or_joining_a_room_switches_to_it() {
         let mut s = session();
-        assert_eq!(typed(&mut s, "/create cat 5"), Reaction::send(Command::CreateRoom { base: "cat".into(), max: 5 }));
+        assert_eq!(typed(&mut s, "/create cat 5"), Reaction::default());
+        let name = room_preview(&s);
+        assert_eq!(typed(&mut s, ""), Reaction::send(Command::CreateRoom { name, max: 5 }));
         s.on_event(&Event::RoomCreated { name: "catpie".into(), key: "123-k7m9xq".into(), max: 13 }, 0);
         assert_eq!(s.store.current(), Some(&Conv::Room("catpie".into())));
         assert_eq!(typed(&mut s, "meow"), send(Target::Room("catpie".into()), "meow"));
@@ -470,42 +509,81 @@ mod tests {
         assert!(typed(&mut s, "/quit").quit);
     }
 
-    #[test]
-    fn create_asks_for_the_head_count_when_left_out() {
-        let mut s = session();
-        let create = |max| Reaction::send(Command::CreateRoom { base: "cat".into(), max });
-        let question = Some("how many people in #cat…? 2–13, Enter for 13, Esc to cancel".to_string());
-        assert_eq!(typed(&mut s, "/create cat"), Reaction::default());
-        assert_eq!(s.prompt(), question);
-        assert_eq!(typed(&mut s, ""), create(13), "Enter takes the most");
-        assert_eq!(s.prompt(), None);
+    /// The room name the open question is offering.
+    fn room_preview(s: &Session) -> String {
+        match &s.asking {
+            Some(Asking::RoomName { preview, .. }) => preview.clone(),
+            other => panic!("not asking for a room name: {other:?}"),
+        }
+    }
 
+    #[test]
+    fn create_previews_the_room_name_first() {
+        let mut s = session();
+        assert_eq!(typed(&mut s, "/create CAT"), Reaction::default());
+        let first = room_preview(&s);
+        assert!(first.starts_with("cat") && crate::names::is_valid_name(&first), "{first}");
+        assert_eq!(s.prompt(), Some(format!("new room #{first} — Enter to keep it, or type another name")));
+
+        assert_eq!(typed(&mut s, "chat").print, vec!["! 'chat' is reserved"]);
+        assert_eq!(typed(&mut s, "a b").print, vec!["! name must be 1–9 letters or digits"]);
+        assert_eq!(room_preview(&s), first, "a bad name keeps the old preview");
+
+        assert_eq!(typed(&mut s, "Dog"), Reaction::default());
+        let dog = room_preview(&s);
+        assert!(dog.starts_with("dog"), "{dog}");
+        assert_eq!(typed(&mut s, ""), Reaction::default(), "Enter moves on to the head count");
+        assert_eq!(s.prompt(), Some(format!("how many people in #{dog}? 2–13, Enter for 13, Esc to cancel")));
+        assert_eq!(typed(&mut s, "5"), Reaction::send(Command::CreateRoom { name: dog, max: 5 }));
+        assert_eq!(s.prompt(), None);
+    }
+
+    #[test]
+    fn create_with_a_head_count_only_asks_the_name() {
+        let mut s = session();
+        typed(&mut s, "/create cat 2");
+        let name = room_preview(&s);
+        assert_eq!(typed(&mut s, ""), Reaction::send(Command::CreateRoom { name, max: 2 }));
+        for bad in ["1", "14", "x", "300"] {
+            assert_eq!(typed(&mut s, &format!("/create cat {bad}")).print, vec!["! a room holds 2–13 people"]);
+            assert_eq!(s.prompt(), None);
+        }
+        assert_eq!(typed(&mut s, "/create chat").print, vec!["! 'chat' is reserved"]);
+        assert_eq!(s.prompt(), None);
+    }
+
+    #[test]
+    fn the_head_count_step_works_as_before() {
+        let mut s = session();
         typed(&mut s, "/create cat");
+        let name = room_preview(&s);
+        typed(&mut s, "");
         assert_eq!(typed(&mut s, "20").print, vec!["! a room holds 2–13 people — type a number, or Esc to cancel"]);
-        assert_eq!(s.prompt(), question, "still asking");
-        assert_eq!(typed(&mut s, " 5 "), create(5));
+        assert!(s.prompt().is_some_and(|p| p.starts_with("how many")), "still asking");
+        assert_eq!(typed(&mut s, ""), Reaction::send(Command::CreateRoom { name, max: 13 }), "Enter takes the most");
 
         typed(&mut s, "/create cat");
         assert_eq!(typed(&mut s, "/who"), Reaction::send(Command::ListPeers), "a command drops the question");
         assert_eq!(s.prompt(), None);
 
         typed(&mut s, "/create cat");
-        assert!(s.cancel_prompt());
-        assert_eq!(s.prompt(), None);
+        assert!(s.cancel_prompt(), "Esc drops the name step");
+        typed(&mut s, "/create cat");
+        typed(&mut s, "");
+        assert!(s.cancel_prompt(), "and the head-count step");
         assert!(!s.cancel_prompt());
-
-        assert_eq!(typed(&mut s, "/create chat").print, vec!["! 'chat' is reserved"], "the name is checked first");
-        assert_eq!(s.prompt(), None);
     }
 
     #[test]
-    fn create_takes_an_optional_head_count() {
+    fn the_room_preview_avoids_rooms_you_are_in() {
         let mut s = session();
-        let create = |max| Reaction::send(Command::CreateRoom { base: "cat".into(), max });
-        assert_eq!(typed(&mut s, "/create cat 2"), create(2));
-        for bad in ["1", "14", "x", "300"] {
-            assert_eq!(typed(&mut s, &format!("/create cat {bad}")).print, vec!["! a room holds 2–13 people"]);
+        // In every cat room but catwolf.
+        for w in crate::words::WORDS.iter().filter(|w| **w != "wolf") {
+            let name = format!("cat{w}");
+            s.on_event(&Event::RoomCreated { name, key: "k7m9xq".into(), max: 13 }, 0);
         }
+        typed(&mut s, "/create cat");
+        assert_eq!(room_preview(&s), "catwolf");
     }
 
     /// We're in `rooms`, and bob is waiting to get into each.

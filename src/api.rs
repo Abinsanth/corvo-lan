@@ -35,10 +35,10 @@ pub enum Command {
         to: Target,
         text: String,
     },
-    /// `base` is what the user typed; the node adds the rest of the name and
-    /// makes the key. `max` counts everyone, the creator included.
+    /// A room name from `names::pick_name` (the UI previews it); the node makes the key.
+    /// `max` counts everyone, the creator included.
     CreateRoom {
-        base: String,
+        name: String,
         max: u8,
     },
     JoinRoom {

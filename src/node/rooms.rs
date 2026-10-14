@@ -224,24 +224,24 @@ impl Node {
         true
     }
 
-    pub(super) fn create_room(&mut self, base: &str, max: u8) {
-        if let Err(e) = names::validate_base(base) {
-            self.emit(Event::Error(e));
+    pub(super) fn create_room(&mut self, name: &str, max: u8) {
+        if !names::is_valid_name(name) {
+            self.emit(Event::Error(format!("#{name} isn't a room name")));
             return;
         }
         if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&max) {
             self.emit(Event::Error(format!("a room holds {MIN_MEMBERS}–{MAX_MEMBERS} people")));
             return;
         }
+        if self.rooms.holds(name) {
+            self.emit(Event::Error(format!("you're already in #{name}")));
+            return;
+        }
         if !self.room_slot_free() {
             return;
         }
-        let Some(name) = names::pick_name(base, |n| self.rooms.holds(n)) else {
-            self.emit(Event::Error(format!("you're already in every #{base}… room")));
-            return;
-        };
         let key = room::make_key();
-        self.spawn_derive(Job::Create { name: name.clone(), key: key.clone(), max }, name, key);
+        self.spawn_derive(Job::Create { name: name.to_string(), key: key.clone(), max }, name.to_string(), key);
     }
 
     pub(super) fn join_room(&mut self, name: &str, key: &str) {
@@ -962,7 +962,8 @@ mod tests {
     }
 
     async fn create(h: &mut Harness, max: u8) -> Made {
-        h.node.handle_command(Command::CreateRoom { base: "cat".into(), max });
+        let name = names::pick_name("cat", |n| h.node.rooms.holds(n)).unwrap();
+        h.node.handle_command(Command::CreateRoom { name: name.clone(), max });
         h.pump().await;
         let (name, key) = match h.events().as_slice() {
             [Event::RoomCreated { name, key, max: m }] => {
@@ -1022,8 +1023,8 @@ mod tests {
     #[tokio::test]
     async fn creating_a_room_holds_key_and_cap() {
         let mut h = with_peers();
-        h.node.handle_command(Command::CreateRoom { base: "cat".into(), max: 1 });
-        h.node.handle_command(Command::CreateRoom { base: "cat".into(), max: 14 });
+        h.node.handle_command(Command::CreateRoom { name: "catpie".into(), max: 1 });
+        h.node.handle_command(Command::CreateRoom { name: "catpie".into(), max: 14 });
         let e = Event::Error("a room holds 2–13 people".into());
         assert_eq!(h.events(), vec![e.clone(), e]);
         let made = create(&mut h, 5).await;
@@ -1037,8 +1038,16 @@ mod tests {
         create(&mut h, 13).await;
         create(&mut h, 13).await;
         h.node.handle_command(Command::JoinRoom { name: "dogpie".into(), key: KEY.into() });
-        h.node.handle_command(Command::CreateRoom { base: "cat".into(), max: 13 });
+        h.node.handle_command(Command::CreateRoom { name: "catpie".into(), max: 13 });
         assert_eq!(h.events(), vec![Event::Error(format!("you're in {MAX_ROOMS} rooms (the max) — /leave one first"))]);
+    }
+
+    #[tokio::test]
+    async fn creating_a_room_you_are_in_is_refused() {
+        let mut h = with_peers();
+        let made = create(&mut h, 5).await;
+        h.node.handle_command(Command::CreateRoom { name: made.name.clone(), max: 5 });
+        assert_eq!(h.events(), vec![Event::Error(format!("you're already in #{}", made.name))]);
     }
 
     #[test]
@@ -1051,7 +1060,7 @@ mod tests {
     #[test]
     fn bad_room_input_is_rejected_up_front() {
         let mut h = with_peers();
-        h.node.handle_command(Command::CreateRoom { base: "chat".into(), max: 5 });
+        h.node.handle_command(Command::CreateRoom { name: "chat".into(), max: 5 });
         h.node.handle_command(Command::JoinRoom { name: "catPie".into(), key: KEY.into() });
         h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: "123-k7m9xq".into() });
         h.node.handle_command(Command::LeaveRoom { name: NAME.into() });
@@ -1059,7 +1068,7 @@ mod tests {
         h.node.handle_command(Command::Approve { room: NAME.into(), nick: "bobroger".into() });
         let errors: Vec<String> =
             h.events().into_iter().map(|e| if let Event::Error(m) = e { m } else { panic!("{e:?}") }).collect();
-        assert_eq!(errors[0], "'chat' is reserved");
+        assert_eq!(errors[0], "#chat isn't a room name");
         assert_eq!(errors[1], "#catPie isn't a room name");
         assert!(errors[2].starts_with("a room key is 6"));
         assert_eq!(errors[3..], ["you're not in #catpie"; 3]);

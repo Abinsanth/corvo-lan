@@ -555,12 +555,15 @@ mod tests {
     }
 
     #[test]
-    fn the_input_shows_the_create_question() {
+    fn the_input_shows_the_create_questions() {
         let mut s = session();
         let mut state = TuiState::new(false);
         s.on_line("/create cat", None);
         let buf = render(&s, &mut state, 80, 20);
-        assert!(find(&buf, "> how many people in #cat…?").is_some(), "{:#?}", rows(&buf));
+        assert!(find(&buf, "> new room #cat").is_some(), "{:#?}", rows(&buf));
+        s.on_line("", None);
+        let buf = render(&s, &mut state, 80, 20);
+        assert!(find(&buf, "> how many people in #cat").is_some(), "{:#?}", rows(&buf));
     }
 
     #[test]
