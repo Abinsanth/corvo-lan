@@ -41,6 +41,49 @@ cd corvo-lan
 cargo install --path .
 ```
 
+### Check the install
+
+Open a new terminal and run:
+
+```bash
+corvo-lan --version         # prints e.g. "corvo-lan 0.4.0"
+command -v corvo-lan        # macOS/Linux: where it's installed
+```
+
+```powershell
+Get-Command corvo-lan       # Windows: where it's installed
+```
+
+If the shell says the command isn't found, the install folder isn't on your
+PATH yet (see the hint the installer printed) or the terminal was opened
+before installing.
+
+### Uninstall
+
+On macOS or Linux, delete the binary, then, if you also want to forget your
+identity key and the peers you've met, the config folder:
+
+```bash
+rm ~/.local/bin/corvo-lan   # or $CORVO_LAN_INSTALL_DIR/corvo-lan
+rm -rf ~/.config/corvo-lan  # or $XDG_CONFIG_HOME/corvo-lan
+```
+
+If you built it with `cargo install`, use `cargo uninstall corvo-lan` instead.
+
+On Windows, in PowerShell:
+
+```powershell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\corvo-lan"
+Remove-Item -Recurse -Force "$env:APPDATA\corvo-lan"   # identity key and known peers
+```
+
+Then remove `%LOCALAPPDATA%\Programs\corvo-lan` from your PATH: search the Start
+menu for "Edit environment variables for your account", select `Path`, and
+delete that entry.
+
+Deleting the config folder gives you a new identity next time, so peers you've
+met will see a key-change warning.
+
 ## Use
 
 ```bash
