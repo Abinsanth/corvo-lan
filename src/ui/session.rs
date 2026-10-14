@@ -130,7 +130,9 @@ impl Session {
                 Ok(Conv::Room(_)) => Reaction::default(),
                 Err(e) => Reaction::say(format!("! {e}")),
             },
-            Input::Create { base, part } => Reaction::send(Command::CreateRoom { base, key_part: part }),
+            Input::Create { base, part } => {
+                Reaction::send(Command::CreateRoom { base, max: part.parse().unwrap_or(13) })
+            }
             Input::Leave(Some(name)) => Reaction::send(Command::LeaveRoom { name }),
             Input::Leave(None) => match self.store.current() {
                 Some(Conv::Room(n)) => Reaction::send(Command::LeaveRoom { name: n.clone() }),
@@ -255,11 +257,8 @@ mod tests {
     #[test]
     fn creating_or_joining_a_room_switches_to_it() {
         let mut s = session();
-        assert_eq!(
-            typed(&mut s, "/create cat 123"),
-            Reaction::send(Command::CreateRoom { base: "cat".into(), key_part: "123".into() })
-        );
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
+        assert_eq!(typed(&mut s, "/create cat 5"), Reaction::send(Command::CreateRoom { base: "cat".into(), max: 5 }));
+        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into(), max: 13 }, 0);
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
         assert_eq!(typed(&mut s, "meow"), send(Target::Room("catPieR".into()), "meow"));
 
@@ -268,7 +267,15 @@ mod tests {
             Reaction::send(Command::JoinRoom { name: "dogFoxR".into(), key: "1-abcdef".into() })
         );
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())), "not until the join succeeds");
-        s.on_event(&Event::RoomJoined { name: "dogFoxR".into(), members: vec!["bobRoger".into()] }, 0);
+        s.on_event(
+            &Event::RoomJoined {
+                name: "dogFoxR".into(),
+                key: "k7m9xq".into(),
+                max: 13,
+                members: vec!["bobRoger".into()],
+            },
+            0,
+        );
         assert_eq!(s.store.current(), Some(&Conv::Room("dogFoxR".into())));
         assert_eq!(typed(&mut s, "/chat #catPieR"), Reaction::default(), "already in: just switch");
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
@@ -284,7 +291,7 @@ mod tests {
         let shown = s.store.current().cloned();
         assert_eq!(shown, Some(Conv::Dm("bobRoger".into())));
         // ...and the join completes meanwhile, switching the current conversation.
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         assert_eq!(s.on_line("for bob only", shown.as_ref()), send(Target::Dm("bobRoger".into()), "for bob only"));
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())), "the next prompt shows the room");
     }
@@ -297,7 +304,7 @@ mod tests {
         let shown = s.store.current().cloned();
         assert_eq!(shown, None);
         // ...the room arrives while the user types, and that's where they mean.
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
+        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into(), max: 13 }, 0);
         assert_eq!(s.on_line("first!", shown.as_ref()), send(Target::Room("catPieR".into()), "first!"));
     }
 
@@ -305,7 +312,7 @@ mod tests {
     fn leave_uses_the_current_room_or_the_named_one() {
         let mut s = session();
         assert_eq!(typed(&mut s, "/leave").print, vec!["! you're not in a room here — /leave #room"]);
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "1-abcdef".into() }, 0);
+        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "1-abcdef".into(), max: 13 }, 0);
         assert_eq!(typed(&mut s, "/leave"), Reaction::send(Command::LeaveRoom { name: "catPieR".into() }));
         assert_eq!(typed(&mut s, "/leave #dogFoxR"), Reaction::send(Command::LeaveRoom { name: "dogFoxR".into() }));
         s.on_event(&Event::RoomLeft { name: "catPieR".into() }, 0);
@@ -369,8 +376,8 @@ mod tests {
         let mut s = session(); // me: annMoon; online: bobRoger
         s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobKite".into() }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(4), nick: "carolFox".into() }, 0);
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
-        s.on_event(&Event::RoomJoined { name: "carolFoxR".into(), members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "carolFoxR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
 
         assert_eq!(typed(&mut s, "/chat catp"), Reaction::default());
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
@@ -419,7 +426,7 @@ mod tests {
         assert_eq!(typed(&mut s, "/close").print, vec!["* closed @bobRoger"]);
         assert!(s.store.get(&Conv::Dm("bobRoger".into())).is_none());
         assert_eq!(typed(&mut s, "/close").print, vec!["! no chat to close here"]);
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         assert_eq!(typed(&mut s, "/close").print, vec!["! use /leave for rooms"]);
         assert_eq!(typed(&mut s, "/close @ghostMoon").print, vec!["! no chat with @ghostMoon"]);
     }

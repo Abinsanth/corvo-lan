@@ -148,7 +148,7 @@ impl Store {
             Event::Sent { conv, text, ts } => {
                 push(self.entry(conv), Line { ts: *ts, kind: LineKind::Mine { text: text.clone() } })
             }
-            Event::RoomCreated { name, key } => {
+            Event::RoomCreated { name, key, .. } => {
                 let c = self.entry(&Conv::Room(name.clone()));
                 push(
                     c,
@@ -158,7 +158,7 @@ impl Store {
                     },
                 );
             }
-            Event::RoomJoined { name, members } => {
+            Event::RoomJoined { name, members, .. } => {
                 let c = self.entry(&Conv::Room(name.clone()));
                 c.members = members.iter().cloned().collect();
                 push(c, Line { ts: now, kind: LineKind::Notice(format!("joined #{name}")) });
@@ -183,6 +183,11 @@ impl Store {
                 }
             }
             Event::Peers { .. } | Event::Error(_) | Event::Info(_) => {}
+            Event::JoinWaiting { .. }
+            | Event::JoinEnded { .. }
+            | Event::JoinRequest { .. }
+            | Event::Approved { .. }
+            | Event::RequestEnded { .. } => {}
         }
     }
 
@@ -348,7 +353,15 @@ mod tests {
     #[test]
     fn rooms_track_members_and_vanish_on_leave() {
         let mut s = Store::new();
-        s.apply(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
+        s.apply(
+            &Event::RoomJoined {
+                name: "catPieR".into(),
+                key: "k7m9xq".into(),
+                max: 13,
+                members: vec!["bobRoger".into()],
+            },
+            0,
+        );
         s.switch(room("catPieR"));
         s.apply(&Event::MemberJoined { room: "catPieR".into(), nick: "carolFox".into() }, 0);
         s.apply(&Event::MemberLeft { room: "catPieR".into(), nick: "bobRoger".into() }, 0);
@@ -378,7 +391,15 @@ mod tests {
     fn a_renamed_peer_keeps_its_dm_and_room_membership() {
         let mut s = Store::new();
         s.apply(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0);
-        s.apply(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
+        s.apply(
+            &Event::RoomJoined {
+                name: "catPieR".into(),
+                key: "k7m9xq".into(),
+                max: 13,
+                members: vec!["bobRoger".into()],
+            },
+            0,
+        );
         s.apply(&msg(dm("bobRoger"), "bobRoger", "psst"), 0);
         s.switch(dm("bobRoger"));
         s.apply(&Event::Renamed { old: "bobRoger".into(), new: "bobPie".into() }, 0);
@@ -481,7 +502,7 @@ mod tests {
         s.apply(&Event::PeerJoined { id: PeerId::test(2), nick: "carolFox".into() }, 0);
         s.apply(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0);
         assert_eq!(s.online().cloned().collect::<Vec<_>>(), vec!["bobRoger", "carolFox"]);
-        s.apply(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
+        s.apply(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into(), max: 13 }, 0);
         let c = s.get(&room("catPieR")).unwrap();
         assert_eq!(
             c.lines[0].kind,

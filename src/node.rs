@@ -23,7 +23,10 @@ use crate::room::{RoomId, RoomKeys};
 
 mod rooms;
 
-pub use rooms::{HERE_INTERVAL, JOIN_SETTLE, JOIN_WAIT, MAX_ROOMS, MEMBER_TIMEOUT};
+pub use rooms::{
+    ADMIT_SETTLE, HERE_INTERVAL, JOIN_WAIT, KNOCK_EVERY, MAX_MEMBERS, MAX_ROOMS, MEMBER_TIMEOUT, MIN_MEMBERS,
+    PENDING_FOR, REQUEST_STALE, needed,
+};
 
 /// Longest chat text accepted, measured JSON-escaped (a control character
 /// becomes 6 bytes), leaving headroom under `MAX_FRAME_LEN` for hex and JSON.
@@ -105,14 +108,18 @@ pub enum NodeMsg {
     },
     /// The listen-only naming window is over.
     NameWaitOver,
-    /// A room key finished deriving on a worker thread.
+    /// A room's door keys finished deriving on a worker thread.
     Derived {
         job: rooms::Job,
         attempt: rooms::Attempt,
         keys: RoomKeys,
     },
-    JoinSettled(RoomId, rooms::Attempt),
+    /// Nobody answered our knock (keyed by door id).
     JoinTimeout(RoomId, rooms::Attempt),
+    /// Nobody let us in (keyed by door id).
+    JoinExpired(RoomId, rooms::Attempt),
+    /// Let in whoever has enough approvals (keyed by room id).
+    Settle(RoomId),
     Tick,
 }
 
@@ -384,9 +391,11 @@ impl Node {
                     Target::Room(name) => self.send_room(&name, text),
                 }
             }
-            Command::CreateRoom { base, key_part } => self.create_room(&base, &key_part),
+            Command::CreateRoom { base, max } => self.create_room(&base, max),
             Command::JoinRoom { name, key } => self.join_room(&name, &key),
             Command::LeaveRoom { name } => self.leave_room(&name),
+            Command::Approve { room, nick } => self.approve(&room, &nick),
+            Command::Deny { room, nick } => self.deny(&room, &nick),
             Command::ListPeers => {
                 let mut peers: Vec<PeerInfo> =
                     self.peers.iter().map(|(id, p)| PeerInfo { id: *id, nick: p.nick.clone(), addr: p.addr }).collect();
@@ -441,8 +450,9 @@ impl Node {
             },
             NodeMsg::NameWaitOver => self.assign_name(),
             NodeMsg::Derived { job, attempt, keys } => self.on_derived(job, attempt, keys),
-            NodeMsg::JoinSettled(id, attempt) => self.on_join_settled(id, attempt),
             NodeMsg::JoinTimeout(id, attempt) => self.on_join_timeout(id, attempt),
+            NodeMsg::JoinExpired(id, attempt) => self.on_join_expired(id, attempt),
+            NodeMsg::Settle(id) => self.settle(id),
             NodeMsg::Tick => self.on_tick(Instant::now()),
         }
     }

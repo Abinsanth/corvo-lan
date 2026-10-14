@@ -200,13 +200,13 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             format!("{} you → {}: {}", s.dim(&stamp(*ts)), s.nick(to), body(text))
         }
         Event::Sent { conv: Conv::Room(_), .. } => return None,
-        Event::RoomCreated { name, key } => {
+        Event::RoomCreated { name, key, .. } => {
             format!("{} {} — key {} — share both to invite", s.tone(Tone::Good, "* created"), s.room(name), clean(key))
         }
-        Event::RoomJoined { name, members } if members.is_empty() => {
+        Event::RoomJoined { name, members, .. } if members.is_empty() => {
             format!("{} {}", s.tone(Tone::Good, "* joined"), s.room(name))
         }
-        Event::RoomJoined { name, members } => {
+        Event::RoomJoined { name, members, .. } => {
             let members: Vec<String> = members.iter().map(|m| s.nick(m)).collect();
             format!("{} {} with {}", s.tone(Tone::Good, "* joined"), s.room(name), members.join(", "))
         }
@@ -230,6 +230,11 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
         }
         Event::Error(msg) => s.tone(Tone::Bad, &format!("! {}", clean(msg))),
         Event::Info(msg) => s.tone(tone_of(event), &format!("* {}", clean(msg))),
+        Event::JoinWaiting { .. }
+        | Event::JoinEnded { .. }
+        | Event::JoinRequest { .. }
+        | Event::Approved { .. }
+        | Event::RequestEnded { .. } => return None,
     })
 }
 
@@ -329,9 +334,14 @@ mod tests {
 
     #[test]
     fn room_and_presence_notices() {
-        let created = Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() };
+        let created = Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into(), max: 13 };
         assert_eq!(event(&created, 0, &P).unwrap(), "* created #catPieR — key 123-k7m9xq — share both to invite");
-        let joined = Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into(), "carolFox".into()] };
+        let joined = Event::RoomJoined {
+            name: "catPieR".into(),
+            key: "k7m9xq".into(),
+            max: 13,
+            members: vec!["bobRoger".into(), "carolFox".into()],
+        };
         assert_eq!(event(&joined, 0, &P).unwrap(), "* joined #catPieR with @bobRoger, @carolFox");
         let member = Event::MemberJoined { room: "catPieR".into(), nick: "carolFox".into() };
         assert_eq!(event(&member, 0, &P).unwrap(), format!("{} * @carolFox joined #catPieR", t(0)));
@@ -425,7 +435,15 @@ mod tests {
         let mut store = Store::new();
         assert!(chats(&store, &P).starts_with("* no conversations yet"));
         assert!(rooms(&store, &P).starts_with("* you're not in any rooms"));
-        store.apply(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
+        store.apply(
+            &Event::RoomJoined {
+                name: "catPieR".into(),
+                key: "k7m9xq".into(),
+                max: 13,
+                members: vec!["bobRoger".into()],
+            },
+            0,
+        );
         store.switch(Conv::Room("catPieR".into()));
         store.apply(
             &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 },
@@ -442,8 +460,11 @@ mod tests {
         let nick = || "bobRoger".to_string();
         assert_eq!(tone_of(&Event::PeerJoined { id: PeerId::test(1), nick: nick() }), Tone::Good);
         assert_eq!(tone_of(&Event::MemberJoined { room: "r".into(), nick: nick() }), Tone::Good);
-        assert_eq!(tone_of(&Event::RoomCreated { name: "r".into(), key: "k".into() }), Tone::Good);
-        assert_eq!(tone_of(&Event::RoomJoined { name: "r".into(), members: vec![] }), Tone::Good);
+        assert_eq!(tone_of(&Event::RoomCreated { name: "r".into(), key: "k".into(), max: 13 }), Tone::Good);
+        assert_eq!(
+            tone_of(&Event::RoomJoined { name: "r".into(), key: "k7m9xq".into(), max: 13, members: vec![] }),
+            Tone::Good
+        );
         assert_eq!(
             tone_of(&Event::PeerLeft { id: PeerId::test(1), nick: nick(), reason: LeaveReason::Quit }),
             Tone::Bad

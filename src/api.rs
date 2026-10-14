@@ -35,10 +35,11 @@ pub enum Command {
         to: Target,
         text: String,
     },
-    /// `base` and `key_part` are what the user typed; the node adds the rest.
+    /// `base` is what the user typed; the node adds the rest of the name and
+    /// makes the key. `max` counts everyone, the creator included.
     CreateRoom {
         base: String,
-        key_part: String,
+        max: u8,
     },
     JoinRoom {
         name: String,
@@ -46,6 +47,16 @@ pub enum Command {
     },
     LeaveRoom {
         name: String,
+    },
+    /// Let `nick` into `room`, which they've asked to join.
+    Approve {
+        room: String,
+        nick: String,
+    },
+    /// Refuse `nick`'s request to join `room`.
+    Deny {
+        room: String,
+        nick: String,
     },
     ListPeers,
     Quit,
@@ -57,6 +68,32 @@ pub enum LeaveReason {
     Quit,
     /// The connection dropped or went silent.
     Lost,
+}
+
+/// Why our request to join a room ended without getting in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinEnd {
+    /// Nobody answered: a wrong key, or nobody in the room is online.
+    NoRoom,
+    Full,
+    Denied {
+        by: String,
+    },
+    /// Nobody let us in within `PENDING_FOR`.
+    TimedOut,
+}
+
+/// Why someone's request to join one of our rooms is closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestEnd {
+    /// Let in; a `MemberJoined` follows.
+    Admitted,
+    Denied {
+        by: String,
+    },
+    Full,
+    /// They gave up, went offline, or never arrived.
+    Gone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,10 +140,43 @@ pub enum Event {
     RoomCreated {
         name: String,
         key: String,
+        max: u8,
     },
     RoomJoined {
         name: String,
+        key: String,
+        max: u8,
         members: Vec<String>,
+    },
+    /// Someone in the room answered our knock; we wait for `needs` approvals.
+    JoinWaiting {
+        name: String,
+        members: u8,
+        needs: u8,
+    },
+    JoinEnded {
+        name: String,
+        why: JoinEnd,
+    },
+    /// `nick` asked to join `room`; `have` of `need` approvals so far.
+    JoinRequest {
+        room: String,
+        nick: String,
+        have: u8,
+        need: u8,
+    },
+    /// `by` approved `nick`'s request.
+    Approved {
+        room: String,
+        nick: String,
+        by: String,
+        have: u8,
+        need: u8,
+    },
+    RequestEnded {
+        room: String,
+        nick: String,
+        why: RequestEnd,
     },
     RoomLeft {
         name: String,

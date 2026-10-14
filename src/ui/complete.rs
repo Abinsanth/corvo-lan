@@ -154,8 +154,11 @@ mod tests {
         for (i, n) in ["annMoon", "zoeOwl", "carolFox", "bobRoger"].iter().enumerate() {
             s.apply(&Event::PeerJoined { id: PeerId::test(i as u64), nick: n.to_string() }, 0);
         }
-        s.apply(&Event::RoomJoined { name: "dogR".into(), members: vec!["zoeOwl".into()] }, 0);
-        s.apply(&Event::RoomJoined { name: "catR".into(), members: vec![] }, 0);
+        s.apply(
+            &Event::RoomJoined { name: "dogR".into(), key: "k7m9xq".into(), max: 13, members: vec!["zoeOwl".into()] },
+            0,
+        );
+        s.apply(&Event::RoomJoined { name: "catR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         s.switch(Conv::Room("dogR".into()));
         let c = Candidates::from_store(&s);
         assert_eq!(c.nicks, vec!["zoeOwl", "bobRoger", "carolFox"]);
