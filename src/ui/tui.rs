@@ -216,6 +216,18 @@ fn say(state: &mut TuiState, text: &str, now: Instant) {
     }
 }
 
+/// Puts a new question in the corvo tab and shows it, so it's in plain view
+/// rather than only at the bottom of the screen.
+fn ask(session: &mut Session, state: &mut TuiState, question: &str, now: Instant) {
+    state.push_status(now_millis(), question, Tone::Warn);
+    state.flash(question, now);
+    if !state.on_status {
+        session.store.clear_current();
+        state.on_status = true;
+        state.scroll.to_bottom();
+    }
+}
+
 /// Keeps the view on the store's current conversation when it changes, and
 /// falls back to corvo when there isn't one.
 fn follow_current(state: &mut TuiState, before: Option<Conv>, session: &Session) {
@@ -253,6 +265,7 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
         return None;
     }
     let before = session.store.current().cloned();
+    let asked = session.prompt();
     let shown = if state.on_status { None } else { before.clone() };
     let mut reaction = session.on_line(&text, shown.as_ref());
     let complained = reaction.print.iter().any(|l| l.starts_with("! "));
@@ -262,8 +275,8 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     if session.store.current().cloned() != before {
         follow_current(state, before, session);
     }
-    if let Some(question) = session.prompt().filter(|_| !complained) {
-        state.flash(&question, now);
+    if let Some(question) = session.prompt().filter(|q| !complained && Some(q) != asked.as_ref()) {
+        ask(session, state, &question, now);
     }
     Some(reaction)
 }
@@ -294,7 +307,7 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
     if matches!(event, Event::NamePreview { .. })
         && let Some(question) = session.prompt()
     {
-        state.flash(&question, now);
+        ask(session, state, &question, now);
     }
 }
 
@@ -465,6 +478,47 @@ mod tests {
         assert_eq!(r.commands, vec![crate::api::Command::ConfirmName]);
     }
 
+    fn last_status(state: &TuiState) -> (&str, Tone) {
+        let l = state.status_lines().last().unwrap();
+        (&l.text, l.tone)
+    }
+
+    #[test]
+    fn the_name_question_is_asked_in_the_corvo_tab() {
+        let mut s = Session::new(false);
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_event(&mut s, &mut state, &Event::NamePreview { nick: "bobroger".into() }, now);
+        assert!(state.on_status);
+        assert_eq!(last_status(&state), ("you'll be @bobroger — Enter to keep it, or type a name", Tone::Warn));
+        on_event(&mut s, &mut state, &Event::NamePreview { nick: "luffysunny".into() }, now);
+        assert!(last_status(&state).0.contains("@luffysunny"), "each new preview is asked again");
+        on_send(&mut s, &mut state, String::new(), now);
+        assert_eq!(last_status(&state).0, "joining as @luffysunny…");
+        let count = state.status_lines().count();
+        on_send(&mut s, &mut state, String::new(), now);
+        assert_eq!(state.status_lines().count(), count, "an unchanged question isn't repeated");
+    }
+
+    #[test]
+    fn the_create_questions_move_a_chat_to_the_corvo_tab() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_send(&mut s, &mut state, "/chat @bobroger".into(), now);
+        assert!(!state.on_status);
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        assert!(state.on_status, "the question shows in the corvo tab");
+        assert!(last_status(&state).0.starts_with("new room #cat"));
+        on_send(&mut s, &mut state, String::new(), now);
+        assert!(last_status(&state).0.starts_with("how many people in #cat"));
+        let r = on_send(&mut s, &mut state, "3".into(), now).unwrap();
+        let [crate::api::Command::CreateRoom { name, .. }] = r.commands.as_slice() else { panic!("{r:?}") };
+        let created = Event::RoomCreated { name: name.clone(), key: "k7m9xq".into(), max: 3 };
+        on_event(&mut s, &mut state, &created, now);
+        assert!(!state.on_status, "the new room's tab opens");
+    }
+
     #[test]
     fn the_create_questions_are_answered_from_any_tab_and_esc_drops_them() {
         let mut s = session();
@@ -496,9 +550,10 @@ mod tests {
         s.on_line("/chat @bobroger", None);
         state.on_status = false;
         on_send(&mut s, &mut state, "/create cat".into(), now);
+        assert!(state.on_status, "the question is asked in the corvo tab");
         state.step_tab(&mut s, 1);
         assert_eq!(s.prompt(), None);
-        state.step_tab(&mut s, 1);
+        assert!(!state.on_status);
         let r = on_send(&mut s, &mut state, "10".into(), now).unwrap();
         assert_eq!(
             r.commands,
