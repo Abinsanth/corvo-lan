@@ -121,7 +121,13 @@ pub(crate) fn private_file() -> OpenOptions {
 /// Writes beside `path` and renames, so a crash never leaves a half-written key.
 fn write_key(path: &Path, keys: &Keys) -> std::io::Result<()> {
     let tmp = path.with_extension("key.tmp");
-    let mut file = private_file().create(true).truncate(true).open(&tmp)?;
+    // A leftover temp file would keep its old mode (mode only applies on creation), so always start fresh.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = private_file().create_new(true).open(&tmp)?;
     writeln!(file, "{}", to_hex(keys.secret()))?;
     file.sync_all()?;
     fs::rename(&tmp, path)
@@ -239,6 +245,7 @@ mod tests {
         let saved = fs::read_to_string(dir.join("identity.key")).unwrap();
         assert_eq!(saved.trim(), to_hex(id.keys.secret()));
         assert!(!dir.join("identity.key.tmp").exists());
+        assert_eq!(mode(&dir.join("identity.key")), 0o600);
     }
 
     #[test]
