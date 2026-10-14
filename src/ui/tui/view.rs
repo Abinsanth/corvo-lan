@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use super::state::{Editor, Hit, MAX_INPUT_ROWS, Tab, TuiState, tabs};
 use crate::api::Conv;
-use crate::convo::LineKind;
+use crate::convo::{LineKind, mentions};
 use crate::ui::render::{Tone, clean, hhmm, nick_color, tone_of_notice};
 use crate::ui::session::Session;
 
@@ -121,8 +121,14 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
                     LineKind::Msg { text, .. } | LineKind::Mine { text } => text.as_str(),
                     LineKind::Notice(_) => "",
                 };
+                let body_style = match kind {
+                    LineKind::Msg { text, .. } if session.store.me().is_some_and(|me| mentions(text, me)) => {
+                        tone_style(Tone::Warn, color).add_modifier(Modifier::BOLD)
+                    }
+                    _ => Style::default(),
+                };
                 let prefix = vec![time, Span::styled(label, nick_style(&nick, color))];
-                out.extend(message_rows(prefix, TIME_WIDTH + sender_w + 1, text, Style::default(), width));
+                out.extend(message_rows(prefix, TIME_WIDTH + sender_w + 1, text, body_style, width));
             }
         }
     }
@@ -148,8 +154,12 @@ fn tab_label(tab: &Tab, session: &Session) -> (String, bool) {
                 Conv::Room(n) => format!("#{}", clean(n)),
                 Conv::Dm(n) => format!("@{}", clean(n)),
             };
-            let unread = c.map_or(0, |c| c.unread);
-            let label = if unread > 0 { format!("{name} ({unread})") } else { name };
+            let (unread, mentioned) = c.map_or((0, 0), |c| (c.unread, c.mentions));
+            let label = match (unread, mentioned) {
+                (0, _) => name,
+                (u, 0) => format!("{name} ({u})"),
+                (u, m) => format!("{name} ({u} @{m})"),
+            };
             (label, c.is_some_and(|c| c.offline))
         }
     }
@@ -591,6 +601,26 @@ mod tests {
         assert!(state.popup.is_some());
         render(&s, &mut state, 39, 9);
         assert!(state.popup.is_none(), "a list that can't be shown can't take keys");
+    }
+
+    #[test]
+    fn mentions_are_bold_yellow_and_counted_on_the_tab() {
+        let mut s = session();
+        s.store.clear_current();
+        let room = Conv::Room("catPieR".into());
+        for text in ["ping @annMoon", "plain words"] {
+            s.on_event(&Event::Message { conv: room.clone(), from: "bobRoger".into(), text: text.into(), ts: 0 }, 0);
+        }
+        let mut state = TuiState::new(true);
+        let top = rows(&render(&s, &mut state, 80, 20))[0].clone();
+        assert!(top.contains("#catPieR (2 @1)"), "{top}");
+        state.select_tab(&mut s, 1);
+        let buf = render(&s, &mut state, 80, 20);
+        let (x, y) = find(&buf, "ping @annMoon").unwrap();
+        assert_eq!(buf[(x, y)].fg, Color::Yellow);
+        assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
+        let (px, py) = find(&buf, "plain words").unwrap();
+        assert_eq!(buf[(px, py)].fg, Color::Reset);
     }
 
     #[test]

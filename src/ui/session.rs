@@ -122,7 +122,7 @@ impl Session {
         if let Event::RoomCreated { name, .. } | Event::RoomJoined { name, .. } = event {
             self.store.switch(Conv::Room(name.clone()));
         }
-        render::event(event, now, &self.style)
+        render::event(event, now, self.store.me(), &self.style)
     }
 
     /// What the prompt shows: its text and the conversation plain text goes to.
@@ -235,7 +235,7 @@ impl Session {
                     return Reaction::say("* nothing here yet");
                 }
                 Reaction {
-                    print: lines.iter().map(|l| render::line(&conv, l, &self.style)).collect(),
+                    print: lines.iter().map(|l| render::line(&conv, l, self.store.me(), &self.style)).collect(),
                     ..Default::default()
                 }
             }
@@ -284,11 +284,12 @@ impl Session {
             self.store.switch(conv);
             return Reaction::default();
         }
-        let unread = self.store.get(&conv).map_or(0, |c| c.unread);
+        let (unread, mentioned) = self.store.get(&conv).map_or((0, 0), |c| (c.unread, c.mentions));
         self.store.switch(conv.clone());
         if unread > 0 {
             let name = render::conv_name(&conv, &self.style);
-            Reaction::say(format!("* {name}: {unread} unread — /his to see them"))
+            let extra = if mentioned > 0 { format!(" ({})", render::mention_count(mentioned)) } else { String::new() };
+            Reaction::say(format!("* {name}: {unread} unread{extra} — /his to see them"))
         } else {
             Reaction::default()
         }
@@ -421,6 +422,26 @@ mod tests {
         let shown = typed(&mut s, "/his 1").print;
         assert_eq!(shown.len(), 1);
         assert!(shown[0].ends_with("@bobRoger → you: two"), "{shown:?}");
+    }
+
+    #[test]
+    fn switching_says_how_many_unread_messages_mention_me() {
+        let mut s = session();
+        for text in ["@annMoon look", "later"] {
+            s.on_event(
+                &Event::Message {
+                    conv: Conv::Dm("bobRoger".into()),
+                    from: "bobRoger".into(),
+                    text: text.into(),
+                    ts: 0,
+                },
+                0,
+            );
+        }
+        assert_eq!(
+            typed(&mut s, "/chat @bobRoger").print,
+            vec!["* @bobRoger: 2 unread (1 mention) — /his to see them"]
+        );
     }
 
     #[test]

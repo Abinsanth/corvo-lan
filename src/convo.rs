@@ -28,6 +28,8 @@ pub struct Conversation {
     pub conv: Conv,
     pub lines: VecDeque<Line>,
     pub unread: u32,
+    /// Unread messages that mention me.
+    pub mentions: u32,
     /// DM partner is no longer connected.
     pub offline: bool,
     /// Room members other than us.
@@ -41,6 +43,16 @@ pub struct Store {
     convs: Vec<Conversation>,
     current: Option<Conv>,
     online: BTreeSet<String>,
+}
+
+/// Whether `text` mentions `@me`: the whole name, ignoring case, not part of
+/// a longer word on either side.
+pub fn mentions(text: &str, me: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let (text, needle) = (text.to_lowercase(), format!("@{}", me.to_lowercase()));
+    text.match_indices(&needle).any(|(i, _)| {
+        !text[..i].chars().next_back().is_some_and(word) && !text[i + needle.len()..].chars().next().is_some_and(word)
+    })
 }
 
 impl Store {
@@ -90,6 +102,7 @@ impl Store {
     pub fn switch(&mut self, conv: Conv) {
         let c = self.entry(&conv);
         c.unread = 0;
+        c.mentions = 0;
         self.current = Some(conv);
     }
 
@@ -100,6 +113,7 @@ impl Store {
         };
         let c = self.entry(&conv);
         c.unread = 0;
+        c.mentions = 0;
         let skip = c.lines.len().saturating_sub(n);
         c.lines.iter().skip(skip).cloned().collect()
     }
@@ -123,10 +137,12 @@ impl Store {
             Event::Renamed { old, new } => self.rename(old, new),
             Event::Message { conv, from, text, ts } => {
                 let unread = self.current.as_ref() != Some(conv);
+                let mention = self.me.as_deref().is_some_and(|me| mentions(text, me));
                 let c = self.entry(conv);
                 push(c, Line { ts: *ts, kind: LineKind::Msg { from: from.clone(), text: text.clone() } });
                 if unread {
                     c.unread += 1;
+                    c.mentions += u32::from(mention);
                 }
             }
             Event::Sent { conv, text, ts } => {
@@ -197,6 +213,7 @@ impl Store {
                 let excess = c.lines.len().saturating_sub(MAX_LINES);
                 c.lines.drain(..excess);
                 c.unread += moved.unread;
+                c.mentions += moved.mentions;
                 c.offline = offline;
             }
             None => {
@@ -223,6 +240,7 @@ impl Store {
             conv: conv.clone(),
             lines: VecDeque::new(),
             unread: 0,
+            mentions: 0,
             offline,
             members: BTreeSet::new(),
         });
@@ -390,6 +408,52 @@ mod tests {
         assert_eq!(ts, vec![1, 2]);
         assert_eq!(c.unread, 2);
         assert!(!c.offline);
+    }
+
+    #[test]
+    fn mentions_need_the_whole_name() {
+        assert!(mentions("hi @bobRoger", "bobRoger"));
+        assert!(mentions("@BOBROGER, look", "bobRoger"));
+        assert!(mentions("(@bobRoger)", "bobRoger"));
+        assert!(mentions("line one\n@bobRoger", "bobRoger"));
+        assert!(!mentions("@bobRogers hi", "bobRoger"));
+        assert!(!mentions("@bobRoger_x", "bobRoger"));
+        assert!(!mentions("x@bobRoger", "bobRoger"));
+        assert!(!mentions("bobRoger", "bobRoger"));
+        assert!(mentions("é @bobRoger", "bobRoger"), "non-ASCII before the name");
+    }
+
+    #[test]
+    fn unread_mentions_are_counted_and_cleared_with_unread() {
+        let mut s = Store::new();
+        s.apply(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
+        s.switch(room("catPieR"));
+        s.apply(&msg(room("catPieR"), "bobRoger", "@annMoon in view"), 0);
+        s.apply(&msg(dm("bobRoger"), "bobRoger", "@annMoon psst"), 0);
+        s.apply(&msg(dm("bobRoger"), "bobRoger", "no mention"), 0);
+        assert_eq!(s.get(&room("catPieR")).unwrap().mentions, 0, "seen as it arrived");
+        assert_eq!(s.get(&dm("bobRoger")).unwrap().mentions, 1);
+        s.switch(dm("bobRoger"));
+        assert_eq!(s.get(&dm("bobRoger")).unwrap().mentions, 0);
+    }
+
+    #[test]
+    fn mentions_before_i_have_a_name_do_not_count() {
+        let mut s = Store::new();
+        s.apply(&msg(dm("bobRoger"), "bobRoger", "@annMoon early"), 0);
+        s.apply(&Event::Sent { conv: dm("bobRoger"), text: "@annMoon me".into(), ts: 2 }, 0);
+        assert_eq!(s.get(&dm("bobRoger")).unwrap().mentions, 0);
+    }
+
+    #[test]
+    fn a_rename_merge_adds_mentions() {
+        let mut s = Store::new();
+        s.apply(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
+        s.apply(&msg(dm("bobPie"), "bobPie", "@annMoon old"), 0);
+        s.apply(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0);
+        s.apply(&msg(dm("bobRoger"), "bobRoger", "@annMoon new"), 0);
+        s.apply(&Event::Renamed { old: "bobRoger".into(), new: "bobPie".into() }, 0);
+        assert_eq!(s.get(&dm("bobPie")).unwrap().mentions, 2);
     }
 
     #[test]
