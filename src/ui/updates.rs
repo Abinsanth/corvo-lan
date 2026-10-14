@@ -109,7 +109,7 @@ async fn run(action: UpdateAction, out: &UnboundedSender<Notice>) {
             return;
         }
     };
-    let target = match std::env::current_exe().and_then(|p| p.canonicalize()) {
+    let target = match running_exe() {
         Ok(path) => path,
         Err(e) => return say(format!("! can't find the running corvo-lan: {e}")),
     };
@@ -118,6 +118,13 @@ async fn run(action: UpdateAction, out: &UnboundedSender<Notice>) {
         Ok(()) => say(format!("* installed v{latest}. Restart corvo-lan to use it.")),
         Err(e) => say(format!("! {e}")),
     }
+}
+
+/// The running binary's path. Unix resolves symlinks; Windows keeps the plain
+/// path, since `canonicalize` there returns a `\\?\` path that curl and tar
+/// and the error messages would then show.
+fn running_exe() -> std::io::Result<std::path::PathBuf> {
+    if cfg!(windows) { std::env::current_exe() } else { std::env::current_exe()?.canonicalize() }
 }
 
 #[cfg(test)]

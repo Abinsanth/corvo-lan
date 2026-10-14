@@ -7,7 +7,7 @@ on:
   push:
     branches: [release]
   pull_request:
-    paths: [.github/workflows/release.yml, Cargo.toml, Cargo.lock]
+    paths: [.github/workflows/release.yml, Cargo.toml, Cargo.lock, install.ps1]
   workflow_dispatch:
 
 permissions:
@@ -47,6 +47,7 @@ jobs:
           - { target: x86_64-apple-darwin, os: macos-latest }
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -58,8 +59,10 @@ jobs:
       - run: cargo build --release --locked --target ${{ matrix.target }}
       # The Intel macOS build is cross-compiled and can't run on this runner.
       - if: matrix.target != 'x86_64-apple-darwin'
-        run: target/${{ matrix.target }}/release/corvo-lan --version
+        shell: bash
+        run: target/${{ matrix.target }}/release/corvo-lan${{ runner.os == 'Windows' && '.exe' || '' }} --version
       - name: Package
+        if: runner.os != 'Windows'
         env:
           NAME: corvo-lan-${{ matrix.target }}
         run: |
@@ -69,10 +72,53 @@ jobs:
           else
             shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
           fi
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NAME: corvo-lan-${{ matrix.target }}
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/corvo-lan.exe" -DestinationPath "$env:NAME.zip"
+          # Lowercase, like sha256sum: /update compares it exactly.
+          $hash = (Get-FileHash -Algorithm SHA256 "$env:NAME.zip").Hash.ToLower()
+          Set-Content -NoNewline -Path "$env:NAME.zip.sha256" -Value "$hash  $env:NAME.zip`n"
+      # install.ps1 end to end against this build, served locally: a fresh
+      # install into a path with a space, then a reinstall while the exe is
+      # held open the way a running corvo-lan holds it.
+      - name: Try install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NAME: corvo-lan-${{ matrix.target }}
+        run: |
+          $site = Join-Path $env:RUNNER_TEMP 'site'
+          New-Item -ItemType Directory -Force $site | Out-Null
+          Copy-Item "$env:NAME.zip", "$env:NAME.zip.sha256" $site
+          $server = Start-Process python -ArgumentList '-m', 'http.server', '8765', '--directory', $site -PassThru
+          try {
+            $up = $false
+            foreach ($i in 1..30) {
+              try { Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8765/$env:NAME.zip.sha256" | Out-Null; $up = $true; break } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $up) { throw 'the local server never came up' }
+            $env:CORVO_LAN_BASE_URL = 'http://127.0.0.1:8765'
+            $env:CORVO_LAN_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'corvo lan bin'
+            $exe = Join-Path $env:CORVO_LAN_INSTALL_DIR 'corvo-lan.exe'
+            Get-Content -Raw install.ps1 | Invoke-Expression
+            & $exe --version
+            if ($LASTEXITCODE -ne 0) { throw 'corvo-lan --version failed' }
+            $held = [IO.File]::Open($exe, 'Open', 'Read', 'Read, Delete')
+            try { Get-Content -Raw install.ps1 | Invoke-Expression } finally { $held.Close() }
+            if (-not (Test-Path (Join-Path $env:CORVO_LAN_INSTALL_DIR 'corvo-lan.old.exe'))) { throw 'the held exe was not moved aside' }
+            & $exe --version
+            if ($LASTEXITCODE -ne 0) { throw 'corvo-lan --version failed' }
+          } finally {
+            Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: corvo-lan-${{ matrix.target }}.tar.gz*
+          path: corvo-lan-${{ matrix.target }}.*
 
   publish:
     needs: [version, build]

@@ -12,10 +12,27 @@ pub struct Style {
     pub color: bool,
 }
 
+/// The legacy Windows console prints escape codes raw unless virtual terminal
+/// processing is on; this tries to turn it on. Elsewhere it's always true.
+fn console_understands_ansi() -> bool {
+    #[cfg(windows)]
+    {
+        ratatui::crossterm::ansi_support::supports_ansi()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 impl Style {
     /// Colour only on a real terminal, and never when `NO_COLOR` is set.
     pub fn detect() -> Style {
-        Style { color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() }
+        Style {
+            color: std::io::stdout().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none()
+                && console_understands_ansi(),
+        }
     }
 
     pub fn plain() -> Style {
