@@ -143,8 +143,8 @@ struct Room {
     replay: ReplayGuard,
     door_replay: ReplayGuard,
     told_alone: bool,
-    /// A re-key timer is running.
-    rekey_pending: bool,
+    /// A re-key timer is running; the epoch when it started.
+    rekey_pending: Option<u32>,
     /// If our epoch is still the noted one at that moment, re-key ourselves.
     rekey_backup: Option<(Instant, u32)>,
     /// Keys we moved away from lately.
@@ -411,7 +411,7 @@ impl Node {
             replay: ReplayGuard::default(),
             door_replay: ReplayGuard::default(),
             told_alone: false,
-            rekey_pending: false,
+            rekey_pending: None,
             rekey_backup: None,
             previous: Vec::new(),
             resent: HashMap::new(),

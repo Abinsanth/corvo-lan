@@ -39,29 +39,29 @@ impl Node {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
-        if room.rekey_pending {
+        if room.rekey_pending.is_some() {
             return;
         }
-        room.rekey_pending = true;
+        room.rekey_pending = Some(room.epoch);
         let name = room.name.clone();
         self.after(REKEY_SETTLE, NodeMsg::RekeyDue(name));
     }
 
     /// The wait for room `name` is over. The lowest id re-keys; the rest wait
-    /// for its key and make one themselves after `REKEY_BACKUP`.
+    /// for its key and make one themselves after `REKEY_BACKUP`, unless a new
+    /// key already came during the wait.
     pub(in crate::node) fn on_rekey_due(&mut self, name: &str, now: Instant) {
         let me = self.id;
         let Some(id) = self.rooms.id_of(name) else {
             return;
         };
         let room = self.rooms.joined.get_mut(&id).expect("found above");
-        if !room.rekey_pending {
+        let Some(noted) = room.rekey_pending.take() else {
             return;
-        }
-        room.rekey_pending = false;
+        };
         if room.members.keys().all(|m| me < *m) {
             self.rekey(id);
-        } else {
+        } else if room.epoch == noted {
             room.rekey_backup = Some((now + REKEY_BACKUP, room.epoch));
         }
     }
@@ -291,6 +291,23 @@ mod tests {
         assert_eq!(keys_now(&h, &made.name).id, room::from_secret(&made.name, &secret).id);
         h.node.on_tick(tokio::time::Instant::now() + REKEY_BACKUP);
         assert!(rekeys(&made.keys, &h.sent(ZED)).is_empty());
+        assert_eq!(room_of(&h, &made.name).epoch, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_taken_before_our_wait_ends_means_no_backup() {
+        let mut h = with_peers();
+        h.connect(ZED, "zedfox", true);
+        h.events(); // its PeerJoined
+        let made = room_with(&mut h, &[ZED, BOB]).await;
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Leave));
+        deliver(&mut h, ZED, frame_from(ZED, &made.keys, rekey_body(1, ZED, [5; 32]))); // zed's wait ended first
+        let k1 = keys_now(&h, &made.name);
+        h.pump().await; // our RekeyDue
+        assert!(room_of(&h, &made.name).rekey_backup.is_none());
+        h.sent(ZED);
+        h.node.on_tick(tokio::time::Instant::now() + REKEY_BACKUP);
+        assert!(rekeys(&k1, &h.sent(ZED)).is_empty());
         assert_eq!(room_of(&h, &made.name).epoch, 1);
     }
 
