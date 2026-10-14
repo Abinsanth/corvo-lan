@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use super::state::{Editor, Hit, MAX_INPUT_ROWS, Tab, TuiState, tabs};
 use crate::api::Conv;
@@ -281,6 +281,45 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.set_cursor_position((x, area.y + (crow - first) as u16));
 }
 
+/// Most completion choices shown at once; the list scrolls with the selection.
+pub const POPUP_ROWS: usize = 6;
+
+/// The completion list, just above the input and lined up with the word.
+fn draw_popup(frame: &mut Frame, input: Rect, state: &TuiState) {
+    let Some(p) = &state.popup else {
+        return;
+    };
+    let rows = p.matches.len().min(POPUP_ROWS);
+    let height = rows as u16 + 2;
+    if input.y < height + 1 {
+        return; // no room above without covering the tabs
+    }
+    let longest = p.matches.iter().map(|m| m.chars().count()).max().unwrap_or(0) as u16;
+    let width = (longest + 2).min(input.width);
+    let before = &state.editor.before_cursor()[..p.start];
+    let col = before[before.rfind('\n').map_or(0, |i| i + 1)..].chars().count() as u16;
+    let x = (input.x + 2 + col).min(input.x + input.width - width);
+    let area = Rect::new(x, input.y - height, width, height);
+    let first = p.selected.saturating_sub(rows - 1);
+    let lines: Vec<Line> = p
+        .matches
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, m)| {
+            let style =
+                if i == p.selected { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+            Line::from(Span::styled(clean(m), style))
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().border_style(tone_style(Tone::Dim, state.color))),
+        area,
+    );
+}
+
 fn draw_status_bar(frame: &mut Frame, area: Rect, session: &Session, state: &TuiState, now: Instant) {
     let line = if let Some(flash) = state.flash_text(now) {
         Line::from(Span::styled(flash.to_string(), tone_style(Tone::Bad, state.color)))
@@ -345,6 +384,7 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
         sep_a,
     );
     draw_input(frame, input_a, state);
+    draw_popup(frame, input_a, state);
     draw_status_bar(frame, status_a, session, state, now);
 }
 
@@ -514,6 +554,21 @@ mod tests {
         let (_, y7) = find(&buf, "row7").unwrap();
         assert_eq!(y7, 18, "last input row sits above the status bar");
         assert!(rows(&buf)[14].starts_with("  row3"), "continuation rows use a 2-space prompt");
+    }
+
+    #[test]
+    fn the_completion_list_sits_above_the_input_lined_up_with_the_word() {
+        let s = session(); // me: annMoon; online: bobRoger, carolFox
+        let mut state = TuiState::new(true);
+        state.editor.set("hi @".into());
+        state.complete(&crate::ui::complete::Candidates::from_store(&s.store));
+        let buf = render(&s, &mut state, 80, 20);
+        // Input on row 18; a 2-item list is 4 rows tall (with borders): rows 14–17.
+        // "hi " is 3 columns after the 2-column prompt, plus 1 for the border.
+        assert_eq!(find(&buf, "@bobRoger"), Some((6, 15)));
+        assert_eq!(find(&buf, "@carolFox"), Some((6, 16)));
+        assert!(buf[(6, 15)].modifier.contains(Modifier::REVERSED), "the choice is highlighted");
+        assert!(!buf[(6, 16)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

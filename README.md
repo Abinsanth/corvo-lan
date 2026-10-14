@@ -109,8 +109,9 @@ After about two seconds you get a name, and you're connected to everyone else ru
 ```
 
 corvo-lan opens a full-screen view: tabs for each chat along the top, the
-people in the room and everyone online on the right. `Tab` / `Shift-Tab` or
-`Alt-1..9` switch tabs, `Alt+Enter` (or `Shift+Enter` where your terminal
+people in the room and everyone online on the right. `Shift-Tab`, `Alt-←`/`Alt-→` or
+`Alt-1..9` switch tabs, `Tab` completes `@names`, `#rooms` and `/commands` (in
+line mode too), `Alt+Enter` (or `Shift+Enter` where your terminal
 supports it) adds a new line, `PgUp`/`PgDn` or the mouse wheel scroll, and
 clicking a name opens a private chat. Command output and errors appear in the
 `corvo` tab. To select text (say, a room key), hold Shift (Option on macOS)

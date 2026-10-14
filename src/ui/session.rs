@@ -23,7 +23,8 @@ commands:
   /tui                   switch to the full-screen UI
   /help                  this list (also /h, /?)
   /quit                  leave (also /q, Ctrl-C / Ctrl-D)
-  //text                 send a message starting with '/'";
+  //text                 send a message starting with '/'
+  Tab                    complete @names, #rooms and /commands";
 
 pub const MAX_MESSAGE_LINES: usize = 50;
 
@@ -43,8 +44,9 @@ commands:
   /quit                  leave (also /q, Ctrl-C)
   //text                 send a message starting with '/'
 keys:
-  Enter send · Alt+Enter or Shift+Enter new line · Tab/Shift-Tab or Alt-1..9 switch tabs
-  PgUp/PgDn or mouse wheel scroll · Esc clear input / back to latest · click a name to chat";
+  Enter send · Alt+Enter or Shift+Enter new line · Tab complete @names, #rooms, /commands
+  Shift-Tab, Alt-←/→ or Alt-1..9 switch tabs · PgUp/PgDn or mouse wheel scroll
+  Esc close the list / clear input / back to latest · click a name to chat";
 
 /// Which frontend is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,6 +526,7 @@ mod tests {
         assert!(HELP_LINE.contains("/tui") && !HELP_LINE.contains("/line"));
         assert!(HELP_LINE.contains("/close [@nick]"), "/close works in line mode too");
         assert!(HELP_LINE.contains("/quit") && HELP_LINE.contains("/q,") && HELP_LINE.contains("/his [n]"));
+        assert!(HELP_TUI.contains("Shift-Tab") && HELP_LINE.contains("Tab"));
         s.set_mode(Mode::Tui);
         assert_eq!(typed(&mut s, "/help").print, vec![HELP_TUI]);
         assert!(HELP_TUI.contains("/line") && HELP_TUI.contains("/close") && HELP_TUI.contains("Alt+Enter"));

@@ -24,6 +24,7 @@ use ratatui::crossterm::terminal::{
 use tokio::sync::mpsc;
 
 use self::state::{Action, Hit, TuiState, WHEEL_STEP, action_for, goes_to_status};
+use super::complete::Candidates;
 use super::render::{Tone, tone_of, tone_of_text};
 use super::session::{Mode, Reaction, Session};
 use super::{Ctx, Exit};
@@ -136,6 +137,30 @@ enum KeyOutcome {
 
 /// Applies an editing, scrolling or tab key. Sending and quitting are left to the caller.
 fn apply_key(session: &mut Session, state: &mut TuiState, action: Action) -> KeyOutcome {
+    let edits =
+        matches!(action, Action::Insert(_) | Action::Backspace | Action::Delete | Action::KillRow | Action::KillWord);
+    if state.popup.is_some() {
+        match action {
+            Action::Complete | Action::Down => {
+                state.move_selection(1);
+                return KeyOutcome::Stay;
+            }
+            Action::Up => {
+                state.move_selection(-1);
+                return KeyOutcome::Stay;
+            }
+            Action::Send => {
+                state.accept();
+                return KeyOutcome::Stay;
+            }
+            Action::Esc => {
+                state.popup = None;
+                return KeyOutcome::Stay;
+            }
+            _ if edits => {}
+            _ => state.popup = None,
+        }
+    }
     let (total, height) = state.view;
     match action {
         Action::Send => return KeyOutcome::Send(state.editor.take()),
@@ -172,6 +197,10 @@ fn apply_key(session: &mut Session, state: &mut TuiState, action: Action) -> Key
         Action::PageDown => state.scroll.page_down(total, height),
         Action::Esc if state.editor.is_empty() => state.scroll.to_bottom(),
         Action::Esc => state.editor.clear(),
+        Action::Complete => state.complete(&Candidates::from_store(&session.store)),
+    }
+    if edits {
+        state.refresh_popup(&Candidates::from_store(&session.store));
     }
     KeyOutcome::Stay
 }
@@ -205,7 +234,7 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     }
     state.history.push(&text);
     if state.on_status && !text.starts_with('/') {
-        say(state, "! this is the corvo tab — switch to a chat (Tab) to send messages", now);
+        say(state, "! this is the corvo tab — switch to a chat (Shift-Tab) to send messages", now);
         return None;
     }
     let before = session.store.current().cloned();
@@ -341,6 +370,7 @@ async fn on_terminal_event(
             Some(KeyOutcome::Stay) | None => None,
         },
         TermEvent::Paste(text) => {
+            state.popup = None;
             state.editor.insert_str(&text);
             None
         }
@@ -485,6 +515,48 @@ mod tests {
         assert_eq!(state.editor.text(), "older");
         apply_key(&mut s, &mut state, Action::Down);
         assert_eq!(state.editor.text(), "hi");
+    }
+
+    #[test]
+    fn tab_completes_and_the_list_takes_enter_esc_and_arrows() {
+        let mut s = session(); // me: annMoon; online: bobRoger
+        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobKite".into() }, 0);
+        let mut state = TuiState::new(false);
+        state.editor.set("@b".into());
+        apply_key(&mut s, &mut state, Action::Complete);
+        assert_eq!(state.popup.as_ref().unwrap().matches, vec!["@bobKite", "@bobRoger"]);
+        apply_key(&mut s, &mut state, Action::Down);
+        apply_key(&mut s, &mut state, Action::Up);
+        apply_key(&mut s, &mut state, Action::Complete);
+        assert_eq!(state.popup.as_ref().unwrap().selected, 1, "Tab moves down the list");
+        assert_eq!(apply_key(&mut s, &mut state, Action::Send), KeyOutcome::Stay, "Enter picks, doesn't send");
+        assert_eq!(state.editor.text(), "@bobRoger ");
+
+        state.editor.set("@b".into());
+        apply_key(&mut s, &mut state, Action::Complete);
+        apply_key(&mut s, &mut state, Action::Esc);
+        assert!(state.popup.is_none());
+        assert_eq!(state.editor.text(), "@bob", "Esc closes the list and keeps the text");
+
+        apply_key(&mut s, &mut state, Action::Complete);
+        apply_key(&mut s, &mut state, Action::Insert('r'));
+        assert_eq!(state.popup.as_ref().unwrap().matches, vec!["@bobRoger"], "typing refreshes the list");
+        apply_key(&mut s, &mut state, Action::Left);
+        assert!(state.popup.is_none(), "moving the cursor closes it");
+    }
+
+    #[test]
+    fn shift_tab_switches_tabs_even_with_the_list_open() {
+        let mut s = session();
+        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobKite".into() }, 0);
+        s.on_line("/chat @bobRoger", None);
+        let mut state = TuiState::new(false);
+        state.on_status = true;
+        state.editor.set("@b".into());
+        apply_key(&mut s, &mut state, Action::Complete);
+        apply_key(&mut s, &mut state, Action::NextTab);
+        assert!(state.popup.is_none());
+        assert_eq!(state.current_tab(&s), 1);
     }
 
     #[test]
