@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use super::state::{Editor, Hit, MAX_INPUT_ROWS, Tab, TuiState, tabs};
 use crate::api::Conv;
 use crate::convo::{LineKind, mentions};
+use crate::names::{display, display_in};
 use crate::ui::render::{Tone, clean, hhmm, nick_color, tone_of_notice};
 use crate::ui::session::Session;
 
@@ -82,7 +83,7 @@ fn message_rows(
     let mut out = Vec::new();
     let mut first = Some(prefix);
     for part in text.split('\n') {
-        for piece in wrap(&clean(part), body_w) {
+        for piece in wrap(&clean(&display_in(part)), body_w) {
             let lead = first.take().unwrap_or_else(|| vec![Span::raw(" ".repeat(prefix_w))]);
             let mut spans = lead;
             spans.push(Span::styled(piece, style));
@@ -97,11 +98,12 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
         return Vec::new();
     };
     let me = session.store.me().unwrap_or("you").to_string();
-    let sender_of = |kind: &LineKind| match kind {
-        LineKind::Msg { from, .. } => Some(format!("@{}", clean(from))),
-        LineKind::Mine { .. } => Some(format!("@{}", clean(&me))),
+    let nick_of = |kind: &LineKind| match kind {
+        LineKind::Msg { from, .. } => Some(from.clone()),
+        LineKind::Mine { .. } => Some(me.clone()),
         LineKind::Notice(_) => None,
     };
+    let sender_of = |kind: &LineKind| nick_of(kind).map(|n| format!("@{}", clean(&display(&n))));
     let sender_w = c.lines.iter().filter_map(|l| sender_of(&l.kind)).map(|s| s.chars().count()).max().unwrap_or(1);
     let sender_w = sender_w.clamp(1, MAX_SENDER);
     let dim = tone_style(Tone::Dim, color);
@@ -115,7 +117,7 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
             }
             kind => {
                 let sender = sender_of(kind).unwrap_or_default();
-                let nick = sender.trim_start_matches('@').to_string();
+                let nick = nick_of(kind).unwrap_or_default();
                 let label = format!("{:<sender_w$} ", truncate(&sender, sender_w));
                 let text = match kind {
                     LineKind::Msg { text, .. } | LineKind::Mine { text } => text.as_str(),
@@ -151,8 +153,8 @@ fn tab_label(tab: &Tab, session: &Session) -> (String, bool) {
         Tab::Conv(conv) => {
             let c = session.store.get(conv);
             let name = match conv {
-                Conv::Room(n) => format!("#{}", clean(n)),
-                Conv::Dm(n) => format!("@{}", clean(n)),
+                Conv::Room(n) => format!("#{}", clean(&display(n))),
+                Conv::Dm(n) => format!("@{}", clean(&display(n))),
             };
             let (unread, mentioned) = c.map_or((0, 0), |c| (c.unread, c.mentions));
             let label = match (unread, mentioned) {
@@ -220,13 +222,18 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, session: &Session, state: &mut Tu
         } else {
             ("○", tone_style(Tone::Dim, state.color))
         };
-        Line::from(Span::styled(format!(" {dot} {}", truncate(&clean(nick), SIDEBAR_WIDTH as usize - 4)), style))
+        Line::from(Span::styled(
+            format!(" {dot} {}", truncate(&clean(&display(nick)), SIDEBAR_WIDTH as usize - 4)),
+            style,
+        ))
     };
     let mut invites: Vec<(usize, String)> = Vec::new();
     if let (false, Some(Conv::Room(room))) = (state.on_status, session.store.current()) {
         invites.push((lines.len(), room.clone()));
-        lines
-            .push(Line::from(Span::styled(format!("#{}", clean(room)), Style::default().add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(
+            format!("#{}", clean(&display(room))),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
         if let Some(c) = session.store.get(&Conv::Room(room.clone())) {
             let dim = tone_style(Tone::Dim, state.color);
             if let Some(key) = &c.key {
@@ -244,7 +251,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, session: &Session, state: &mut Tu
                 lines.push(Line::raw(""));
                 lines.push(Line::from(Span::styled("waiting", dim)));
                 for (nick, (have, need)) in &c.waiting {
-                    let name = truncate(&clean(nick), SIDEBAR_WIDTH as usize - 8);
+                    let name = truncate(&clean(&display(nick)), SIDEBAR_WIDTH as usize - 8);
                     let text = format!(" ? {name} {have}/{need}");
                     lines.push(Line::from(Span::styled(text, tone_style(Tone::Warn, state.color))));
                 }
@@ -301,7 +308,7 @@ fn draw_input(frame: &mut Frame, area: Rect, session: &Session, state: &TuiState
     let height = area.height as usize;
     let first = crow.saturating_sub(height.saturating_sub(1));
     let lines: Vec<Line> = if state.editor.is_empty() {
-        let hint = session.prompt().unwrap_or_else(|| "type a message…".into());
+        let hint = session.prompt().map_or_else(|| "type a message…".into(), |p| display_in(&p));
         vec![Line::from(vec![Span::raw("> "), Span::styled(hint, tone_style(Tone::Dim, state.color))])]
     } else {
         rows.iter()
@@ -369,7 +376,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, session: &Session, state: &Tui
             tone_style(Tone::Dim, state.color),
         ))
     } else {
-        let me = session.store.me().unwrap_or("…");
+        let me = session.store.me().map_or_else(|| "…".into(), display);
         let online = session.store.online().count();
         Line::from(Span::styled(
             format!("@{me} · {online} online · Alt+Enter: new line · /help"),
@@ -491,8 +498,8 @@ mod tests {
         let buf = render(&s, &mut state, 80, 20);
         let top = &rows(&buf)[0];
         assert!(top.starts_with(" corvo "), "{top}");
-        assert!(top.contains("#catpie") && top.contains("@bobroger (2)"), "{top}");
-        let (x, y) = find(&buf, "#catpie").unwrap();
+        assert!(top.contains("#catPie") && top.contains("@bobRoger (2)"), "{top}");
+        let (x, y) = find(&buf, "#catPie").unwrap();
         assert!(buf[(x, y)].modifier.contains(ratatui::style::Modifier::REVERSED), "current tab is reversed");
         assert_eq!(state.hit(x, 0), Some(Hit::Tab(1)));
     }
@@ -509,11 +516,11 @@ mod tests {
         state.select_tab(&mut s, 1);
         let buf = render(&s, &mut state, 60, 20);
         let (x0, y0) = find(&buf, "first line").unwrap();
-        let (x1, y1) = find(&buf, "[14:02] #catpie @alice: fake").unwrap();
+        let (x1, y1) = find(&buf, "[14:02] #catPie @alice: fake").unwrap();
         let (x2, _) = find(&buf, "this third line").unwrap();
         assert_eq!((x1, y1), (x0, y0 + 1), "continuation starts at the text column");
         assert_eq!(x2, x0);
-        let (sx, sy) = find(&buf, "@bobroger").unwrap();
+        let (sx, sy) = find(&buf, "@bobRoger").unwrap();
         assert_eq!(sy, y0);
         assert!(sx < x0);
         assert!(
@@ -527,10 +534,10 @@ mod tests {
         let mut state = TuiState::new(true);
         state.select_tab(&mut s, 1);
         let buf = render(&s, &mut state, 80, 20);
-        let (x, y) = find(&buf, "● bobroger").unwrap();
+        let (x, y) = find(&buf, "● bobRoger").unwrap();
         assert_eq!(buf[(x, y)].fg, Color::Green);
         assert!(find(&buf, "online").is_some());
-        assert!(find(&buf, "● carolwolf").is_some());
+        assert!(find(&buf, "● carolWolf").is_some());
         assert_eq!(state.hit(x + 3, y), Some(Hit::Person("bobroger".into())));
     }
 
@@ -548,9 +555,9 @@ mod tests {
         let (x, y) = find(&buf, "key k7m9xq").unwrap_or_else(|| panic!("{:#?}", rows(&buf)));
         assert!(find(&buf, "2/13 members").is_some());
         assert!(find(&buf, "waiting").is_some());
-        assert!(find(&buf, "? daveoak 1/2").is_some(), "{:#?}", rows(&buf));
+        assert!(find(&buf, "? daveOak 1/2").is_some(), "{:#?}", rows(&buf));
         assert_eq!(state.hit(x, y), Some(Hit::Invite("catpie".into())), "click the key to copy the invite");
-        let (hx, hy) = find(&buf, "#catpie").filter(|(hx, _)| *hx > 50).unwrap_or((x, y - 1));
+        let (hx, hy) = find(&buf, "#catPie").filter(|(hx, _)| *hx > 50).unwrap_or((x, y - 1));
         assert_eq!(state.hit(hx, hy), Some(Hit::Invite("catpie".into())), "or the room name");
     }
 
@@ -571,7 +578,7 @@ mod tests {
         let mut s = session();
         let mut state = TuiState::new(true);
         state.select_tab(&mut s, 1);
-        assert!(find(&render(&s, &mut state, 69, 20), "● carolwolf").is_none());
+        assert!(find(&render(&s, &mut state, 69, 20), "● carolWolf").is_none());
         let tiny = render(&s, &mut state, 39, 9);
         assert!(find(&tiny, "terminal too small").is_some());
     }
@@ -586,7 +593,7 @@ mod tests {
         let (x, y) = find(&buf, "! no room").unwrap();
         assert_eq!(buf[(x, y)].fg, Color::Red);
         let (px, py) = find(&buf, "* 2 peer(s) online:").unwrap();
-        let (bx, by) = find(&buf, "@bobroger").unwrap();
+        let (bx, by) = find(&buf, "@bobRoger").unwrap();
         assert_eq!((bx, by), (px + 2, py + 1));
     }
 
@@ -604,7 +611,7 @@ mod tests {
         assert_eq!(buf[(x, y)].fg, Color::Red);
         term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
         let bottom = rows(term.backend().buffer()).pop().unwrap();
-        assert!(bottom.contains("@annmoon · 2 online · Alt+Enter: new line · /help"), "{bottom}");
+        assert!(bottom.contains("@annMoon · 2 online · Alt+Enter: new line · /help"), "{bottom}");
     }
 
     #[test]
@@ -651,8 +658,8 @@ mod tests {
         let buf = render(&s, &mut state, 80, 20);
         // Input on row 18; a 2-item list is 4 rows tall (with borders): rows 14–17.
         // "hi " is 3 columns after the 2-column prompt, plus 1 for the border.
-        assert_eq!(find(&buf, "@bobroger"), Some((6, 15)));
-        assert_eq!(find(&buf, "@carolwolf"), Some((6, 16)));
+        assert_eq!(find(&buf, "@bobRoger"), Some((6, 15)));
+        assert_eq!(find(&buf, "@carolWolf"), Some((6, 16)));
         assert!(buf[(6, 15)].modifier.contains(Modifier::REVERSED), "the choice is highlighted");
         assert!(!buf[(6, 16)].modifier.contains(Modifier::REVERSED));
     }
@@ -667,7 +674,7 @@ mod tests {
         state.editor.set("@".into());
         state.complete(&crate::ui::complete::Candidates::from_store(&s.store));
         let buf = render(&s, &mut state, 80, 10);
-        assert!(find(&buf, "@bobroger").is_some(), "{:#?}", rows(&buf));
+        assert!(find(&buf, "@bobRoger").is_some(), "{:#?}", rows(&buf));
         assert!(state.popup.is_some());
         render(&s, &mut state, 39, 9);
         assert!(state.popup.is_none(), "a list that can't be shown can't take keys");
@@ -683,10 +690,10 @@ mod tests {
         }
         let mut state = TuiState::new(true);
         let top = rows(&render(&s, &mut state, 80, 20))[0].clone();
-        assert!(top.contains("#catpie (2 @1)"), "{top}");
+        assert!(top.contains("#catPie (2 @1)"), "{top}");
         state.select_tab(&mut s, 1);
         let buf = render(&s, &mut state, 80, 20);
-        let (x, y) = find(&buf, "ping @annmoon").unwrap();
+        let (x, y) = find(&buf, "ping @annMoon").unwrap();
         assert_eq!(buf[(x, y)].fg, Color::Yellow);
         assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
         let (px, py) = find(&buf, "plain words").unwrap();

@@ -1,5 +1,6 @@
 //! System-assigned names: `base + word`, all lowercase. People (`bobroger`)
-//! and rooms (`catpie`) share the shape; `@`/`#` tell them apart.
+//! and rooms (`catpie`) share the shape; `@`/`#` tell them apart. They're
+//! shown as `bobRoger` and `catPie` so you can see where the word starts.
 
 use rand::seq::SliceRandom;
 
@@ -36,6 +37,42 @@ pub fn is_valid_name(name: &str) -> bool {
 /// `bobroger` → `bob`: the part the user chose. `None` if `name` isn't a valid name.
 pub fn base_of(name: &str) -> Option<&str> {
     WORDS.iter().find_map(|w| name.strip_suffix(w).filter(|base| validate_base(base).is_ok()))
+}
+
+/// `bobroger` → `bobRoger`: how a name is shown. Only the screen sees this;
+/// the wire, room keys and lookups keep the lowercase name. Anything that
+/// isn't a valid name comes back as it is.
+pub fn display(name: &str) -> String {
+    match base_of(name) {
+        Some(base) => {
+            let word = &name[base.len()..];
+            format!("{base}{}{}", word[..1].to_ascii_uppercase(), &word[1..])
+        }
+        None => name.to_string(),
+    }
+}
+
+/// `text` with every `@name` and `#name` in it shown as [`display`] does.
+/// Only whole words count: not `a@bobroger` or `@bobrogers`.
+pub fn display_in(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(['@', '#']) {
+        out.push_str(&rest[..i]);
+        let after_word = out.chars().next_back().is_some_and(char::is_alphanumeric);
+        out.push_str(&rest[i..=i]);
+        rest = &rest[i + 1..];
+        let len = rest.find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit())).unwrap_or(rest.len());
+        let (name, tail) = rest.split_at(len);
+        if !after_word && !tail.starts_with(char::is_alphanumeric) && is_valid_name(name) {
+            out.push_str(&display(name));
+        } else {
+            out.push_str(name);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `base + word` for the first shuffled word whose name isn't taken. The
@@ -115,6 +152,30 @@ mod tests {
         assert_eq!(base_of("grapegrape"), Some("grape"));
         assert_eq!(base_of("bob"), None);
         assert_eq!(base_of("roger"), None, "no base left");
+    }
+
+    #[test]
+    fn names_show_with_the_word_capitalised() {
+        assert_eq!(display("bobroger"), "bobRoger");
+        assert_eq!(display("catpie"), "catPie");
+        assert_eq!(display("team42moon"), "team42Moon");
+        assert_eq!(display("grapegrape"), "grapeGrape");
+        assert_eq!(display("bob"), "bob", "not a name, left alone");
+        assert_eq!(display("bobRoger"), "bobRoger");
+    }
+
+    #[test]
+    fn names_inside_text_show_the_same_way() {
+        assert_eq!(display_in("@bobroger joined #catpie"), "@bobRoger joined #catPie");
+        assert_eq!(display_in("/approve @bobroger or /deny @bobroger"), "/approve @bobRoger or /deny @bobRoger");
+        assert_eq!(display_in("(/leave #catpie to stop)"), "(/leave #catPie to stop)");
+        assert_eq!(display_in("hi @bobroger, you there?"), "hi @bobRoger, you there?");
+        assert_eq!(display_in("mail a@bobroger"), "mail a@bobroger", "not after a word");
+        assert_eq!(display_in("@bobrogers"), "@bobrogers", "not a whole name");
+        assert_eq!(display_in("@bobrogerX"), "@bobrogerX");
+        assert_eq!(display_in("@bob and #1 and # and @"), "@bob and #1 and # and @");
+        assert_eq!(display_in("@@bobroger é#catpie"), "@@bobRoger é#catpie");
+        assert_eq!(display_in(&display_in("@bobroger")), "@bobRoger", "twice is the same as once");
     }
 
     #[test]
