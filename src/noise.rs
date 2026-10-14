@@ -24,6 +24,8 @@ pub enum HandshakeError {
     Version(u8),
     #[error("key mismatch")]
     KeyMismatch,
+    #[error("peer key is invalid")]
+    WeakKey,
     #[error("connected to myself")]
     Myself,
     #[error("noise handshake failed: {0}")]
@@ -82,6 +84,9 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
 
     let remote = hs.get_remote_static().and_then(|k| <[u8; 32]>::try_from(k).ok()).map(PeerId);
     let remote = remote.ok_or(HandshakeError::Noise(snow::Error::Input))?;
+    if is_weak(&remote, keys) {
+        return Err(HandshakeError::WeakKey);
+    }
     if remote == keys.public {
         return Err(HandshakeError::Myself);
     }
@@ -142,6 +147,11 @@ pub(crate) async fn test_pair() -> ((Sealer, Opener), (Sealer, Opener)) {
     ((sa, oa), (sb, ob))
 }
 
+/// A low-order remote key gives an all-zero shared secret, so anyone could claim it.
+fn is_weak(remote: &PeerId, keys: &Keys) -> bool {
+    curve25519_dalek::MontgomeryPoint(remote.0).mul_clamped(*keys.secret()).to_bytes() == [0u8; 32]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +161,13 @@ mod tests {
         let (mut x, mut y) = duplex(1 << 16);
         let (ra, rb) = tokio::join!(handshake(&mut x, &a, true, expected), handshake(&mut y, &b, false, None));
         (ra.map(|r| r.0).map_err(|e| e.to_string()), rb.map(|r| r.0).map_err(|e| e.to_string()))
+    }
+
+    #[test]
+    fn low_order_keys_are_weak() {
+        let k = Keys::generate();
+        assert!(is_weak(&PeerId([0; 32]), &k));
+        assert!(!is_weak(&Keys::generate().public, &k));
     }
 
     #[tokio::test]
