@@ -103,9 +103,9 @@ impl Node {
     }
 
     /// A frame under one of room `current`'s old keys (old room id `old`). A
-    /// member still on it is sent the new key; a newcomer we let in with it is
-    /// answered and sent the new key; anyone else, whoever left or was kicked
-    /// included, is ignored.
+    /// member still on it is sent the new key; so is a newcomer we let in with
+    /// it, after an answer if they probed; anyone else, whoever left or was
+    /// kicked included, is ignored.
     pub(super) fn on_old_key_frame(
         &mut self,
         current: RoomId,
@@ -134,12 +134,15 @@ impl Node {
             self.on_member_envelope(current, from, env, now);
             return;
         }
-        let admitted = room.requests.get(&from).is_some_and(|r| r.admitted.is_some());
-        if let (true, RoomBody::Probe { nonce }) = (admitted, env.body) {
+        if !room.requests.get(&from).is_some_and(|r| r.admitted.is_some()) {
+            return;
+        }
+        // Their probe gets its answer first: it proves us to them, so they take the key that follows.
+        if let RoomBody::Probe { nonce } = env.body {
             let reply = RoomBody::Here { name: room.name.clone(), echo: Some(nonce) };
             self.send_to(from, self.seal(&old_keys, reply));
-            self.resend_key(current, from, &old_keys, now);
         }
+        self.resend_key(current, from, &old_keys, now);
     }
 
     /// Sends `to` the room's current secret, sealed with the `old` keys they
@@ -462,6 +465,23 @@ mod tests {
         let sent = bodies(&made.keys, &h.sent(BOB));
         assert_eq!(sent[0], here(&made.name, Some("p1")), "proves us to him first");
         assert!(matches!(&sent[1], RoomBody::Rekey { epoch: 1, by, .. } if *by == ME));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_newcomer_whose_answer_crossed_the_rekey_still_gets_the_new_key() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[CAROL]).await;
+        knock(&mut h, BOB, &made, 100);
+        approve(&mut h, &made, "bobroger");
+        h.pump().await; // Settle: bob gets the secret that's about to be replaced
+        deliver(&mut h, CAROL, frame_from(CAROL, &made.keys, RoomBody::Leave));
+        h.pump().await; // RekeyDue
+        h.sent(BOB);
+        // His probe was answered before the switch; this is his presence, or the answer to a challenge.
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, here(&made.name, None)));
+        let sent = rekeys(&made.keys, &h.sent(BOB));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(room::from_secret(&made.name, &sent[0].2).id, keys_now(&h, &made.name).id);
     }
 
     #[tokio::test(start_paused = true)]
