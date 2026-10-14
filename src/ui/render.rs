@@ -200,9 +200,9 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
         }
         Event::Peers { you, nick, peers } => {
             let mut out = format!("* {} peer(s) online:", peers.len());
-            out.push_str(&format!("\n  {:<16} {}", format!("you {}", s.nick(nick)), you.fingerprint()));
+            out.push_str(&format!("\n  {} {}", pad(&format!("you {}", s.nick(nick)), 16), you.fingerprint()));
             for p in peers {
-                out.push_str(&format!("\n  {:<16} {}  {}", s.nick(&p.nick), p.id.fingerprint(), p.addr));
+                out.push_str(&format!("\n  {} {}  {}", pad(&s.nick(&p.nick), 16), p.id.fingerprint(), p.addr));
             }
             out
         }
@@ -231,6 +231,25 @@ pub fn line(conv: &Conv, l: &Line, style: &Style) -> String {
     }
 }
 
+/// Pads `s` to `width` columns on screen; colour codes take no room.
+fn pad(s: &str, width: usize) -> String {
+    format!("{s}{}", " ".repeat(width.saturating_sub(visible_len(s))))
+}
+
+fn visible_len(s: &str) -> usize {
+    let mut n = 0;
+    let mut in_code = false;
+    for c in s.chars() {
+        match (in_code, c) {
+            (false, '\x1b') => in_code = true,
+            (true, 'm') => in_code = false,
+            (false, _) => n += 1,
+            (true, _) => {}
+        }
+    }
+    n
+}
+
 pub fn conv_name(conv: &Conv, style: &Style) -> String {
     match conv {
         Conv::Room(n) => style.room(n),
@@ -255,7 +274,7 @@ pub fn chats(store: &Store, style: &Style) -> String {
         if store.current() == Some(&c.conv) {
             tags.push("current".into());
         }
-        out.push_str(&format!("\n  {:<18} {}", conv_name(&c.conv, style), tags.join(", ")));
+        out.push_str(&format!("\n  {} {}", pad(&conv_name(&c.conv, style), 18), tags.join(", ")));
     }
     out
 }
@@ -273,7 +292,7 @@ pub fn rooms(store: &Store, style: &Style) -> String {
         } else {
             c.members.iter().map(|m| style.nick(m)).collect::<Vec<_>>().join(", ")
         };
-        out.push_str(&format!("\n  {:<18} {members}", conv_name(&c.conv, style)));
+        out.push_str(&format!("\n  {} {members}", pad(&conv_name(&c.conv, style), 18)));
     }
     out
 }
@@ -379,6 +398,37 @@ mod tests {
         assert_eq!(prompt(None), "> ");
         assert_eq!(prompt(Some(&Conv::Room("catPieR".into()))), "#catPieR> ");
         assert_eq!(prompt(Some(&Conv::Dm("bobRoger".into()))), "@bobRoger> ");
+    }
+
+    /// The text as it shows on screen: colour codes removed.
+    fn on_screen(s: &str) -> String {
+        let mut out = String::new();
+        let mut in_code = false;
+        for c in s.chars() {
+            match (in_code, c) {
+                (false, '\x1b') => in_code = true,
+                (true, 'm') => in_code = false,
+                (false, c) => out.push(c),
+                (true, _) => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn coloured_who_lines_up_like_plain() {
+        let peers = Event::Peers {
+            you: PeerId::test(0x7f3a_9c0d_12e4_5b68),
+            nick: "annMoon".into(),
+            peers: vec![PeerInfo {
+                id: PeerId::test(0xa1b2_c3d4_e5f6_0718),
+                nick: "bobRoger".into(),
+                addr: "10.0.0.2:5000".parse().unwrap(),
+            }],
+        };
+        let coloured = event(&peers, 0, &Style { color: true }).unwrap();
+        assert_ne!(coloured, event(&peers, 0, &P).unwrap(), "colour is really on");
+        assert_eq!(on_screen(&coloured), event(&peers, 0, &P).unwrap());
     }
 
     #[test]
