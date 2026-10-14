@@ -391,7 +391,7 @@ impl Node {
                 let mut peers: Vec<PeerInfo> =
                     self.peers.iter().map(|(id, p)| PeerInfo { id: *id, nick: p.nick.clone(), addr: p.addr }).collect();
                 peers.sort_by(|a, b| a.nick.cmp(&b.nick));
-                self.emit(Event::Peers { you: self.id, peers });
+                self.emit(Event::Peers { you: self.id, nick: self.my_nick(), peers });
             }
             Command::Quit => {} // handled in `run`
         }
@@ -1058,8 +1058,9 @@ pub(super) mod tests {
         h.events();
         h.node.handle_command(Command::ListPeers);
         match h.events().as_slice() {
-            [Event::Peers { you, peers }] => {
+            [Event::Peers { you, nick, peers }] => {
                 assert_eq!(*you, ME);
+                assert_eq!(nick, "annMoon");
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0].id, BOB);
             }

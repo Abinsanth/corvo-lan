@@ -233,12 +233,13 @@ async fn crash_is_reported_as_connection_lost() {
 async fn who_lists_connected_peers_and_our_fingerprint() {
     let (mut alice, bob) = pair().await;
     send(&alice, Command::ListPeers).await;
-    let Event::Peers { you, peers } =
+    let Event::Peers { you, nick, peers } =
         wait_for(&mut alice.node, "peer list", |e| matches!(e, Event::Peers { .. })).await
     else {
         unreachable!()
     };
     assert_eq!(you, alice.node.id);
+    assert_eq!(nick, alice.nick);
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0].nick, bob.nick);
     assert_eq!(peers[0].id, bob.node.id);

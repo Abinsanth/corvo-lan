@@ -195,12 +195,12 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
         Event::MemberLeft { room, nick } => {
             notice(now, &format!("{} {} {}", s.nick(nick), s.tone(Tone::Bad, "left"), s.room(room)), s)
         }
-        Event::Peers { you, peers } if peers.is_empty() => {
-            format!("* no peers connected — your fingerprint is {}", you.fingerprint())
+        Event::Peers { you, nick, peers } if peers.is_empty() => {
+            format!("* no peers connected — you are {}, fingerprint {}", s.nick(nick), you.fingerprint())
         }
-        Event::Peers { you, peers } => {
+        Event::Peers { you, nick, peers } => {
             let mut out = format!("* {} peer(s) online:", peers.len());
-            out.push_str(&format!("\n  {:<16} {}", "you", you.fingerprint()));
+            out.push_str(&format!("\n  {:<16} {}", format!("you {}", s.nick(nick)), you.fingerprint()));
             for p in peers {
                 out.push_str(&format!("\n  {:<16} {}  {}", s.nick(&p.nick), p.id.fingerprint(), p.addr));
             }
@@ -326,6 +326,7 @@ mod tests {
         assert_eq!(event(&assigned, 0, &P).unwrap(), "* the system assigned you @annMoon — this name can't be changed");
         let peers = Event::Peers {
             you: PeerId::test(0x7f3a_9c0d_12e4_5b68),
+            nick: "annMoon".into(),
             peers: vec![PeerInfo {
                 id: PeerId::test(0xa1b2_c3d4_e5f6_0718),
                 nick: "bobRoger".into(),
@@ -333,11 +334,14 @@ mod tests {
             }],
         };
         let text = event(&peers, 0, &P).unwrap();
-        let you = format!("\n  {:<16} 7f3a 9c0d 12e4 5b68", "you");
+        let you = format!("\n  {:<16} 7f3a 9c0d 12e4 5b68", "you @annMoon");
         let bob = format!("\n  {:<16} a1b2 c3d4 e5f6 0718  10.0.0.2:5000", "@bobRoger");
         assert_eq!(text, format!("* 1 peer(s) online:{you}{bob}"));
-        let alone = Event::Peers { you: PeerId::test(0x7f3a_9c0d_12e4_5b68), peers: vec![] };
-        assert_eq!(event(&alone, 0, &P).unwrap(), "* no peers connected — your fingerprint is 7f3a 9c0d 12e4 5b68");
+        let alone = Event::Peers { you: PeerId::test(0x7f3a_9c0d_12e4_5b68), nick: "annMoon".into(), peers: vec![] };
+        assert_eq!(
+            event(&alone, 0, &P).unwrap(),
+            "* no peers connected — you are @annMoon, fingerprint 7f3a 9c0d 12e4 5b68"
+        );
     }
 
     #[test]
@@ -425,7 +429,7 @@ mod tests {
             Tone::Warn
         );
         assert_eq!(tone_of(&Event::Info("looking for peers…".into())), Tone::Plain);
-        assert_eq!(tone_of(&Event::Peers { you: PeerId::test(1), peers: vec![] }), Tone::Plain);
+        assert_eq!(tone_of(&Event::Peers { you: PeerId::test(1), nick: "annMoon".into(), peers: vec![] }), Tone::Plain);
         let changed = "@bobMoon has a different key from the bob you met before (last seen 2026-10-12). Compare fingerprints in /who.";
         assert_eq!(tone_of(&Event::Info(changed.into())), Tone::Warn);
         assert_eq!(tone_of(&Event::Info("first time meeting @bobRoger (7f3a 9c0d 12e4 5b68)".into())), Tone::Plain);

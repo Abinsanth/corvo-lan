@@ -119,8 +119,10 @@ pub enum Event {
         room: String,
         nick: String,
     },
+    /// `you`/`nick` are ours, so `/who` can show our fingerprint.
     Peers {
         you: PeerId,
+        nick: String,
         peers: Vec<PeerInfo>,
     },
     /// User-facing problem, e.g. a wrong room key.
