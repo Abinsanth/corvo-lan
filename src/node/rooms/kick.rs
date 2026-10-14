@@ -274,6 +274,18 @@ mod tests {
         assert!(h.sent(BOB).is_empty(), "no invite sent");
     }
 
+    #[tokio::test]
+    async fn a_banned_peer_is_never_proven_or_voted_on() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[CAROL]).await;
+        h.node.rooms.joined.get_mut(&made.id).unwrap().kicks.insert(BOB, BAN_AFTER);
+        vote(&mut h, CAROL, &made, BOB, true);
+        assert!(h.events().is_empty(), "no request opened for him");
+        verify(&mut h, BOB, &made.name, &made.keys); // he still holds the key
+        assert!(!room_of(&h, &made.name).members.contains_key(&BOB));
+        assert!(h.events().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_banned_newcomer_is_told() {
         let mut h = with_peers();

@@ -131,6 +131,8 @@ struct Room {
     door: RoomKeys,
     /// Other members, all proven.
     members: HashMap<PeerId, Member>,
+    /// Peers removed from the room; they may only come back through the door.
+    gone: HashSet<PeerId>,
     challenges: HashMap<PeerId, Challenge>,
     requests: HashMap<PeerId, Request>,
     /// Recently closed requests (their `asked`, and when), so a vote still on
@@ -401,6 +403,7 @@ impl Node {
             keys,
             door,
             members,
+            gone: HashSet::new(),
             challenges: HashMap::new(),
             requests: HashMap::new(),
             closed: HashMap::new(),
@@ -667,6 +670,7 @@ impl Node {
                 free -= 1;
                 let request = room.requests.get_mut(&peer).expect("listed above");
                 request.admitted = Some(now);
+                room.gone.remove(&peer);
                 if request.approvals.contains(&me) {
                     grants.push(peer);
                 }
@@ -818,7 +822,7 @@ impl Node {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
-        if peer == me || room.members.contains_key(&peer) {
+        if peer == me || room.members.contains_key(&peer) || room.banned(peer) {
             return;
         }
         let name = room.name.clone();
@@ -919,6 +923,10 @@ impl Node {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
+        // Whoever was removed holds this key until the re-key; they come back only through the door.
+        if room.gone.contains(&from) {
+            return;
+        }
         // Anyone may probe, member or not: answer privately, echoing their nonce.
         if let RoomBody::Probe { nonce } = &env.body {
             let reply = RoomBody::Here { name: room.name.clone(), echo: Some(nonce.clone()) };
@@ -932,7 +940,7 @@ impl Node {
         }
         // Unknown sender: is this the answer to our challenge, or to the probe we sent on arrival?
         let proven = match (&env.body, room.challenges.get(&from)) {
-            (RoomBody::Here { name, echo: Some(e) }, c) if *name == room.name => {
+            (RoomBody::Here { name, echo: Some(e) }, c) if *name == room.name && !room.banned(from) => {
                 c.is_some_and(|c| c.nonce == *e) || room.probe.as_ref() == Some(e)
             }
             _ => false,
@@ -1021,7 +1029,8 @@ impl Node {
         }
     }
 
-    /// Takes `member` out of room `id`, starting a re-key; true if they were a member.
+    /// Takes `member` out of room `id`, starting a re-key; true if they were a
+    /// member. From then on they only get back in through the door.
     fn forget_member(&mut self, id: RoomId, member: PeerId) -> bool {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return false;
@@ -1030,6 +1039,7 @@ impl Node {
         room.kick_votes.remove(&member);
         let was = room.members.remove(&member).is_some();
         if was {
+            room.gone.insert(member);
             self.schedule_rekey(id);
         }
         was

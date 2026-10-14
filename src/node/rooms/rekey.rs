@@ -364,6 +364,43 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn whoever_was_removed_cannot_get_back_in_before_the_rekey() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[BOB, CAROL]).await;
+        h.node.rooms.joined.get_mut(&made.id).unwrap().probe = Some("join-probe".into());
+        h.node.handle_command(Command::Kick { room: made.name.clone(), nick: "bobroger".into() });
+        assert!(!room_of(&h, &made.name).members.contains_key(&BOB));
+        h.events();
+        h.sent(BOB);
+        // Still under the old key, which is current until RekeyDue.
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Probe { nonce: "p1".into() }));
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, here(&made.name, None)));
+        assert!(h.sent(BOB).is_empty(), "no answer, no challenge");
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, here(&made.name, Some("join-probe"))));
+        assert!(!room_of(&h, &made.name).members.contains_key(&BOB), "echoing our join probe doesn't prove him");
+        assert!(h.events().is_empty());
+        h.pump().await; // RekeyDue
+        assert!(rekeys(&made.keys, &h.sent(BOB)).is_empty(), "and he isn't handed the new key");
+        assert_eq!(rekeys(&made.keys, &h.sent(CAROL)).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn whoever_left_comes_back_through_the_door() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[BOB, CAROL]).await;
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Leave));
+        h.pump().await; // RekeyDue
+        knock(&mut h, BOB, &made, 100);
+        approve(&mut h, &made, "bobroger");
+        h.pump().await; // Settle: he's let in again
+        h.events();
+        let keys = keys_now(&h, &made.name);
+        verify(&mut h, BOB, &made.name, &keys);
+        assert!(room_of(&h, &made.name).members.contains_key(&BOB));
+        assert!(h.events().contains(&Event::MemberJoined { room: made.name.clone(), nick: "bobroger".into() }));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_member_who_missed_the_rekey_is_sent_the_key_again() {
         let mut h = with_peers();
         let made = room_with(&mut h, &[BOB, CAROL]).await;
