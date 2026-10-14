@@ -383,7 +383,7 @@ mod tests {
         let mut s = Session::new(Style::plain());
         s.set_mode(Mode::Tui);
         s.on_event(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
-        s.on_event(&Event::PeerJoined { id: PeerId(2), nick: "bobRoger".into() }, 0);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
         s
     }
 

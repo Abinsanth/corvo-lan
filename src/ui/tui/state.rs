@@ -585,7 +585,7 @@ mod tests {
 
     fn session_with_tabs() -> Session {
         let mut s = Session::new(Style::plain());
-        s.on_event(&Event::PeerJoined { id: PeerId(2), nick: "bobRoger".into() }, 0);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
         s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
         s.on_event(
             &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 },
@@ -675,6 +675,6 @@ mod tests {
         assert!(!goes_to_status(&Event::MemberJoined { room: "r".into(), nick: "b".into() }));
         assert!(goes_to_status(&Event::Error("x".into())));
         assert!(goes_to_status(&Event::RoomCreated { name: "r".into(), key: "k".into() }));
-        assert!(goes_to_status(&Event::PeerJoined { id: PeerId(1), nick: "b".into() }));
+        assert!(goes_to_status(&Event::PeerJoined { id: PeerId::test(1), nick: "b".into() }));
     }
 }

@@ -275,9 +275,12 @@ mod tests {
         write_frame(&mut theirs, &Frame::Ping).await.unwrap();
         write_frame(&mut theirs, &chat).await.unwrap();
         drop(theirs);
-        assert_eq!(read_loop(&mut ours, 7, PeerId(9), &node_tx).await, LeaveReason::Lost);
+        assert_eq!(read_loop(&mut ours, 7, PeerId::test(9), &node_tx).await, LeaveReason::Lost);
         match node_rx.try_recv() {
-            Ok(NodeMsg::PeerFrame { conn: 7, id: PeerId(9), frame }) => assert_eq!(frame, chat),
+            Ok(NodeMsg::PeerFrame { conn: 7, id, frame }) => {
+                assert_eq!(id, PeerId::test(9));
+                assert_eq!(frame, chat);
+            }
             _ => panic!("expected the chat frame to be forwarded"),
         }
         assert!(node_rx.try_recv().is_err()); // Ping is swallowed

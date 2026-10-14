@@ -90,8 +90,8 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    const ME: PeerId = PeerId(1);
-    const OTHER: PeerId = PeerId(2);
+    const ME: PeerId = PeerId::test(1);
+    const OTHER: PeerId = PeerId::test(2);
 
     fn src() -> SocketAddr {
         "192.168.1.20:4299".parse().unwrap()

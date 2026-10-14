@@ -317,12 +317,12 @@ mod tests {
         assert_eq!(event(&joined, 0, &P).unwrap(), "* joined #catPieR with @bobRoger, @carolFox");
         let member = Event::MemberJoined { room: "catPieR".into(), nick: "carolFox".into() };
         assert_eq!(event(&member, 0, &P).unwrap(), format!("{} * @carolFox joined #catPieR", t(0)));
-        let lost = Event::PeerLeft { id: PeerId(1), nick: "bobRoger".into(), reason: LeaveReason::Lost };
+        let lost = Event::PeerLeft { id: PeerId::test(1), nick: "bobRoger".into(), reason: LeaveReason::Lost };
         assert_eq!(event(&lost, 0, &P).unwrap(), format!("{} * @bobRoger went offline (connection lost)", t(0)));
         let assigned = Event::Assigned { nick: "annMoon".into(), renamed: false };
         assert_eq!(event(&assigned, 0, &P).unwrap(), "* the system assigned you @annMoon — this name can't be changed");
         let peers = Event::Peers(vec![PeerInfo {
-            id: PeerId(1),
+            id: PeerId::test(1),
             nick: "bobRoger".into(),
             addr: "10.0.0.2:5000".parse().unwrap(),
         }]);
@@ -398,11 +398,14 @@ mod tests {
     #[test]
     fn events_have_tones() {
         let nick = || "bobRoger".to_string();
-        assert_eq!(tone_of(&Event::PeerJoined { id: PeerId(1), nick: nick() }), Tone::Good);
+        assert_eq!(tone_of(&Event::PeerJoined { id: PeerId::test(1), nick: nick() }), Tone::Good);
         assert_eq!(tone_of(&Event::MemberJoined { room: "r".into(), nick: nick() }), Tone::Good);
         assert_eq!(tone_of(&Event::RoomCreated { name: "r".into(), key: "k".into() }), Tone::Good);
         assert_eq!(tone_of(&Event::RoomJoined { name: "r".into(), members: vec![] }), Tone::Good);
-        assert_eq!(tone_of(&Event::PeerLeft { id: PeerId(1), nick: nick(), reason: LeaveReason::Quit }), Tone::Bad);
+        assert_eq!(
+            tone_of(&Event::PeerLeft { id: PeerId::test(1), nick: nick(), reason: LeaveReason::Quit }),
+            Tone::Bad
+        );
         assert_eq!(tone_of(&Event::MemberLeft { room: "r".into(), nick: nick() }), Tone::Bad);
         assert_eq!(tone_of(&Event::RoomLeft { name: "r".into() }), Tone::Bad);
         assert_eq!(tone_of(&Event::Error("x".into())), Tone::Bad);
@@ -439,10 +442,11 @@ mod tests {
         assert_eq!(c.tone(Tone::Plain, "x"), "x");
         assert_eq!(c.toned("! nope"), "\x1b[31m! nope\x1b[0m");
         assert_eq!(P.tone(Tone::Bad, "x"), "x");
-        let online = event(&Event::PeerJoined { id: PeerId(1), nick: "bobRoger".into() }, 0, &c).unwrap();
+        let online = event(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0, &c).unwrap();
         assert!(online.contains("\x1b[32mis online\x1b[0m"), "{online:?}");
-        let gone = event(&Event::PeerLeft { id: PeerId(1), nick: "bobRoger".into(), reason: LeaveReason::Quit }, 0, &c)
-            .unwrap();
+        let gone =
+            event(&Event::PeerLeft { id: PeerId::test(1), nick: "bobRoger".into(), reason: LeaveReason::Quit }, 0, &c)
+                .unwrap();
         assert!(gone.contains("\x1b[31mwent offline\x1b[0m"), "{gone:?}");
         let error = event(&Event::Error("no room".into()), 0, &c).unwrap();
         assert_eq!(error, "\x1b[31m! no room\x1b[0m");

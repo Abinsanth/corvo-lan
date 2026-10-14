@@ -6,14 +6,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 /// Largest JSON body accepted in a single TCP frame.
 pub const MAX_FRAME_LEN: usize = 64 * 1024;
 
-/// Random per-run identity. Serialized as 16 lowercase hex characters.
+/// A peer's X25519 public key. Serialized as 64 lowercase hex characters.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
-pub struct PeerId(pub u64);
+pub struct PeerId(pub [u8; 32]);
 
 impl PeerId {
     pub fn random() -> Self {
@@ -24,11 +24,29 @@ impl PeerId {
     pub fn short(&self) -> String {
         self.to_string()[..4].to_string()
     }
+
+    /// First 8 bytes as four groups of four hex digits, for comparing by eye.
+    pub fn fingerprint(&self) -> String {
+        self.0[..8].chunks(2).map(|c| format!("{:02x}{:02x}", c[0], c[1])).collect::<Vec<_>>().join(" ")
+    }
+
+    /// `n` big-endian in the first 8 bytes, so test ids order like their numbers.
+    #[cfg(test)]
+    pub const fn test(n: u64) -> PeerId {
+        let be = n.to_be_bytes();
+        let mut bytes = [0u8; 32];
+        let mut i = 0;
+        while i < 8 {
+            bytes[i] = be[i];
+            i += 1;
+        }
+        PeerId(bytes)
+    }
 }
 
 impl fmt::Display for PeerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:016x}", self.0)
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
     }
 }
 
@@ -42,10 +60,13 @@ impl TryFrom<String> for PeerId {
     type Error = String;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        if s.len() != 16 {
-            return Err(format!("peer id must be 16 hex chars, got {:?}", s));
+        if s.len() != 64 {
+            return Err(format!("peer id must be 64 hex chars, got {} chars", s.len()));
         }
-        u64::from_str_radix(&s, 16).map(PeerId).map_err(|e| format!("invalid peer id {s:?}: {e}"))
+        crate::room::from_hex(&s)
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(PeerId)
+            .ok_or_else(|| format!("invalid peer id {s:?}"))
     }
 }
 
@@ -155,7 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_frame_variant_round_trips() {
-        let id = PeerId(0x7f3a_9c0d_12e4_5b68);
+        let id = PeerId::test(0x7f3a_9c0d_12e4_5b68);
         let frames = vec![
             Frame::Hello { v: PROTOCOL_VERSION, id, nick: "aliceMoon".into() },
             Frame::Room { room_id: "ab".repeat(16), nonce: "cd".repeat(24), ct: "ef".repeat(20) },
@@ -217,16 +238,35 @@ mod tests {
 
     #[test]
     fn announce_round_trips() {
-        let a = Announce { v: 2, id: PeerId(42), nick: "aliceMoon".into(), tcp_port: 54321 };
+        let a = Announce { v: 3, id: PeerId::test(42), nick: "aliceMoon".into(), tcp_port: 54321 };
         let json = String::from_utf8(a.to_bytes()).unwrap();
-        assert_eq!(json, r#"{"v":2,"id":"000000000000002a","nick":"aliceMoon","tcp_port":54321}"#);
+        let hex = format!("000000000000002a{}", "0".repeat(48));
+        assert_eq!(json, format!(r#"{{"v":3,"id":"{hex}","nick":"aliceMoon","tcp_port":54321}}"#));
         assert_eq!(Announce::from_bytes(json.as_bytes()).unwrap(), a);
     }
 
     #[test]
-    fn peer_id_rejects_bad_hex() {
+    fn peer_id_is_64_hex_chars() {
         assert!(PeerId::try_from("xyz".to_string()).is_err());
-        assert!(PeerId::try_from("zzzzzzzzzzzzzzzz".to_string()).is_err());
-        assert_eq!(PeerId(0xabcd_0000_0000_0000).short(), "abcd");
+        assert!(PeerId::try_from("z".repeat(64)).is_err());
+        assert!(PeerId::try_from("ab".repeat(31)).is_err(), "62 chars");
+        let id = PeerId::try_from("ab".repeat(32)).unwrap();
+        assert_eq!(id, PeerId([0xab; 32]));
+        assert_eq!(id.to_string(), "ab".repeat(32));
+        assert_eq!(id.short(), "abab");
+    }
+
+    #[test]
+    fn fingerprint_is_the_first_eight_bytes_in_groups() {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&[0x7f, 0x3a, 0x9c, 0x0d, 0x12, 0xe4, 0x5b, 0x68]);
+        bytes[8] = 0xff; // not shown
+        assert_eq!(PeerId(bytes).fingerprint(), "7f3a 9c0d 12e4 5b68");
+    }
+
+    #[test]
+    fn test_ids_order_by_their_number() {
+        assert!(PeerId::test(1) < PeerId::test(2));
+        assert!(PeerId::test(0xff) < PeerId::test(0x100));
     }
 }

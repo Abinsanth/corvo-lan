@@ -589,9 +589,9 @@ impl Node {
 pub(super) mod tests {
     use super::*;
 
-    pub(in crate::node) const ME: PeerId = PeerId(0x1000_0000_0000_0000);
-    pub(in crate::node) const BOB: PeerId = PeerId(0x2000_0000_0000_0000);
-    pub(in crate::node) const CAROL: PeerId = PeerId(0x3000_0000_0000_0000);
+    pub(in crate::node) const ME: PeerId = PeerId::test(0x1000_0000_0000_0000);
+    pub(in crate::node) const BOB: PeerId = PeerId::test(0x2000_0000_0000_0000);
+    pub(in crate::node) const CAROL: PeerId = PeerId::test(0x3000_0000_0000_0000);
 
     pub(in crate::node) struct Harness {
         pub(in crate::node) node: Node,
@@ -707,9 +707,9 @@ pub(super) mod tests {
     fn peer_count_is_capped() {
         let mut h = Harness::new();
         for i in 0..MAX_PEERS as u64 {
-            assert!(h.connect(PeerId(0x4000_0000_0000_0000 + i), &format!("p{i}Fox"), true));
+            assert!(h.connect(PeerId::test(0x4000_0000_0000_0000 + i), &format!("p{i}Fox"), true));
         }
-        assert_eq!(h.connect_verdict(PeerId(0x5000_0000_0000_0000), "lateFox", out(1)), Verdict::Close);
+        assert_eq!(h.connect_verdict(PeerId::test(0x5000_0000_0000_0000), "lateFox", out(1)), Verdict::Close);
         assert_eq!(h.node.peers.len(), MAX_PEERS);
     }
 
@@ -730,7 +730,7 @@ pub(super) mod tests {
 
         // A lower id than ours shows up with our name: we re-roll and tell everyone.
         let mut h = Harness::new();
-        let low = PeerId(1);
+        let low = PeerId::test(1);
         assert!(h.connect(low, "annMoon", true));
         let mine = h.node.my_nick();
         assert_ne!(mine, "annMoon");
@@ -790,8 +790,11 @@ pub(super) mod tests {
         h.node.naming = Some(HashSet::new());
         let taken: Vec<String> = crate::words::WORDS.iter().skip(1).map(|w| format!("ann{w}")).collect();
         for (i, nick) in taken.iter().enumerate() {
-            let s =
-                Sighting { id: PeerId(100 + i as u64), nick: nick.clone(), tcp_addr: "127.0.0.1:1".parse().unwrap() };
+            let s = Sighting {
+                id: PeerId::test(100 + i as u64),
+                nick: nick.clone(),
+                tcp_addr: "127.0.0.1:1".parse().unwrap(),
+            };
             h.node.on_discovered(s);
         }
         assert!(h.node.dialing.is_empty(), "no dialing before we have a name");
