@@ -17,6 +17,7 @@ chat
   /msg @nick <text>    one-off message (/m)
   /create <name>       new private room
   /invite @nick        bring someone in
+  /kick @nick          vote someone out
   /accept  /decline    answer an invite
   /approve /deny       answer a join request
   /leave   /close      leave a room / chat
@@ -290,6 +291,15 @@ impl Session {
                     return Reaction::say("! /invite works in a room tab, or name the room: /invite @nick #room");
                 };
                 Reaction::send(Command::Invite { nick, room })
+            }
+            Input::Kick { nick, room } => {
+                let Some(room) = room.or_else(|| match self.store.current() {
+                    Some(Conv::Room(name)) => Some(name.clone()),
+                    _ => None,
+                }) else {
+                    return Reaction::say("! /kick works in a room tab, or name the room: /kick @nick #room");
+                };
+                Reaction::send(Command::Kick { room, nick })
             }
             Input::Accept(room) => match self.invited_room(room, "accept") {
                 Ok(room) => Reaction::send(Command::Accept { room }),
@@ -685,6 +695,21 @@ mod tests {
             Reaction::say("! /invite works in a room tab, or name the room: /invite @nick #room")
         );
         assert_eq!(typed(&mut s, "/invite").print, vec!["! usage: /invite @nick [#room]"]);
+    }
+
+    #[test]
+    fn kick_goes_to_the_current_or_named_room() {
+        let mut s = bob_waits_in(&["catpie"]);
+        s.store.switch(Conv::Room("catpie".into()));
+        let kick = |room: &str| Reaction::send(Command::Kick { room: room.into(), nick: "carolwolf".into() });
+        assert_eq!(typed(&mut s, "/kick @CarolWolf"), kick("catpie"));
+        typed(&mut s, "/chat @bobroger");
+        assert_eq!(typed(&mut s, "/kick @carolwolf #dogpie"), kick("dogpie"), "the node checks the room");
+        assert_eq!(
+            typed(&mut s, "/kick @carolwolf"),
+            Reaction::say("! /kick works in a room tab, or name the room: /kick @nick #room")
+        );
+        assert!(HELP.contains("/kick @nick"));
     }
 
     #[test]

@@ -39,6 +39,11 @@ pub enum Input {
         nick: String,
         room: Option<String>,
     },
+    /// Vote to remove someone from the named room, or the current one.
+    Kick {
+        nick: String,
+        room: Option<String>,
+    },
     /// Answer an invitation; the room if typed, else the only one.
     Accept(Option<String>),
     Decline(Option<String>),
@@ -63,8 +68,8 @@ const SIGIL_HINT: &str = "use @name for people or #name for rooms";
 /// Every command name `parse_line` accepts, aliases included. Completion and
 /// typo hints read it, so keep it in step with the match below.
 pub const COMMANDS: &[&str] = &[
-    "msg", "m", "chat", "c", "create", "invite", "accept", "decline", "approve", "deny", "leave", "close", "rooms",
-    "chats", "who", "update", "help", "h", "?", "quit", "q",
+    "msg", "m", "chat", "c", "create", "invite", "accept", "decline", "approve", "deny", "kick", "leave", "close",
+    "rooms", "chats", "who", "update", "help", "h", "?", "quit", "q",
 ];
 
 /// Names that were dropped, and the command that replaced each.
@@ -133,6 +138,13 @@ pub fn parse_line(line: &str) -> Input {
                 Input::Invite { nick: lower(&nick[1..]), room: Some(lower(&room[1..])) }
             }
             _ => Input::Error("usage: /invite @nick [#room]".into()),
+        },
+        "kick" => match words.as_slice() {
+            [nick] if nick.starts_with('@') => Input::Kick { nick: lower(&nick[1..]), room: None },
+            [nick, room] if nick.starts_with('@') && room.starts_with('#') => {
+                Input::Kick { nick: lower(&nick[1..]), room: Some(lower(&room[1..])) }
+            }
+            _ => Input::Error("usage: /kick @nick [#room]".into()),
         },
         "accept" | "decline" => {
             let room = match words.as_slice() {
@@ -353,6 +365,18 @@ mod tests {
         assert_eq!(distance("qiut", "quit"), 2);
         assert_eq!(distance("", "abc"), 3);
         assert_eq!(distance("héllo", "hello"), 1);
+    }
+
+    #[test]
+    fn kick_parses() {
+        assert_eq!(parse_line("/kick @BobRoger"), Input::Kick { nick: "bobroger".into(), room: None });
+        assert_eq!(
+            parse_line("/kick @bobroger #CatPie"),
+            Input::Kick { nick: "bobroger".into(), room: Some("catpie".into()) }
+        );
+        assert_eq!(parse_line("/kick"), err("usage: /kick @nick [#room]"));
+        assert_eq!(parse_line("/kick bob"), err("usage: /kick @nick [#room]"));
+        assert!(COMMANDS.contains(&"kick"));
     }
 
     #[test]

@@ -99,6 +99,7 @@ Then you're connected to everyone else running it. With `--nick` it skips the qu
 /invite @bobroger          # invite someone; they /accept (your invite counts as your approval)
 /chat #catpie k7m9xq       # or ask to join with a room's key (click it in the sidebar to copy)
 /approve @bobroger         # someone in the room lets them in (or /deny @bobroger)
+/kick @bobroger            # vote someone out of the room
 /chat @bobroger            # private chat
 /msg @bobroger hi          # one-off private message
 /chat bob                  # the @ or # is optional when only one name matches
@@ -148,6 +149,13 @@ How many approvals a newcomer needs depends on how many people are in the room
 
 One `/deny` turns the request away. If two people are let in for the last
 place, whoever asked first gets it.
+
+`/kick @name` votes someone out. It takes as many votes as letting someone in
+(the table above). Someone kicked can ask to join again; someone kicked twice
+can't get back into that room.
+
+Whenever someone leaves a room, drops off or is kicked, the people still in it
+switch to a new encryption key on their own, so whoever left can't read on.
 
 ### Encryption
 
