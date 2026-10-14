@@ -5,8 +5,8 @@ Wi-Fi or LAN and they find each other. There's no server, no account and no
 setup.
 
 - People find each other automatically (UDP multicast), then talk over direct TCP connections.
-- Everyone gets a unique name: you choose the start and a word is added (`--nick bob` → `@bobRoger`).
-- Private rooms are protected by a key and end-to-end encrypted. Only people with the room's name and key can read it.
+- Everyone gets a unique name: you choose the start and a word is added (`--nick Bob` → `@bobroger`). Names are all lowercase.
+- Private rooms are end-to-end encrypted, and the people inside decide who joins. A room's key only lets you ask.
 - Direct messages go peer to peer, and every connection is encrypted.
 - Chats are never written to disk. Quitting forgets everything.
 
@@ -41,6 +41,49 @@ cd corvo-lan
 cargo install --path .
 ```
 
+### Check the install
+
+Open a new terminal and run:
+
+```bash
+corvo-lan --version         # prints "corvo-lan <version>"
+command -v corvo-lan        # macOS/Linux: where it's installed
+```
+
+```powershell
+Get-Command corvo-lan       # Windows: where it's installed
+```
+
+If the shell says the command isn't found, the install folder isn't on your
+PATH yet (see the hint the installer printed) or the terminal was opened
+before installing.
+
+### Uninstall
+
+On macOS or Linux, delete the binary, then, if you also want to forget your
+identity key and the peers you've met, the config folder:
+
+```bash
+rm ~/.local/bin/corvo-lan   # or $CORVO_LAN_INSTALL_DIR/corvo-lan
+rm -rf ~/.config/corvo-lan  # or $XDG_CONFIG_HOME/corvo-lan
+```
+
+If you built it with `cargo install`, use `cargo uninstall corvo-lan` instead.
+
+On Windows, in PowerShell:
+
+```powershell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\corvo-lan"
+Remove-Item -Recurse -Force "$env:APPDATA\corvo-lan"   # identity key and known peers
+```
+
+Then remove `%LOCALAPPDATA%\Programs\corvo-lan` from your PATH: search the Start
+menu for "Edit environment variables for your account", select `Path`, and
+delete that entry.
+
+Deleting the config folder gives you a new identity next time, so peers you've
+met will see a key-change warning.
+
 ## Use
 
 ```bash
@@ -48,30 +91,61 @@ corvo-lan                   # your name starts with your login name
 corvo-lan --nick bob        # or choose the start yourself
 ```
 
-After about two seconds you get a name, and you're connected to everyone else running it.
+It shows the name you'd get: press Enter to keep it, or type another start to see a new one.
+Then you're connected to everyone else running it. With `--nick` it skips the question.
 
 ```
-/create cat 123            # creates e.g. #catPieR with key 123-k7m9xq
-/chat #catPieR 123-k7m9xq  # someone else joins with the name and key
-/chat @bobRoger            # private chat
-/msg @bobRoger hi          # one-off private message
+/create cat 5              # a room for up to 5 people, e.g. #catpie with key k7m9xq
+/invite @bobroger          # invite someone; they /accept (your invite counts as your approval)
+/chat #catpie k7m9xq       # or ask to join with a room's key (click it in the sidebar to copy)
+/approve @bobroger         # someone in the room lets them in (or /deny @bobroger)
+/chat @bobroger            # private chat
+/msg @bobroger hi          # one-off private message
+/chat bob                  # the @ or # is optional when only one name matches
 /who                       # who's connected
 /update [yes]              # check for and install a newer version
 /close [@nick]             # close a private chat (TUI)
-/line  /tui                # switch between the full-screen view and a plain prompt
-/help                      # all commands
+/help  /h                  # all commands
+/quit  /q                  # leave
 ```
 
 corvo-lan opens a full-screen view: tabs for each chat along the top, the
-people in the room and everyone online on the right. `Tab` / `Shift-Tab` or
-`Alt-1..9` switch tabs, `Alt+Enter` (or `Shift+Enter` where your terminal
-supports it) adds a new line, `PgUp`/`PgDn` or the mouse wheel scroll, and
-clicking a name opens a private chat. Command output and errors appear in the
-`corvo` tab. To select text (say, a room key), hold Shift (Option on macOS)
-while dragging, or switch to `/line`.
+people in the room and everyone online on the right. `Shift-Tab`,
+`Alt-←`/`Alt-→` or `Alt-1..9` switch tabs, `Tab` completes `@names`, `#rooms`
+and `/commands`, `Alt+Enter` (or `Shift+Enter` where your terminal supports it)
+adds a new line, `PgUp`/`PgDn` or the mouse wheel scroll, and clicking a name
+opens a private chat. Command output and errors appear in the `corvo` tab. To
+select text, hold Shift (Option on macOS) while dragging.
 
-Prefer a plain prompt? Start with `--line`, or type `/line` (and `/tui` to come
-back). Line mode is also used automatically when output isn't a terminal.
+### Rooms
+
+A room holds 2–13 people (`/create cat` asks how many; Enter means 13), and you
+can be in up to 3 rooms at once. Its key is 6 characters made up by the app.
+Anyone with the room's name and key can *ask* to join; the people already
+inside see the request and approve or deny it. A request waits up to 2 minutes.
+
+`/invite @name` sends someone an invitation: they answer with `/accept` or
+`/decline`, and if they accept, your invite counts as your approval. An
+invitation lasts 10 minutes.
+
+A room's sidebar shows its key, how full it is and who's waiting to get in.
+Click the room name or key to copy the line someone pastes to ask to join, for
+anyone who isn't online yet. Copying uses your terminal's clipboard support (OSC 52); macOS
+Terminal.app doesn't have it, so there you select the line with Option-drag
+instead.
+
+How many approvals a newcomer needs depends on how many people are in the room
+(online) right now:
+
+| In the room | Approvals needed |
+|---|---|
+| 1–3 | 1 |
+| 4–6 | 2 |
+| 7–9 | 3 |
+| 10–12 | 4 |
+
+One `/deny` turns the request away. If two people are let in for the last
+place, whoever asked first gets it.
 
 ### Encryption
 
@@ -123,7 +197,9 @@ Work happens on `main`. To ship, bump `version` in `Cargo.toml`, then merge
 `main` into the `release` branch. That builds macOS, Linux and Windows
 binaries, tags `v<version>`, and publishes them as a GitHub Release, which is
 what the install script downloads. A version that's already released is
-refused, so bump it first.
+refused, so bump it (and `Cargo.lock`) in its own pull request to `main`
+first. CI fails a pull request into `release` that still has a released
+version, before it can be merged.
 
 ## License
 

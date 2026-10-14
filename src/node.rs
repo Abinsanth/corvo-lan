@@ -23,7 +23,10 @@ use crate::room::{RoomId, RoomKeys};
 
 mod rooms;
 
-pub use rooms::{HERE_INTERVAL, JOIN_SETTLE, JOIN_WAIT, MAX_ROOMS, MEMBER_TIMEOUT};
+pub use rooms::{
+    ADMIT_SETTLE, HERE_INTERVAL, INVITE_FOR, JOIN_WAIT, KNOCK_EVERY, MAX_INVITES, MAX_INVITES_FROM_ONE, MAX_MEMBERS,
+    MAX_ROOMS, MEMBER_TIMEOUT, MIN_MEMBERS, PENDING_FOR, REQUEST_STALE, needed,
+};
 
 /// Longest chat text accepted, measured JSON-escaped (a control character
 /// becomes 6 bytes), leaving headroom under `MAX_FRAME_LEN` for hex and JSON.
@@ -60,6 +63,9 @@ pub struct NodeConfig {
     pub manual_peers: Vec<SocketAddr>,
     /// Listen-only discovery time before naming (`NAME_WAIT`; tests use zero).
     pub name_wait: Duration,
+    /// Wait for `Command::ConfirmName` before going live, showing `Event::NamePreview`s
+    /// (the app without `--nick`). `false` names us as soon as `name_wait` ends.
+    pub ask_name: bool,
     /// Pin the Word part of our first name instead of drawing one; tests use
     /// it to force a same-moment clash. `None` (the app) picks at random.
     pub fixed_word: Option<String>,
@@ -105,14 +111,18 @@ pub enum NodeMsg {
     },
     /// The listen-only naming window is over.
     NameWaitOver,
-    /// A room key finished deriving on a worker thread.
+    /// A room's door keys finished deriving on a worker thread.
     Derived {
         job: rooms::Job,
         attempt: rooms::Attempt,
         keys: RoomKeys,
     },
-    JoinSettled(RoomId, rooms::Attempt),
+    /// Nobody answered our knock (keyed by door id).
     JoinTimeout(RoomId, rooms::Attempt),
+    /// Nobody let us in (keyed by door id).
+    JoinExpired(RoomId, rooms::Attempt),
+    /// Let in whoever has enough approvals (keyed by room id).
+    Settle(RoomId),
     Tick,
 }
 
@@ -213,6 +223,14 @@ struct Node {
     /// `Some(nicks seen so far)` during the listen-only naming window.
     naming: Option<HashSet<String>>,
     fixed_word: Option<String>,
+    /// See `NodeConfig::ask_name`.
+    ask_name: bool,
+    /// The name last sent as `Event::NamePreview`.
+    preview: Option<String>,
+    /// The user kept `preview`; we go live once the naming window is over too.
+    confirmed: bool,
+    /// `NAME_WAIT` has passed.
+    wait_over: bool,
     events: mpsc::UnboundedSender<Event>,
     msg_tx: mpsc::Sender<NodeMsg>,
     peers: HashMap<PeerId, PeerEntry>,
@@ -239,6 +257,7 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
     let mut node = Node::new(config.keys, config.base, event_tx, msg_tx.clone());
     node.naming = Some(HashSet::new());
     node.fixed_word = config.fixed_word;
+    node.ask_name = config.ask_name;
     node.listener = Some(listener);
     node.manual_peers = config.manual_peers;
     let (store, store_notice) = match config.known_peers {
@@ -276,6 +295,9 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
     }));
 
     node.emit(Event::Info("looking for peers…".into()));
+    if node.ask_name {
+        node.preview_name(node.base.clone());
+    }
     node.after(config.name_wait, NodeMsg::NameWaitOver);
     let task = tokio::spawn(node.run(cmd_rx, msg_rx));
     Ok(NodeHandle { id, local_addr, commands: cmd_tx, events: event_rx, task })
@@ -290,6 +312,10 @@ impl Node {
             nick: watch::Sender::new(String::new()),
             naming: None,
             fixed_word: None,
+            ask_name: false,
+            preview: None,
+            confirmed: false,
+            wait_over: false,
             events,
             msg_tx,
             peers: HashMap::new(),
@@ -370,7 +396,9 @@ impl Node {
     }
 
     fn handle_command(&mut self, cmd: Command) {
-        if self.naming.is_some() && !matches!(cmd, Command::ListPeers | Command::Quit) {
+        if self.naming.is_some()
+            && !matches!(cmd, Command::ListPeers | Command::Quit | Command::PreviewName { .. } | Command::ConfirmName)
+        {
             self.emit(Event::Error("still picking your name, try again in a moment".into()));
             return;
         }
@@ -384,9 +412,16 @@ impl Node {
                     Target::Room(name) => self.send_room(&name, text),
                 }
             }
-            Command::CreateRoom { base, key_part } => self.create_room(&base, &key_part),
+            Command::CreateRoom { name, max } => self.create_room(&name, max),
             Command::JoinRoom { name, key } => self.join_room(&name, &key),
             Command::LeaveRoom { name } => self.leave_room(&name),
+            Command::Approve { room, nick } => self.approve(&room, &nick),
+            Command::Deny { room, nick } => self.deny(&room, &nick),
+            Command::PreviewName { base } => self.preview_name(base),
+            Command::ConfirmName => self.confirm_name(),
+            Command::Invite { nick, room } => self.invite(&nick, &room),
+            Command::Accept { room } => self.accept(&room),
+            Command::Decline { room } => self.decline(&room),
             Command::ListPeers => {
                 let mut peers: Vec<PeerInfo> =
                     self.peers.iter().map(|(id, p)| PeerInfo { id: *id, nick: p.nick.clone(), addr: p.addr }).collect();
@@ -439,11 +474,52 @@ impl Node {
                 }
                 None => self.emit(Event::Error(format!("could not connect to {addr}: {error}"))),
             },
-            NodeMsg::NameWaitOver => self.assign_name(),
+            NodeMsg::NameWaitOver => self.on_name_wait_over(),
             NodeMsg::Derived { job, attempt, keys } => self.on_derived(job, attempt, keys),
-            NodeMsg::JoinSettled(id, attempt) => self.on_join_settled(id, attempt),
             NodeMsg::JoinTimeout(id, attempt) => self.on_join_timeout(id, attempt),
+            NodeMsg::JoinExpired(id, attempt) => self.on_join_expired(id, attempt),
+            NodeMsg::Settle(id) => self.settle(id),
             NodeMsg::Tick => self.on_tick(Instant::now()),
+        }
+    }
+
+    /// The listen-only window is over: go live, unless the user is still choosing.
+    fn on_name_wait_over(&mut self) {
+        self.wait_over = true;
+        if !self.ask_name || self.confirmed {
+            self.assign_name();
+        }
+    }
+
+    /// Shows the name `base` would get now. Only while naming and not yet confirmed.
+    fn preview_name(&mut self, base: String) {
+        if self.confirmed {
+            return;
+        }
+        let Some(seen) = &self.naming else {
+            return;
+        };
+        if let Err(e) = names::validate_base(&base) {
+            self.emit(Event::Error(e));
+            return;
+        }
+        let Some(nick) = names::pick_name(&base, |n| seen.contains(n)) else {
+            self.emit(Event::Error(format!("every name for '{base}' is taken — try another")));
+            return;
+        };
+        self.base = base;
+        self.preview = Some(nick.clone());
+        self.emit(Event::NamePreview { nick });
+    }
+
+    /// The user keeps the preview; we go live now if the window is over, else when it ends.
+    fn confirm_name(&mut self) {
+        if self.naming.is_none() || self.preview.is_none() {
+            return;
+        }
+        self.confirmed = true;
+        if self.wait_over {
+            self.assign_name();
         }
     }
 
@@ -452,16 +528,19 @@ impl Node {
         let Some(seen) = self.naming.take() else {
             return;
         };
-        let picked = match &self.fixed_word {
-            Some(word) => Some(format!("{}{word}", self.base)),
-            None => names::pick_nick(&self.base, |n| seen.contains(n)),
+        let (picked, renamed) = match (&self.fixed_word, self.preview.take()) {
+            (Some(word), _) => (Some(format!("{}{word}", self.base)), false),
+            (None, Some(kept)) if !seen.contains(&kept) => (Some(kept), false),
+            // Someone announced the preview while the user was deciding.
+            (None, Some(_)) => (names::pick_name(&self.base, |n| seen.contains(n)), true),
+            (None, None) => (names::pick_name(&self.base, |n| seen.contains(n)), false),
         };
         let Some(nick) = picked else {
             self.emit(Event::Error(format!("every name for '{}' is taken; restart with another --nick", self.base)));
             return;
         };
         self.nick.send_replace(nick.clone());
-        self.emit(Event::Assigned { nick, renamed: false });
+        self.emit(Event::Assigned { nick, renamed });
 
         if let Some(listener) = self.listener.take() {
             if let Ok(addr) = listener.local_addr() {
@@ -564,7 +643,7 @@ impl Node {
     fn reroll_name(&mut self) {
         let mine = self.my_nick();
         let taken: HashSet<String> = self.peers.values().map(|p| p.nick.clone()).collect();
-        let Some(nick) = names::pick_nick(&self.base, |n| n == mine || taken.contains(n)) else {
+        let Some(nick) = names::pick_name(&self.base, |n| n == mine || taken.contains(n)) else {
             self.emit(Event::Error(format!("every name for '{}' is taken", self.base)));
             return;
         };
@@ -599,7 +678,7 @@ impl Node {
             Frame::Nick { nick: new } => {
                 let taken = new == self.my_nick() || self.peer_by_nick(&new).is_some_and(|other| other != id);
                 let used_up = self.peers.get(&id).is_some_and(|p| p.renames >= MAX_RENAMES);
-                if !names::is_valid_nick(&new) || taken || used_up || names::base_of(&new) != names::base_of(&nick) {
+                if !names::is_valid_name(&new) || taken || used_up || names::base_of(&new) != names::base_of(&nick) {
                     debug!(%id, "ignoring rename to {new:?}");
                     return;
                 }
@@ -609,6 +688,8 @@ impl Node {
                 }
                 self.emit(Event::Renamed { old: nick, new });
             }
+            Frame::Invite { room, key } => self.on_invite(id, room, key, Instant::now()),
+            Frame::Decline { room } => self.on_decline(id, &room),
             Frame::Hello { .. } | Frame::Ping | Frame::Bye => {} // consumed by the peer task
         }
     }
@@ -652,12 +733,12 @@ pub(super) mod tests {
     }
 
     impl Harness {
-        /// A node already named `annMoon`, with no sockets.
+        /// A node already named `annmoon`, with no sockets.
         pub(in crate::node) fn new() -> Self {
             let (event_tx, events) = mpsc::unbounded_channel();
             let (msg_tx, msgs) = mpsc::channel(64);
             let node = Node::new(Keys::fake(ME), "ann".into(), event_tx, msg_tx);
-            node.nick.send_replace("annMoon".into());
+            node.nick.send_replace("annmoon".into());
             Harness { node, events, msgs, outboxes: HashMap::new(), next_conn: 1 }
         }
 
@@ -757,10 +838,10 @@ pub(super) mod tests {
     #[test]
     fn duplicate_connection_does_not_rejoin() {
         let mut h = Harness::new();
-        assert!(h.connect_key(BOB, "bobRoger", inb(7000)));
-        assert!(h.connect_key(BOB, "bobRoger", out(9000))); // preferred direction replaces
-        assert!(h.connect_key(BOB, "bobRoger", out(8000))); // same direction, lower port replaces
-        assert!(!h.connect_key(BOB, "bobRoger", out(8500))); // same direction, higher port rejected
+        assert!(h.connect_key(BOB, "bobroger", inb(7000)));
+        assert!(h.connect_key(BOB, "bobroger", out(9000))); // preferred direction replaces
+        assert!(h.connect_key(BOB, "bobroger", out(8000))); // same direction, lower port replaces
+        assert!(!h.connect_key(BOB, "bobroger", out(8500))); // same direction, higher port rejected
         let joins = h.events().into_iter().filter(|e| matches!(e, Event::PeerJoined { .. })).count();
         assert_eq!(joins, 1);
     }
@@ -768,58 +849,58 @@ pub(super) mod tests {
     #[test]
     fn duplicate_connection_keeps_the_existing_nick() {
         let mut h = Harness::new();
-        assert!(h.connect_key(BOB, "bobRoger", inb(7000)));
+        assert!(h.connect_key(BOB, "bobroger", inb(7000)));
         h.events();
-        assert!(h.connect_key(BOB, "carolFox", out(9000)));
-        assert_eq!(h.node.nick_of(BOB), Some("bobRoger".to_string()));
+        assert!(h.connect_key(BOB, "carolwolf", out(9000)));
+        assert_eq!(h.node.nick_of(BOB), Some("bobroger".to_string()));
         assert!(h.events().is_empty());
     }
 
     #[test]
     fn a_rename_to_another_base_is_refused() {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", true);
+        h.connect(BOB, "bobroger", true);
         h.events();
         let conn = h.node.peers[&BOB].conn;
-        h.node.on_frame(conn, BOB, Frame::Nick { nick: "eveFox".into() });
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "evewolf".into() });
         assert!(h.events().is_empty());
-        assert_eq!(h.node.nick_of(BOB), Some("bobRoger".to_string()));
-        h.node.on_frame(conn, BOB, Frame::Nick { nick: "bobOtter".into() });
-        assert_eq!(h.events(), vec![Event::Renamed { old: "bobRoger".into(), new: "bobOtter".into() }]);
+        assert_eq!(h.node.nick_of(BOB), Some("bobroger".to_string()));
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "bobotter".into() });
+        assert_eq!(h.events(), vec![Event::Renamed { old: "bobroger".into(), new: "bobotter".into() }]);
     }
 
     #[test]
     fn peer_count_is_capped() {
         let mut h = Harness::new();
         for i in 0..MAX_PEERS as u64 {
-            assert!(h.connect(PeerId::test(0x4000_0000_0000_0000 + i), &format!("p{i}Fox"), true));
+            assert!(h.connect(PeerId::test(0x4000_0000_0000_0000 + i), &format!("p{i}wolf"), true));
         }
-        assert_eq!(h.connect_verdict(PeerId::test(0x5000_0000_0000_0000), "lateFox", out(1)), Verdict::Close);
+        assert_eq!(h.connect_verdict(PeerId::test(0x5000_0000_0000_0000), "latewolf", out(1)), Verdict::Close);
         assert_eq!(h.node.peers.len(), MAX_PEERS);
     }
 
     #[test]
     fn a_second_peer_with_a_taken_name_is_refused() {
         let mut h = Harness::new();
-        assert!(h.connect(BOB, "bobRoger", true));
-        assert_eq!(h.connect_verdict(CAROL, "bobRoger", out(1)), Verdict::Close);
+        assert!(h.connect(BOB, "bobroger", true));
+        assert_eq!(h.connect_verdict(CAROL, "bobroger", out(1)), Verdict::Close);
     }
 
     #[test]
     fn same_moment_clash_rerolls_only_the_higher_id() {
         // BOB (higher id than ME) shows up with our name: we keep ours.
         let mut h = Harness::new();
-        assert!(h.connect(BOB, "annMoon", true));
-        assert_eq!(h.node.my_nick(), "annMoon");
+        assert!(h.connect(BOB, "annmoon", true));
+        assert_eq!(h.node.my_nick(), "annmoon");
         assert!(!h.events().iter().any(|e| matches!(e, Event::Assigned { .. })));
 
         // A lower id than ours shows up with our name: we re-roll and tell everyone.
         let mut h = Harness::new();
         let low = PeerId::test(1);
-        assert!(h.connect(low, "annMoon", true));
+        assert!(h.connect(low, "annmoon", true));
         let mine = h.node.my_nick();
-        assert_ne!(mine, "annMoon");
-        assert!(mine.starts_with("ann") && names::is_valid_nick(&mine));
+        assert_ne!(mine, "annmoon");
+        assert!(mine.starts_with("ann") && names::is_valid_name(&mine));
         assert_eq!(h.sent(low), vec![Frame::Nick { nick: mine.clone() }]);
         assert!(h.events().contains(&Event::Assigned { nick: mine, renamed: true }));
     }
@@ -827,45 +908,140 @@ pub(super) mod tests {
     #[test]
     fn peer_rename_is_accepted_only_when_valid_and_free() {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", true);
-        h.connect(CAROL, "carolFox", true);
+        h.connect(BOB, "bobroger", true);
+        h.connect(CAROL, "carolwolf", true);
         h.events();
         let conn = h.node.peers[&BOB].conn;
-        h.node.on_frame(conn, BOB, Frame::Nick { nick: "carolFox".into() }); // taken
-        h.node.on_frame(conn, BOB, Frame::Nick { nick: "annMoon".into() }); // ours
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "carolwolf".into() }); // taken
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "annmoon".into() }); // ours
         h.node.on_frame(conn, BOB, Frame::Nick { nick: "\u{1b}[2J".into() }); // invalid
-        h.node.on_frame(conn, BOB, Frame::Nick { nick: "bobPie".into() });
-        assert_eq!(h.events(), vec![Event::Renamed { old: "bobRoger".into(), new: "bobPie".into() }]);
-        assert_eq!(h.node.peer_by_nick("bobPie"), Some(BOB));
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "bobpie".into() });
+        assert_eq!(h.events(), vec![Event::Renamed { old: "bobroger".into(), new: "bobpie".into() }]);
+        assert_eq!(h.node.peer_by_nick("bobpie"), Some(BOB));
     }
 
     #[test]
     fn a_peer_can_only_rename_a_few_times() {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", false);
+        h.connect(BOB, "bobroger", false);
         h.events();
-        let words = ["Pie", "Fox", "Owl", "Elk", "Bee"];
+        let words = ["pie", "wolf", "owl", "elk", "bee"];
         for w in &words[..2] {
             let conn = h.node.peers[&BOB].conn;
             h.node.on_frame(conn, BOB, Frame::Nick { nick: format!("bob{w}") });
         }
         // A duplicate connection replacing the first doesn't reset the count.
-        h.connect(BOB, "bobFox", true);
+        h.connect(BOB, "bobwolf", true);
         for w in &words[2..] {
             let conn = h.node.peers[&BOB].conn;
             h.node.on_frame(conn, BOB, Frame::Nick { nick: format!("bob{w}") });
         }
         let renames = h.events().into_iter().filter(|e| matches!(e, Event::Renamed { .. })).count();
         assert_eq!(renames, MAX_RENAMES as usize);
-        assert_eq!(h.node.peers[&BOB].nick, "bobOwl");
+        assert_eq!(h.node.peers[&BOB].nick, "bobowl");
     }
 
     #[test]
     fn commands_wait_for_a_name() {
         let mut h = Harness::new();
         h.node.naming = Some(HashSet::new());
-        h.node.handle_command(dm("bobRoger", "hi"));
+        h.node.handle_command(dm("bobroger", "hi"));
         assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("still picking")));
+    }
+
+    /// A node in its naming window that asks the user, like the app without `--nick`.
+    fn asking() -> Harness {
+        let mut h = Harness::new();
+        h.node.nick.send_replace(String::new());
+        h.node.naming = Some(HashSet::new());
+        h.node.ask_name = true;
+        h
+    }
+
+    fn sighting(i: u64, nick: &str) -> Sighting {
+        Sighting { id: PeerId::test(100 + i), nick: nick.into(), tcp_addr: "127.0.0.1:1".parse().unwrap() }
+    }
+
+    /// The nick of the one `NamePreview` waiting in `h`'s events.
+    fn previewed(h: &mut Harness) -> String {
+        match h.events().as_slice() {
+            [Event::NamePreview { nick }] => nick.clone(),
+            other => panic!("expected one NamePreview, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_asking_node_waits_for_the_user_to_confirm() {
+        let mut h = asking();
+        h.node.handle_command(Command::PreviewName { base: "luffy".into() });
+        let nick = previewed(&mut h);
+        assert!(nick.starts_with("luffy") && names::is_valid_name(&nick), "{nick}");
+        h.node.on_name_wait_over();
+        assert_eq!(h.node.my_nick(), "", "not until the user says so");
+        assert!(h.events().is_empty());
+
+        h.node.handle_command(Command::ConfirmName);
+        assert_eq!(h.node.my_nick(), nick);
+        assert_eq!(h.events(), vec![Event::Assigned { nick: nick.clone(), renamed: false }]);
+
+        h.node.handle_command(Command::PreviewName { base: "zoro".into() });
+        h.node.handle_command(Command::ConfirmName);
+        assert!(h.events().is_empty(), "too late to change");
+        assert_eq!(h.node.my_nick(), nick);
+    }
+
+    #[tokio::test]
+    async fn confirming_early_waits_for_the_window() {
+        let mut h = asking();
+        h.node.handle_command(Command::PreviewName { base: "nami".into() });
+        let nick = previewed(&mut h);
+        h.node.handle_command(Command::ConfirmName);
+        assert_eq!(h.node.my_nick(), "");
+        h.node.handle_command(Command::PreviewName { base: "zoro".into() });
+        assert!(h.events().is_empty(), "no new preview once confirmed");
+        h.node.on_name_wait_over();
+        assert_eq!(h.events(), vec![Event::Assigned { nick, renamed: false }]);
+    }
+
+    #[tokio::test]
+    async fn a_preview_someone_announces_meanwhile_gets_a_new_word() {
+        let mut h = asking();
+        h.node.handle_command(Command::PreviewName { base: "sanji".into() });
+        let nick = previewed(&mut h);
+        h.node.on_discovered(sighting(1, &nick));
+        h.node.on_name_wait_over();
+        h.node.handle_command(Command::ConfirmName);
+        let got = h.node.my_nick();
+        assert!(got.starts_with("sanji") && got != nick, "{got}");
+        assert_eq!(h.events(), vec![Event::Assigned { nick: got, renamed: true }]);
+    }
+
+    #[test]
+    fn previews_avoid_seen_names_and_check_the_base() {
+        let mut h = asking();
+        let words = crate::words::WORDS;
+        for (i, w) in words.iter().skip(1).enumerate() {
+            h.node.on_discovered(sighting(i as u64, &format!("ann{w}")));
+        }
+        h.node.handle_command(Command::PreviewName { base: "ann".into() });
+        assert_eq!(previewed(&mut h), format!("ann{}", words[0]));
+        h.node.handle_command(Command::PreviewName { base: "chat".into() });
+        h.node.handle_command(Command::PreviewName { base: "Bob".into() });
+        assert_eq!(
+            h.events(),
+            vec![Event::Error("'chat' is reserved".into()), Event::Error("name must be 1–9 letters or digits".into()),]
+        );
+        h.node.handle_command(dm("bobroger", "hi"));
+        assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("still picking")));
+    }
+
+    #[tokio::test]
+    async fn a_node_that_does_not_ask_goes_live_when_the_window_ends() {
+        let mut h = Harness::new();
+        h.node.nick.send_replace(String::new());
+        h.node.naming = Some(HashSet::new());
+        h.node.on_name_wait_over();
+        assert!(h.node.my_nick().starts_with("ann"));
     }
 
     #[tokio::test]
@@ -895,7 +1071,7 @@ pub(super) mod tests {
         let (out, mut rx) = mpsc::channel(8);
         let entry = PeerEntry {
             conn: 1,
-            nick: "bobRoger".into(),
+            nick: "bobroger".into(),
             addr: "127.0.0.1:1".parse().unwrap(),
             key: out_key(),
             out,
@@ -904,7 +1080,7 @@ pub(super) mod tests {
         };
         assert_eq!(h.node.on_connected(entry, BOB), Verdict::Keep);
         for i in 0..8 {
-            h.node.handle_command(dm("bobRoger", &format!("msg {i}"))); // fills the 8-slot outbox
+            h.node.handle_command(dm("bobroger", &format!("msg {i}"))); // fills the 8-slot outbox
         }
         let drain = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -941,7 +1117,7 @@ pub(super) mod tests {
     #[test]
     fn flooding_peer_is_throttled_with_one_warning() {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", true);
+        h.connect(BOB, "bobroger", true);
         h.events();
         let conn = h.node.peers[&BOB].conn;
         for i in 0..100 {
@@ -957,46 +1133,46 @@ pub(super) mod tests {
     #[test]
     fn dm_goes_only_to_its_target_and_is_recorded() {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", true);
-        h.connect(CAROL, "carolFox", true);
+        h.connect(BOB, "bobroger", true);
+        h.connect(CAROL, "carolwolf", true);
         h.events();
-        h.node.handle_command(dm("bobRoger", "psst"));
+        h.node.handle_command(dm("bobroger", "psst"));
         assert!(matches!(h.sent(BOB).as_slice(), [Frame::Direct { text, .. }] if text == "psst"));
         assert!(h.sent(CAROL).is_empty());
         assert!(matches!(
             h.events().as_slice(),
-            [Event::Sent { conv: Conv::Dm(n), text, .. }] if n == "bobRoger" && text == "psst"
+            [Event::Sent { conv: Conv::Dm(n), text, .. }] if n == "bobroger" && text == "psst"
         ));
     }
 
     #[test]
     fn dm_to_someone_not_connected_is_an_error() {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", true);
+        h.connect(BOB, "bobroger", true);
         h.events();
-        h.node.handle_command(dm("bobroger", "case matters"));
-        assert_eq!(h.events(), vec![Event::Error("@bobroger is offline".into())]);
+        h.node.handle_command(dm("bobRoger", "case matters"));
+        assert_eq!(h.events(), vec![Event::Error("@bobRoger is offline".into())]);
     }
 
     #[test]
     fn incoming_dm_becomes_a_dm_message() {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", true);
+        h.connect(BOB, "bobroger", true);
         h.events();
         let conn = h.node.peers[&BOB].conn;
         h.node.on_frame(conn, BOB, Frame::Direct { text: "hi".into(), ts: 0 });
         assert!(matches!(
             h.events().as_slice(),
-            [Event::Message { conv: Conv::Dm(c), from, text, .. }] if c == "bobRoger" && from == "bobRoger" && text == "hi"
+            [Event::Message { conv: Conv::Dm(c), from, text, .. }] if c == "bobroger" && from == "bobroger" && text == "hi"
         ));
     }
 
     #[test]
     fn oversized_text_is_rejected_before_sending() {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", true);
+        h.connect(BOB, "bobroger", true);
         h.events();
-        h.node.handle_command(dm("bobRoger", &"x".repeat(MAX_TEXT_LEN + 1)));
+        h.node.handle_command(dm("bobroger", &"x".repeat(MAX_TEXT_LEN + 1)));
         assert!(h.sent(BOB).is_empty());
         assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("too long")));
     }
@@ -1004,8 +1180,8 @@ pub(super) mod tests {
     #[test]
     fn frames_from_a_replaced_connection_still_arrive_but_its_close_is_silent() {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", false); // conn 1
-        h.connect(BOB, "bobRoger", true); // conn 2 replaces it
+        h.connect(BOB, "bobroger", false); // conn 1
+        h.connect(BOB, "bobroger", true); // conn 2 replaces it
         h.events();
         // bob may have sent this before he switched over too.
         h.node.on_frame(1, BOB, Frame::Direct { text: "in flight".into(), ts: 0 });
@@ -1017,50 +1193,50 @@ pub(super) mod tests {
     #[test]
     fn losing_duplicates_are_retired_and_other_refusals_closed() {
         let mut h = Harness::new();
-        assert_eq!(h.connect_verdict(BOB, "bobRoger", out(5000)), Verdict::Keep);
-        assert_eq!(h.connect_verdict(BOB, "bobRoger", out(6000)), Verdict::Retire);
-        assert_eq!(h.connect_verdict(ME, "annMoon", out(7000)), Verdict::Close);
+        assert_eq!(h.connect_verdict(BOB, "bobroger", out(5000)), Verdict::Keep);
+        assert_eq!(h.connect_verdict(BOB, "bobroger", out(6000)), Verdict::Retire);
+        assert_eq!(h.connect_verdict(ME, "annmoon", out(7000)), Verdict::Close);
     }
 
     #[test]
     fn meeting_a_new_key_says_so_once() {
         let mut h = Harness::new();
-        assert!(h.connect_stranger(BOB, "bobRoger"));
+        assert!(h.connect_stranger(BOB, "bobroger"));
         let fp = BOB.fingerprint();
         assert_eq!(
             h.events(),
             vec![
-                Event::PeerJoined { id: BOB, nick: "bobRoger".into() },
-                Event::Info(format!("first time meeting @bobRoger ({fp})")),
+                Event::PeerJoined { id: BOB, nick: "bobroger".into() },
+                Event::Info(format!("first time meeting @bobroger ({fp})")),
             ]
         );
         h.node.handle_msg(NodeMsg::PeerGone { conn: 1, id: BOB, reason: LeaveReason::Quit });
         h.events();
-        assert!(h.connect_stranger(BOB, "bobOtter"));
-        assert_eq!(h.events(), vec![Event::PeerJoined { id: BOB, nick: "bobOtter".into() }]);
+        assert!(h.connect_stranger(BOB, "bobotter"));
+        assert_eq!(h.events(), vec![Event::PeerJoined { id: BOB, nick: "bobotter".into() }]);
     }
 
     #[test]
     fn a_familiar_name_with_a_new_key_warns() {
         let mut h = Harness::new();
-        h.node.known.record(BOB, "bobRoger", 0);
-        assert!(h.connect_stranger(CAROL, "bobMoon"));
+        h.node.known.record(BOB, "bobroger", 0);
+        assert!(h.connect_stranger(CAROL, "bobmoon"));
         let events = h.events();
         let Some(Event::Info(text)) = events.get(1) else { panic!("{events:?}") };
-        assert!(text.starts_with("@bobMoon has a different key from the bob you met before (last seen "), "{text}");
+        assert!(text.starts_with("@bobmoon has a different key from the bob you met before (last seen "), "{text}");
         assert!(text.ends_with("). Compare fingerprints in /who."), "{text}");
     }
 
     #[test]
     fn who_includes_our_own_id() {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", true);
+        h.connect(BOB, "bobroger", true);
         h.events();
         h.node.handle_command(Command::ListPeers);
         match h.events().as_slice() {
             [Event::Peers { you, nick, peers }] => {
                 assert_eq!(*you, ME);
-                assert_eq!(nick, "annMoon");
+                assert_eq!(nick, "annmoon");
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0].id, BOB);
             }

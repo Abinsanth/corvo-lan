@@ -1,5 +1,5 @@
-//! System-assigned names. People are `base + Word` (`bobRoger`), rooms are
-//! `base + Word + "R"` (`catPieR`). `@`/`#` are display and command syntax only.
+//! System-assigned names: `base + word`, all lowercase. People (`bobroger`)
+//! and rooms (`catpie`) share the shape; `@`/`#` tell them apart.
 
 use rand::seq::SliceRandom;
 
@@ -8,58 +8,54 @@ use crate::words::WORDS;
 pub const MAX_BASE_LEN: usize = 9;
 
 /// Command names and a few words that would read as commands or as "everyone".
-pub const RESERVED: [&str; 16] = [
-    "msg", "chat", "chats", "create", "leave", "rooms", "history", "who", "tui", "line", "help", "quit", "exit", "me",
-    "all", "system",
+pub const RESERVED: [&str; 21] = [
+    "msg", "chat", "chats", "create", "approve", "deny", "invite", "leave", "rooms", "history", "who", "tui", "line",
+    "help", "quit", "exit", "me", "all", "system", "accept", "decline",
 ];
 
-/// A base is what the user types: 1–9 ASCII letters or digits, not reserved.
+/// A base is what the user types, lowercased: 1–9 ASCII letters or digits, not reserved.
 pub fn validate_base(base: &str) -> Result<(), String> {
-    if base.is_empty() || base.len() > MAX_BASE_LEN || !base.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if base.is_empty()
+        || base.len() > MAX_BASE_LEN
+        || !base.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
         return Err(format!("name must be 1–{MAX_BASE_LEN} letters or digits"));
     }
-    if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(base)) {
+    if RESERVED.contains(&base) {
         return Err(format!("'{base}' is reserved"));
     }
     Ok(())
 }
 
-/// `bobRoger`: a valid base followed by a listed word.
-pub fn is_valid_nick(name: &str) -> bool {
-    WORDS.iter().any(|w| name.strip_suffix(w).is_some_and(|base| validate_base(base).is_ok()))
+/// `bobroger` or `catpie`: a valid base followed by a listed word. No word
+/// ends another, so there's only one way to split it.
+pub fn is_valid_name(name: &str) -> bool {
+    base_of(name).is_some()
 }
 
-/// `catPieR`: a valid nick shape followed by `R`.
-pub fn is_valid_room(name: &str) -> bool {
-    name.strip_suffix('R').is_some_and(is_valid_nick)
+/// `bobroger` → `bob`: the part the user chose. `None` if `name` isn't a valid name.
+pub fn base_of(name: &str) -> Option<&str> {
+    WORDS.iter().find_map(|w| name.strip_suffix(w).filter(|base| validate_base(base).is_ok()))
 }
 
-/// `bobRoger` → `bob`: the part the user chose. `None` if `nick` isn't a valid nick.
-pub fn base_of(nick: &str) -> Option<&str> {
-    WORDS.iter().find_map(|w| nick.strip_suffix(w).filter(|base| validate_base(base).is_ok()))
-}
-
-/// `base + Word` for the first shuffled word whose name isn't taken.
-pub fn pick_nick(base: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
-    pick(base, "", taken)
-}
-
-/// `base + Word + "R"` for the first shuffled word whose name isn't taken.
-pub fn pick_room(base: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
-    pick(base, "R", taken)
-}
-
-fn pick(base: &str, tail: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
+/// `base + word` for the first shuffled word whose name isn't taken. The
+/// word is never the base itself: `ace` gets `aceluffy`, not `aceace`.
+pub fn pick_name(base: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
     let mut words = WORDS;
     words.shuffle(&mut rand::rng());
-    words.iter().map(|w| format!("{base}{w}{tail}")).find(|name| !taken(name))
+    words.iter().filter(|w| **w != base).map(|w| format!("{base}{w}")).find(|name| !taken(name))
 }
 
 /// The base used when `--nick` isn't given: the login name's letters and
-/// digits, cut to `MAX_BASE_LEN`, or `anon` if nothing usable is left.
+/// digits, lowercased and cut to `MAX_BASE_LEN`, or `anon` if nothing usable is left.
 pub fn default_base(login: Option<&str>) -> String {
-    let base: String =
-        login.unwrap_or_default().chars().filter(char::is_ascii_alphanumeric).take(MAX_BASE_LEN).collect();
+    let base: String = login
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .take(MAX_BASE_LEN)
+        .collect();
     if validate_base(&base).is_ok() { base } else { "anon".into() }
 }
 
@@ -68,11 +64,11 @@ mod tests {
     #[test]
     fn default_base_makes_any_login_usable() {
         assert_eq!(default_base(Some("abinsanth")), "abinsanth");
-        assert_eq!(default_base(Some("John Smith")), "JohnSmith");
+        assert_eq!(default_base(Some("John Smith")), "johnsmith");
         assert_eq!(default_base(Some("j.doe")), "jdoe");
         assert_eq!(default_base(Some("christopher")), "christoph");
-        assert_eq!(default_base(Some("José")), "Jos");
-        assert_eq!(default_base(Some("help")), "anon", "reserved");
+        assert_eq!(default_base(Some("José")), "jos");
+        assert_eq!(default_base(Some("HELP")), "anon", "reserved");
         assert_eq!(default_base(Some("...")), "anon");
         assert_eq!(default_base(None), "anon");
     }
@@ -80,51 +76,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bases_are_short_alphanumeric_and_not_reserved() {
+    fn bases_are_short_lowercase_alphanumeric_and_not_reserved() {
         assert!(validate_base("bob").is_ok());
-        assert!(validate_base("Team42").is_ok());
+        assert!(validate_base("team42").is_ok());
         assert!(validate_base("abcdefghi").is_ok());
         assert_eq!(validate_base("abcdefghij"), Err("name must be 1–9 letters or digits".into()));
         assert!(validate_base("").is_err());
+        assert!(validate_base("Bob").is_err(), "callers lowercase what's typed");
         assert!(validate_base("bob smith").is_err());
         assert!(validate_base("bob#").is_err());
         assert!(validate_base("élan").is_err());
-        assert_eq!(validate_base("Chat"), Err("'Chat' is reserved".into()));
+        assert_eq!(validate_base("chat"), Err("'chat' is reserved".into()));
         assert!(validate_base("exit").is_err());
+        for cmd in ["approve", "deny", "invite", "accept", "decline"] {
+            assert!(validate_base(cmd).is_err(), "{cmd}");
+        }
     }
 
     #[test]
-    fn nick_and_room_shapes() {
-        assert!(is_valid_nick("bobRoger"));
-        assert!(is_valid_nick("b2Fox"));
-        assert!(!is_valid_nick("bob")); // no word
-        assert!(!is_valid_nick("Roger")); // empty base
-        assert!(!is_valid_nick("bobZzz")); // not a listed word
-        assert!(!is_valid_nick("chatRoger")); // reserved base
-        assert!(!is_valid_nick("abcdefghijRoger")); // base too long
-        assert!(!is_valid_nick("bobPieR")); // that's a room
-        assert!(is_valid_room("catPieR"));
-        assert!(!is_valid_room("catPie"));
-        assert!(!is_valid_room("catR"));
+    fn name_shapes() {
+        assert!(is_valid_name("bobroger"));
+        assert!(is_valid_name("catpie"));
+        assert!(is_valid_name("b2wolf"));
+        assert!(!is_valid_name("bobRoger"), "names are all lowercase");
+        assert!(!is_valid_name("BOBroger"));
+        assert!(!is_valid_name("bob")); // no word
+        assert!(!is_valid_name("roger")); // empty base
+        assert!(!is_valid_name("bobzzz")); // not a listed word
+        assert!(!is_valid_name("chatroger")); // reserved base
+        assert!(!is_valid_name("abcdefghijroger")); // base too long
+        assert!(!is_valid_name("catpier"), "rooms have no R any more");
     }
 
     #[test]
-    fn base_is_the_nick_without_its_word() {
-        assert_eq!(base_of("bobRoger"), Some("bob"));
-        assert_eq!(base_of("Team42Moon"), Some("Team42"));
+    fn base_is_the_name_without_its_word() {
+        assert_eq!(base_of("bobroger"), Some("bob"));
+        assert_eq!(base_of("team42moon"), Some("team42"));
+        assert_eq!(base_of("grapegrape"), Some("grape"));
         assert_eq!(base_of("bob"), None);
-        assert_eq!(base_of("Roger"), None, "no base left");
+        assert_eq!(base_of("roger"), None, "no base left");
     }
 
     #[test]
     fn picked_names_have_the_right_shape_and_avoid_taken_ones() {
-        let nick = pick_nick("bob", |_| false).unwrap();
-        assert!(nick.starts_with("bob") && is_valid_nick(&nick), "{nick}");
-        let room = pick_room("cat", |_| false).unwrap();
-        assert!(room.starts_with("cat") && is_valid_room(&room), "{room}");
+        let name = pick_name("bob", |_| false).unwrap();
+        assert!(name.starts_with("bob") && is_valid_name(&name), "{name}");
 
-        // Everything but bobRoger is taken, so that's the only pick.
-        assert_eq!(pick_nick("bob", |n| n != "bobRoger"), Some("bobRoger".into()));
-        assert_eq!(pick_nick("bob", |_| true), None);
+        // Everything but bobroger is taken, so that's the only pick.
+        assert_eq!(pick_name("bob", |n| n != "bobroger"), Some("bobroger".into()));
+        assert_eq!(pick_name("bob", |_| true), None);
+    }
+
+    #[test]
+    fn a_base_never_gets_itself_as_its_word() {
+        for _ in 0..50 {
+            assert_ne!(pick_name("ace", |_| false).as_deref(), Some("aceace"));
+        }
+        assert_eq!(pick_name("ace", |n| n != "aceace"), None, "aceace is never offered");
     }
 }

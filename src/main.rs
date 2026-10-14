@@ -25,9 +25,6 @@ struct Args {
     /// Write debug logs to ./corvo-lan.log
     #[arg(long)]
     debug: bool,
-    /// Start in line mode instead of the full-screen UI
-    #[arg(long)]
-    line: bool,
     /// Don't check GitHub for a newer version at startup (or set CORVO_LAN_NO_UPDATE_CHECK=1)
     #[arg(long)]
     no_update_check: bool,
@@ -54,7 +51,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Windows sets USERNAME rather than USER.
     let login = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok();
-    let base = args.nick.unwrap_or_else(|| names::default_base(login.as_deref()));
+    let ask_name = args.nick.is_none();
+    let base = args.nick.map(|n| n.to_ascii_lowercase()).unwrap_or_else(|| names::default_base(login.as_deref()));
     names::validate_base(&base).map_err(|e| anyhow!("invalid --nick {base:?}: {e}"))?;
 
     // Holds the identity lock until the app exits.
@@ -69,8 +67,9 @@ async fn main() -> anyhow::Result<()> {
         manual_peers: args.peers,
         name_wait: node::NAME_WAIT,
         fixed_word: None,
+        ask_name,
     })
     .await?;
     let env_off = update::check_disabled_by(std::env::var("CORVO_LAN_NO_UPDATE_CHECK").ok().as_deref());
-    ui::run(handle, ui::Options { line: args.line, check_updates: !args.no_update_check && !env_off }).await
+    ui::run(handle, ui::Options { check_updates: !args.no_update_check && !env_off }).await
 }

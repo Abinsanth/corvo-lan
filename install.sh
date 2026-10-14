@@ -55,7 +55,9 @@ main() {
     trap 'rm -rf "$tmp"' EXIT
 
     echo "downloading $asset"
-    curl -fsSL "$base_url/$asset" -o "$tmp/$asset" || fail "couldn't download $base_url/$asset"
+    # A progress bar when someone's watching; logs and pipes stay quiet.
+    if [ -t 2 ]; then progress=--progress-bar; else progress=--silent; fi
+    curl -fSL "$progress" "$base_url/$asset" -o "$tmp/$asset" || fail "couldn't download $base_url/$asset"
     curl -fsSL "$base_url/$asset.sha256" -o "$tmp/$asset.sha256" || fail "couldn't download its checksum"
     expected="$(cut -d ' ' -f 1 < "$tmp/$asset.sha256")"
     actual="$(sha256 "$tmp/$asset")"

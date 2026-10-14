@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Position, Rect};
 
 use crate::api::{Conv, Event};
+use crate::ui::complete::{Candidates, common_prefix, complete};
 use crate::ui::render::Tone;
 use crate::ui::session::Session;
 
@@ -129,6 +130,17 @@ impl Editor {
     pub fn cursor_pos(&self) -> (usize, usize) {
         let row = self.text[..self.cursor].matches('\n').count();
         (row, self.text[self.row_start()..self.cursor].chars().count())
+    }
+
+    /// The text up to the cursor.
+    pub fn before_cursor(&self) -> &str {
+        &self.text[..self.cursor]
+    }
+
+    /// Replaces the text from byte `start` up to the cursor with `with`.
+    pub fn replace_before_cursor(&mut self, start: usize, with: &str) {
+        self.text.replace_range(start..self.cursor, with);
+        self.cursor = start + with.len();
     }
 
     /// Byte offset of `col` chars into row `row`, clamped to its end.
@@ -276,6 +288,17 @@ pub fn tabs(session: &Session) -> Vec<Tab> {
 pub enum Hit {
     Tab(usize),
     Person(String),
+    /// A room's name or key in the sidebar: copies its invite.
+    Invite(String),
+}
+
+/// Completion choices shown above the input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Popup {
+    pub matches: Vec<String>,
+    pub selected: usize,
+    /// Byte offset in the input where the word being completed starts.
+    pub start: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +320,7 @@ pub enum Action {
     PageUp,
     PageDown,
     Esc,
+    Complete,
     KillRow,
     KillWord,
     Quit,
@@ -325,14 +349,16 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char(c) => Action::Insert(c),
         KeyCode::Backspace => Action::Backspace,
         KeyCode::Delete => Action::Delete,
+        KeyCode::Left if alt => Action::PrevTab,
+        KeyCode::Right if alt => Action::NextTab,
         KeyCode::Left => Action::Left,
         KeyCode::Right => Action::Right,
         KeyCode::Home => Action::Home,
         KeyCode::End => Action::End,
         KeyCode::Up => Action::Up,
         KeyCode::Down => Action::Down,
-        KeyCode::Tab => Action::NextTab,
-        KeyCode::BackTab => Action::PrevTab,
+        KeyCode::Tab => Action::Complete,
+        KeyCode::BackTab => Action::NextTab,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Esc => Action::Esc,
@@ -343,7 +369,15 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
 /// Events shown in the corvo tab. Chat lines and member changes already live
 /// in their conversation.
 pub fn goes_to_status(event: &Event) -> bool {
-    !matches!(event, Event::Message { .. } | Event::Sent { .. } | Event::MemberJoined { .. } | Event::MemberLeft { .. })
+    !matches!(
+        event,
+        Event::Message { .. }
+            | Event::Sent { .. }
+            | Event::MemberJoined { .. }
+            | Event::MemberLeft { .. }
+            | Event::Approved { .. }
+            | Event::RequestEnded { .. }
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,6 +396,8 @@ pub struct TuiState {
     pub color: bool,
     /// (total rows, visible rows) of the message pane at the last draw.
     pub view: (usize, usize),
+    /// The completion list, while open.
+    pub popup: Option<Popup>,
     status: VecDeque<StatusLine>,
     flash: Option<(String, Instant)>,
     hits: Vec<(Rect, Hit)>,
@@ -376,6 +412,7 @@ impl TuiState {
             on_status: true,
             color,
             view: (0, 0),
+            popup: None,
             status: VecDeque::new(),
             flash: None,
             hits: Vec::new(),
@@ -391,6 +428,9 @@ impl TuiState {
     }
 
     pub fn select_tab(&mut self, session: &mut Session, idx: usize) {
+        self.popup = None;
+        // A question left open would take whatever is typed in the new tab.
+        session.cancel_prompt();
         match tabs(session).get(idx) {
             Some(Tab::Status) => {
                 session.store.clear_current();
@@ -409,6 +449,49 @@ impl TuiState {
         let n = tabs(session).len() as isize;
         let next = (self.current_tab(session) as isize + delta).rem_euclid(n);
         self.select_tab(session, next as usize);
+    }
+
+    /// Tab: completes the word before the cursor. One match goes straight in;
+    /// several fill their shared start and open the list.
+    pub fn complete(&mut self, cands: &Candidates) {
+        let Some(c) = complete(self.editor.before_cursor(), cands) else {
+            return;
+        };
+        if let [only] = c.matches.as_slice() {
+            self.editor.replace_before_cursor(c.start, &format!("{only} "));
+            return;
+        }
+        let prefix = common_prefix(&c.matches);
+        if prefix.chars().count() > self.editor.before_cursor()[c.start..].chars().count() {
+            self.editor.replace_before_cursor(c.start, &prefix);
+        }
+        self.popup = Some(Popup { matches: c.matches, selected: 0, start: c.start });
+    }
+
+    /// ↑/↓ (and Tab) in the open list; wraps.
+    pub fn move_selection(&mut self, delta: isize) {
+        if let Some(p) = &mut self.popup {
+            p.selected = (p.selected as isize + delta).rem_euclid(p.matches.len() as isize) as usize;
+        }
+    }
+
+    /// Enter in the open list: puts the choice in the input and closes it.
+    pub fn accept(&mut self) {
+        if let Some(p) = self.popup.take() {
+            self.editor.replace_before_cursor(p.start, &format!("{} ", p.matches[p.selected]));
+        }
+    }
+
+    /// After an edit with the list open: re-runs completion, closing the list
+    /// when nothing matches.
+    pub fn refresh_popup(&mut self, cands: &Candidates) {
+        if self.popup.is_some() {
+            self.popup = complete(self.editor.before_cursor(), cands).map(|c| Popup {
+                matches: c.matches,
+                selected: 0,
+                start: c.start,
+            });
+        }
     }
 
     pub fn push_status(&mut self, ts: u64, text: &str, tone: Tone) {
@@ -447,7 +530,7 @@ impl TuiState {
 mod tests {
     use super::*;
     use crate::api::PeerId;
-    use crate::ui::render::Style;
+    use crate::ui::complete::Candidates;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn ed(text: &str) -> Editor {
@@ -576,7 +659,11 @@ mod tests {
         assert_eq!(action_for(key(KeyCode::Char('X'), KeyModifiers::SHIFT)), Some(Action::Insert('X')));
         assert_eq!(action_for(key(KeyCode::Char('c'), KeyModifiers::CONTROL)), Some(Action::Quit));
         assert_eq!(action_for(key(KeyCode::Char('3'), KeyModifiers::ALT)), Some(Action::GoTab(2)));
-        assert_eq!(action_for(key(KeyCode::BackTab, KeyModifiers::SHIFT)), Some(Action::PrevTab));
+        assert_eq!(action_for(key(KeyCode::Tab, none)), Some(Action::Complete));
+        assert_eq!(action_for(key(KeyCode::BackTab, KeyModifiers::SHIFT)), Some(Action::NextTab));
+        assert_eq!(action_for(key(KeyCode::Left, KeyModifiers::ALT)), Some(Action::PrevTab));
+        assert_eq!(action_for(key(KeyCode::Right, KeyModifiers::ALT)), Some(Action::NextTab));
+        assert_eq!(action_for(key(KeyCode::Left, none)), Some(Action::Left));
         assert_eq!(action_for(key(KeyCode::Char('q'), KeyModifiers::ALT)), None);
         let mut release = key(KeyCode::Char('x'), none);
         release.kind = KeyEventKind::Release;
@@ -584,14 +671,84 @@ mod tests {
     }
 
     fn session_with_tabs() -> Session {
-        let mut s = Session::new(Style::plain());
-        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
+        let mut s = Session::new(false);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobroger".into() }, 0);
+        s.on_event(&Event::RoomJoined { name: "catpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         s.on_event(
-            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 },
+            &Event::Message { conv: Conv::Dm("bobroger".into()), from: "bobroger".into(), text: "x".into(), ts: 0 },
             0,
         );
         s
+    }
+
+    fn bobs() -> Candidates {
+        Candidates { nicks: vec!["bobroger".into(), "bobkite".into(), "carolwolf".into()], ..Default::default() }
+    }
+
+    #[test]
+    fn tab_completes_one_match_or_opens_the_list() {
+        let mut t = TuiState::new(false);
+        t.editor.set("hi @car".into());
+        t.complete(&bobs());
+        assert_eq!(t.editor.text(), "hi @carolwolf ");
+        assert_eq!(t.popup, None);
+
+        t.editor.set("é @b".into());
+        t.complete(&bobs());
+        assert_eq!(t.editor.text(), "é @bob", "fills the shared prefix");
+        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobroger", "@bobkite"]);
+        t.move_selection(1);
+        t.accept();
+        assert_eq!(t.editor.text(), "é @bobkite ");
+        assert_eq!(t.popup, None);
+
+        t.editor.set("line one\n@car".into());
+        t.complete(&bobs());
+        assert_eq!(t.editor.text(), "line one\n@carolwolf ");
+
+        t.editor.set("@zed".into());
+        t.complete(&bobs());
+        assert_eq!((t.editor.text(), t.popup.is_none()), ("@zed", true));
+    }
+
+    #[test]
+    fn selection_wraps_and_typing_keeps_the_list_in_step() {
+        let mut t = TuiState::new(false);
+        t.editor.set("@b".into());
+        t.complete(&bobs());
+        t.move_selection(-1);
+        assert_eq!(t.popup.as_ref().unwrap().selected, 1);
+        t.editor.insert('k');
+        t.refresh_popup(&bobs());
+        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobkite"]);
+        assert_eq!(t.popup.as_ref().unwrap().selected, 0);
+        t.editor.insert(' ');
+        t.refresh_popup(&bobs());
+        assert_eq!(t.popup, None, "a space ends the word");
+    }
+
+    #[test]
+    fn editing_past_the_word_closes_the_list() {
+        let mut t = TuiState::new(false);
+        t.editor.set("hi @b".into());
+        t.complete(&bobs());
+        for _ in 0..5 {
+            t.editor.backspace();
+            t.refresh_popup(&bobs());
+        }
+        assert_eq!(t.popup, None);
+        t.accept(); // nothing open: must not touch the text or panic
+        assert_eq!(t.editor.text(), "hi");
+    }
+
+    #[test]
+    fn switching_tabs_closes_the_list() {
+        let mut s = session_with_tabs();
+        let mut t = TuiState::new(false);
+        t.editor.set("@b".into());
+        t.complete(&bobs());
+        t.select_tab(&mut s, 1);
+        assert_eq!(t.popup, None);
     }
 
     #[test]
@@ -600,14 +757,14 @@ mod tests {
         let mut t = TuiState::new(false);
         assert_eq!(
             tabs(&s),
-            vec![Tab::Status, Tab::Conv(Conv::Room("catPieR".into())), Tab::Conv(Conv::Dm("bobRoger".into()))]
+            vec![Tab::Status, Tab::Conv(Conv::Room("catpie".into())), Tab::Conv(Conv::Dm("bobroger".into()))]
         );
         assert_eq!(t.current_tab(&s), 0);
         t.step_tab(&mut s, 1);
         assert_eq!(t.current_tab(&s), 1);
         t.step_tab(&mut s, 1);
-        assert_eq!(s.store.current(), Some(&Conv::Dm("bobRoger".into())));
-        assert_eq!(s.store.get(&Conv::Dm("bobRoger".into())).unwrap().unread, 0, "viewing marks read");
+        assert_eq!(s.store.current(), Some(&Conv::Dm("bobroger".into())));
+        assert_eq!(s.store.get(&Conv::Dm("bobroger".into())).unwrap().unread, 0, "viewing marks read");
         t.step_tab(&mut s, 1);
         assert!(t.on_status, "wraps to corvo");
         t.step_tab(&mut s, -1);
@@ -622,8 +779,8 @@ mod tests {
         let mut t = TuiState::new(false);
         t.select_tab(&mut s, 2);
         t.select_tab(&mut s, 0);
-        let bob = Conv::Dm("bobRoger".into());
-        s.on_event(&Event::Message { conv: bob.clone(), from: "bobRoger".into(), text: "hi".into(), ts: 0 }, 0);
+        let bob = Conv::Dm("bobroger".into());
+        s.on_event(&Event::Message { conv: bob.clone(), from: "bobroger".into(), text: "hi".into(), ts: 0 }, 0);
         assert_eq!(s.store.get(&bob).unwrap().unread, 1);
         assert_eq!(s.store.current(), None);
         assert_eq!(t.current_tab(&s), 0);
@@ -634,7 +791,7 @@ mod tests {
         let mut s = session_with_tabs();
         let mut t = TuiState::new(false);
         t.select_tab(&mut s, 2);
-        s.store.close(&Conv::Dm("bobRoger".into()));
+        s.store.close(&Conv::Dm("bobroger".into()));
         assert_eq!(t.current_tab(&s), 0, "no current conversation means the corvo tab");
         assert!(tabs(&s).len() == 2);
         t.step_tab(&mut s, 1);
@@ -659,9 +816,9 @@ mod tests {
     fn clicks_hit_what_was_drawn_there() {
         let mut t = TuiState::new(false);
         t.add_hit(Rect::new(0, 0, 7, 1), Hit::Tab(0));
-        t.add_hit(Rect::new(60, 3, 20, 1), Hit::Person("bobRoger".into()));
+        t.add_hit(Rect::new(60, 3, 20, 1), Hit::Person("bobroger".into()));
         assert_eq!(t.hit(3, 0), Some(Hit::Tab(0)));
-        assert_eq!(t.hit(79, 3), Some(Hit::Person("bobRoger".into())));
+        assert_eq!(t.hit(79, 3), Some(Hit::Person("bobroger".into())));
         assert_eq!(t.hit(80, 3), None);
         t.clear_hits();
         assert_eq!(t.hit(3, 0), None);
@@ -674,7 +831,12 @@ mod tests {
         assert!(!goes_to_status(&Event::Sent { conv: Conv::Dm("b".into()), text: "x".into(), ts: 0 }));
         assert!(!goes_to_status(&Event::MemberJoined { room: "r".into(), nick: "b".into() }));
         assert!(goes_to_status(&Event::Error("x".into())));
-        assert!(goes_to_status(&Event::RoomCreated { name: "r".into(), key: "k".into() }));
+        assert!(goes_to_status(&Event::RoomCreated { name: "r".into(), key: "k".into(), max: 13 }));
         assert!(goes_to_status(&Event::PeerJoined { id: PeerId::test(1), nick: "b".into() }));
+        let approved = Event::Approved { room: "r".into(), nick: "b".into(), by: "c".into(), have: 1, need: 2 };
+        assert!(!goes_to_status(&approved));
+        let ended = Event::RequestEnded { room: "r".into(), nick: "b".into(), why: crate::api::RequestEnd::Gone };
+        assert!(!goes_to_status(&ended));
+        assert!(goes_to_status(&Event::JoinRequest { room: "r".into(), nick: "b".into(), have: 0, need: 1 }));
     }
 }

@@ -1,8 +1,8 @@
-//! The UI: a shared `Session` and two frontends (line mode and the full-screen
-//! TUI) that take turns owning the terminal.
+//! The UI: a shared `Session` and the full-screen TUI.
 
+pub mod clip;
+pub mod complete;
 pub mod input;
-pub mod line;
 pub mod render;
 pub mod session;
 pub mod tui;
@@ -13,25 +13,16 @@ use std::io::IsTerminal;
 use tokio::sync::mpsc;
 
 use self::render::{Style, Tone, tone_of_text};
-use self::session::{Mode, Reaction, Session};
+use self::session::{Reaction, Session};
 use self::updates::Updater;
 use crate::api::{Command, Event};
 use crate::node::NodeHandle;
 
 pub struct Options {
-    /// Start in line mode (`--line`).
-    pub line: bool,
     pub check_updates: bool,
 }
 
-/// Why a frontend gave the terminal back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Exit {
-    Switch(Mode),
-    Quit,
-}
-
-/// Output from background work (`/update`), shown by whichever frontend is active.
+/// Output from background work (`/update`), shown in the corvo tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub text: String,
@@ -45,7 +36,7 @@ impl Notice {
     }
 }
 
-/// Everything the frontends share; it outlives each of their turns.
+/// Everything the UI works with.
 pub struct Ctx {
     pub session: Session,
     pub commands: mpsc::Sender<Command>,
@@ -60,12 +51,12 @@ impl Ctx {
         let _ = self.notice_tx.send(Notice::new(text));
     }
 
-    /// Carries out a reaction's commands and update; says whether to leave.
+    /// Carries out a reaction's commands and update; says whether to quit.
     /// The caller shows `reaction.print` first.
-    pub async fn act(&mut self, reaction: Reaction) -> anyhow::Result<Option<Exit>> {
+    pub async fn act(&mut self, reaction: Reaction) -> anyhow::Result<bool> {
         if reaction.quit {
             let _ = self.commands.send(Command::Quit).await;
-            return Ok(Some(Exit::Quit));
+            return Ok(true);
         }
         for cmd in reaction.commands {
             self.commands.send(cmd).await?;
@@ -73,40 +64,31 @@ impl Ctx {
         if let Some(action) = reaction.update {
             self.updater.start(action);
         }
-        Ok(reaction.switch.map(Exit::Switch))
+        Ok(false)
     }
 }
 
-/// Runs the frontends in turn until one quits.
-pub async fn mode_loop(
-    start: Mode,
+/// Runs `ui` if there's a terminal. Whatever happens, the node is told to quit,
+/// so the process never stays on the LAN without a UI. `tui::run` words its own
+/// setup errors ("corvo-lan needs a terminal (...)"), so only the no-terminal
+/// case is worded here.
+async fn run_ui(
     ctx: &mut Ctx,
-    mut line: impl AsyncFnMut(&mut Ctx) -> anyhow::Result<Exit>,
-    mut tui: impl AsyncFnMut(&mut Ctx) -> anyhow::Result<Exit>,
+    is_terminal: bool,
+    ui: impl AsyncFnOnce(&mut Ctx) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let mut mode = start;
-    loop {
-        ctx.session.set_mode(mode);
-        let result = match mode {
-            Mode::Line => line(ctx).await,
-            Mode::Tui => tui(ctx).await,
-        };
-        let exit = match result {
-            Ok(exit) => exit,
-            Err(e) => {
-                // Without this the node never stops and the process hangs, still on the LAN.
-                let _ = ctx.commands.send(Command::Quit).await;
-                return Err(e);
-            }
-        };
-        match exit {
-            Exit::Quit => return Ok(()),
-            Exit::Switch(next) => mode = next,
-        }
+    let result = if is_terminal {
+        ui(ctx).await
+    } else {
+        Err(anyhow::anyhow!("corvo-lan needs a terminal (output isn't a terminal)"))
+    };
+    if result.is_err() {
+        let _ = ctx.commands.send(Command::Quit).await;
     }
+    result
 }
 
-/// Runs the UI until the user quits, then waits for the Node to say goodbye.
+/// Runs the full-screen UI until the user quits, then waits for the Node to say goodbye.
 pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<()> {
     let NodeHandle { commands, events, task, .. } = handle;
     tui::install_panic_hook();
@@ -115,12 +97,9 @@ pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<()> {
     if opts.check_updates {
         updater.check_at_startup();
     }
-    let style = Style::detect();
-    let start = if opts.line || !std::io::stdout().is_terminal() { Mode::Line } else { Mode::Tui };
-    let mut ctx = Ctx { session: Session::new(style), commands, events, notices, notice_tx, updater };
-    let mut line = line::LineFrontend::new(style, start == Mode::Tui)?;
-    let result = mode_loop(start, &mut ctx, async |ctx: &mut Ctx| line.run(ctx).await, tui::run).await;
-    line.shutdown();
+    let session = Session::new(Style::detect().color);
+    let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater };
+    let result = run_ui(&mut ctx, std::io::stdout().is_terminal(), tui::run).await;
     let _ = task.await;
     result
 }
@@ -128,14 +107,18 @@ pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::PeerId;
+
+    /// The next command the UI sent, or `None` after 2s, so a missing Quit fails instead of hanging.
+    async fn next(cmd_rx: &mut mpsc::Receiver<Command>) -> Option<Command> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx.recv()).await.ok().flatten()
+    }
 
     fn ctx() -> (Ctx, mpsc::UnboundedSender<Event>, mpsc::Receiver<Command>) {
         let (commands, cmd_rx) = mpsc::channel(8);
         let (event_tx, events) = mpsc::unbounded_channel();
         let (notice_tx, notices) = mpsc::unbounded_channel();
         let ctx = Ctx {
-            session: Session::new(Style::plain()),
+            session: Session::new(false),
             commands,
             events,
             notices,
@@ -145,77 +128,30 @@ mod tests {
         (ctx, event_tx, cmd_rx)
     }
 
-    fn joined(n: u64) -> Event {
-        Event::PeerJoined { id: PeerId::test(n), nick: format!("p{n}Fox") }
-    }
-
     #[tokio::test]
-    async fn mode_loop_hands_events_and_notices_across_switches() {
-        let (mut ctx, event_tx, _cmd_rx) = ctx();
-        for n in 1..=4 {
-            event_tx.send(joined(n)).unwrap();
-        }
-        ctx.notify("* first");
-        let seen = std::cell::RefCell::new(Vec::<String>::new());
-        let mut line_runs = 0;
-        // Each frontend consumes one event and one notice if there is one, then hands over.
-        let step = async |ctx: &mut Ctx, who: &str| {
-            let e = ctx.events.recv().await.unwrap();
-            ctx.session.on_event(&e, 0);
-            if let Ok(n) = ctx.notices.try_recv() {
-                seen.borrow_mut().push(format!("{who}:{}", n.text));
-            }
-        };
-        mode_loop(
-            Mode::Line,
-            &mut ctx,
-            async |ctx: &mut Ctx| {
-                assert_eq!(ctx.session.mode(), Mode::Line);
-                ctx.notify("* second");
-                step(ctx, "line").await;
-                line_runs += 1;
-                Ok(if line_runs == 1 { Exit::Switch(Mode::Tui) } else { Exit::Quit })
-            },
-            async |ctx: &mut Ctx| {
-                assert_eq!(ctx.session.mode(), Mode::Tui);
-                step(ctx, "tui").await;
-                step(ctx, "tui").await;
-                Ok(Exit::Switch(Mode::Line))
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(line_runs, 2);
-        for n in 1..=4 {
-            assert!(ctx.session.store.is_online(&format!("p{n}Fox")), "event {n} lost");
-        }
-        assert_eq!(*seen.borrow(), vec!["line:* first", "tui:* second", "line:* second"]);
-    }
-
-    #[tokio::test]
-    async fn act_sends_commands_and_reports_quit_or_switch() {
+    async fn act_sends_commands_and_reports_quit() {
         let (mut ctx, _event_tx, mut cmd_rx) = ctx();
         let quit = Reaction { quit: true, ..Default::default() };
-        assert_eq!(ctx.act(quit).await.unwrap(), Some(Exit::Quit));
+        assert!(ctx.act(quit).await.unwrap());
         assert_eq!(cmd_rx.recv().await, Some(Command::Quit));
-        let switch = Reaction { commands: vec![Command::ListPeers], switch: Some(Mode::Tui), ..Default::default() };
-        assert_eq!(ctx.act(switch).await.unwrap(), Some(Exit::Switch(Mode::Tui)));
+        assert!(!ctx.act(Reaction::send(Command::ListPeers)).await.unwrap());
         assert_eq!(cmd_rx.recv().await, Some(Command::ListPeers));
         assert_eq!(Notice::new("! boom").tone, Tone::Bad);
     }
 
     #[tokio::test]
-    async fn a_failing_frontend_still_stops_the_node() {
+    async fn no_terminal_stops_the_node() {
         let (mut ctx, _event_tx, mut cmd_rx) = ctx();
-        let r = mode_loop(
-            Mode::Line,
-            &mut ctx,
-            async |_: &mut Ctx| Err(anyhow::anyhow!("boom")),
-            async |_: &mut Ctx| Ok(Exit::Quit),
-        )
-        .await;
+        let r = run_ui(&mut ctx, false, async |_: &mut Ctx| panic!("no UI without a terminal")).await;
+        assert_eq!(r.unwrap_err().to_string(), "corvo-lan needs a terminal (output isn't a terminal)");
+        assert_eq!(next(&mut cmd_rx).await, Some(Command::Quit));
+    }
+
+    #[tokio::test]
+    async fn a_failing_ui_still_stops_the_node() {
+        let (mut ctx, _event_tx, mut cmd_rx) = ctx();
+        let r = run_ui(&mut ctx, true, async |_: &mut Ctx| Err(anyhow::anyhow!("boom"))).await;
         assert!(r.is_err());
-        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx.recv()).await;
-        assert_eq!(sent, Ok(Some(Command::Quit)));
+        assert_eq!(next(&mut cmd_rx).await, Some(Command::Quit));
     }
 }

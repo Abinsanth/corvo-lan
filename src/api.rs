@@ -35,10 +35,11 @@ pub enum Command {
         to: Target,
         text: String,
     },
-    /// `base` and `key_part` are what the user typed; the node adds the rest.
+    /// A room name from `names::pick_name` (the UI previews it); the node makes the key.
+    /// `max` counts everyone, the creator included.
     CreateRoom {
-        base: String,
-        key_part: String,
+        name: String,
+        max: u8,
     },
     JoinRoom {
         name: String,
@@ -46,6 +47,35 @@ pub enum Command {
     },
     LeaveRoom {
         name: String,
+    },
+    /// Let `nick` into `room`, which they've asked to join.
+    Approve {
+        room: String,
+        nick: String,
+    },
+    /// Refuse `nick`'s request to join `room`.
+    Deny {
+        room: String,
+        nick: String,
+    },
+    /// While picking our name: show the name `base` would get.
+    PreviewName {
+        base: String,
+    },
+    /// While picking our name: keep the last preview.
+    ConfirmName,
+    /// Invite `nick`, who's online, to `room`, one of ours.
+    Invite {
+        nick: String,
+        room: String,
+    },
+    /// Join `room` with the key its invitation carried.
+    Accept {
+        room: String,
+    },
+    /// Turn down the invitation to `room`.
+    Decline {
+        room: String,
     },
     ListPeers,
     Quit,
@@ -57,6 +87,32 @@ pub enum LeaveReason {
     Quit,
     /// The connection dropped or went silent.
     Lost,
+}
+
+/// Why our request to join a room ended without getting in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinEnd {
+    /// Nobody answered: a wrong key, or nobody in the room is online.
+    NoRoom,
+    Full,
+    Denied {
+        by: String,
+    },
+    /// Nobody let us in within `PENDING_FOR`.
+    TimedOut,
+}
+
+/// Why someone's request to join one of our rooms is closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestEnd {
+    /// Let in; a `MemberJoined` follows.
+    Admitted,
+    Denied {
+        by: String,
+    },
+    Full,
+    /// They gave up, went offline, or never arrived.
+    Gone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +128,20 @@ pub enum Event {
     Assigned {
         nick: String,
         renamed: bool,
+    },
+    /// The name we'd get if the user keeps it (only when the app asks).
+    NamePreview {
+        nick: String,
+    },
+    /// `from` invites us to `room`; `/accept` or `/decline` answers.
+    Invited {
+        from: String,
+        room: String,
+    },
+    /// `by` turned down our invitation to `room`.
+    InviteDeclined {
+        by: String,
+        room: String,
     },
     PeerJoined {
         id: PeerId,
@@ -103,10 +173,43 @@ pub enum Event {
     RoomCreated {
         name: String,
         key: String,
+        max: u8,
     },
     RoomJoined {
         name: String,
+        key: String,
+        max: u8,
         members: Vec<String>,
+    },
+    /// Someone in the room answered our knock; we wait for `needs` approvals.
+    JoinWaiting {
+        name: String,
+        members: u8,
+        needs: u8,
+    },
+    JoinEnded {
+        name: String,
+        why: JoinEnd,
+    },
+    /// `nick` asked to join `room`; `have` of `need` approvals so far.
+    JoinRequest {
+        room: String,
+        nick: String,
+        have: u8,
+        need: u8,
+    },
+    /// `by` approved `nick`'s request.
+    Approved {
+        room: String,
+        nick: String,
+        by: String,
+        have: u8,
+        need: u8,
+    },
+    RequestEnded {
+        room: String,
+        nick: String,
+        why: RequestEnd,
     },
     RoomLeft {
         name: String,

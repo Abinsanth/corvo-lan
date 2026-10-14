@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
 /// Largest JSON body in one frame: a Noise message (65,535 bytes) minus its 16-byte tag.
 pub const MAX_FRAME_LEN: usize = 65_535 - 16;
 
@@ -110,6 +110,15 @@ pub enum Frame {
         nonce: String,
         ct: String,
     },
+    /// An invitation to `room`, sent to one peer only: the room's name and join key.
+    Invite {
+        room: String,
+        key: String,
+    },
+    /// The invitation to `room` was turned down.
+    Decline {
+        room: String,
+    },
     Ping,
     Bye,
 }
@@ -145,10 +154,10 @@ mod tests {
 
     #[test]
     fn announce_round_trips() {
-        let a = Announce { v: 3, id: PeerId::test(42), nick: "aliceMoon".into(), tcp_port: 54321 };
+        let a = Announce { v: 3, id: PeerId::test(42), nick: "alicemoon".into(), tcp_port: 54321 };
         let json = String::from_utf8(a.to_bytes()).unwrap();
         let hex = format!("000000000000002a{}", "0".repeat(48));
-        assert_eq!(json, format!(r#"{{"v":3,"id":"{hex}","nick":"aliceMoon","tcp_port":54321}}"#));
+        assert_eq!(json, format!(r#"{{"v":3,"id":"{hex}","nick":"alicemoon","tcp_port":54321}}"#));
         assert_eq!(Announce::from_bytes(json.as_bytes()).unwrap(), a);
     }
 
@@ -185,5 +194,15 @@ mod tests {
         assert!(PeerId::try_from(format!("+a{}", "ab".repeat(31))).is_err(), "a sign");
         assert!(PeerId::try_from(format!("zz{}", "ab".repeat(31))).is_err());
         assert!(PeerId::try_from("ab".repeat(31)).is_err(), "too short");
+    }
+
+    #[test]
+    fn invite_frames_are_tagged() {
+        let invite = Frame::Invite { room: "catpie".into(), key: "k7m9xq".into() };
+        let json = serde_json::to_string(&invite).unwrap();
+        assert_eq!(json, r#"{"type":"invite","room":"catpie","key":"k7m9xq"}"#);
+        assert_eq!(serde_json::from_str::<Frame>(&json).unwrap(), invite);
+        let decline = Frame::Decline { room: "catpie".into() };
+        assert_eq!(serde_json::to_string(&decline).unwrap(), r#"{"type":"decline","room":"catpie"}"#);
     }
 }
