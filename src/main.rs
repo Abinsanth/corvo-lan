@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         manual_peers: args.peers,
         name_wait: node::NAME_WAIT,
         fixed_word: None,
+        ask_name: false,
     })
     .await?;
     let env_off = update::check_disabled_by(std::env::var("CORVO_LAN_NO_UPDATE_CHECK").ok().as_deref());

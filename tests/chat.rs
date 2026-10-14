@@ -29,6 +29,7 @@ async fn spawn_node_with_word(base: &str, peers: &[SocketAddr], word: Option<&st
         manual_peers: peers.to_vec(),
         name_wait: Duration::ZERO,
         fixed_word: word.map(String::from),
+        ask_name: false,
     })
     .await
     .unwrap();
@@ -322,4 +323,38 @@ async fn racing_duplicate_dials_settle_on_one_connection() {
     while let Ok(event) = alice.node.events.try_recv() {
         assert!(!matches!(event, Event::PeerLeft { .. } | Event::PeerJoined { .. }), "unexpected {event:?}");
     }
+}
+
+#[tokio::test]
+async fn an_asking_node_goes_live_on_confirm() {
+    let mut node = node::start(NodeConfig {
+        keys: Keys::generate(),
+        known_peers: None,
+        notice: None,
+        base: "luffy".into(),
+        listen: "127.0.0.1:0".parse().unwrap(),
+        discovery: false,
+        manual_peers: vec![],
+        name_wait: Duration::ZERO,
+        fixed_word: None,
+        ask_name: true,
+    })
+    .await
+    .unwrap();
+    let Event::NamePreview { nick: first } =
+        wait_for(&mut node, "a preview", |e| matches!(e, Event::NamePreview { .. })).await
+    else {
+        unreachable!()
+    };
+    assert!(first.starts_with("luffy"), "{first}");
+    node.commands.send(Command::PreviewName { base: "zoro".into() }).await.unwrap();
+    let Event::NamePreview { nick: second } =
+        wait_for(&mut node, "a second preview", |e| matches!(e, Event::NamePreview { .. })).await
+    else {
+        unreachable!()
+    };
+    assert!(second.starts_with("zoro"), "{second}");
+    node.commands.send(Command::ConfirmName).await.unwrap();
+    let assigned = wait_for(&mut node, "a name", |e| matches!(e, Event::Assigned { .. })).await;
+    assert_eq!(assigned, Event::Assigned { nick: second, renamed: false });
 }
