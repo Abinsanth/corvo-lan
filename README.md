@@ -7,7 +7,7 @@ setup.
 - People find each other automatically (UDP multicast), then talk over direct TCP connections.
 - Everyone gets a unique name: you choose the start and a word is added (`--nick bob` → `@bobRoger`).
 - Private rooms are protected by a key and end-to-end encrypted. Only people with the room's name and key can read it.
-- Direct messages go peer to peer. They are **not encrypted yet**; that comes in v0.4.
+- Direct messages go peer to peer, and every connection is encrypted.
 - Chats are never written to disk. Quitting forgets everything.
 
 ## Install
@@ -22,6 +22,17 @@ This downloads the latest release, checks its SHA-256, and installs it to
 `~/.local/bin` (set `CORVO_LAN_INSTALL_DIR` to change that). It never uses sudo.
 Run the same command again to update.
 
+On Windows 10 or 11 (x86_64; **experimental**), in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Abinsanth/corvo-lan/release/install.ps1 | iex
+```
+
+This installs to `%LOCALAPPDATA%\Programs\corvo-lan` (set `CORVO_LAN_INSTALL_DIR`
+to change that) and adds it to your PATH; open a new terminal afterwards. No
+admin rights needed. Windows support is new and hasn't had much testing yet;
+please open an issue if something doesn't work.
+
 Or build from source with a Rust toolchain ([rustup.rs](https://rustup.rs)):
 
 ```bash
@@ -33,7 +44,7 @@ cargo install --path .
 ## Use
 
 ```bash
-corvo-lan                   # your name starts with $USER
+corvo-lan                   # your name starts with your login name
 corvo-lan --nick bob        # or choose the start yourself
 ```
 
@@ -65,18 +76,20 @@ back). Line mode is also used automatically when output isn't a terminal.
 ### Encryption
 
 Everything between machines is encrypted, and each machine has its own key,
-kept in `~/.config/corvo-lan/`. `/who` shows a short fingerprint for everyone
-(and you); compare them in person if you want to be sure who you're talking
-to. If someone you've met before shows up with a different key, corvo-lan
-warns you.
+kept in `~/.config/corvo-lan/` (`%APPDATA%\corvo-lan` on Windows). `/who`
+shows a short fingerprint for everyone (and you); compare them in person if you
+want to be sure who you're talking to. If someone you've met before shows up
+with a different key, corvo-lan warns you.
 
 ### Updating
 
 Type `/update` to see newer versions, then `/update yes` to install the
-newest one; restart corvo-lan to use it. At startup corvo-lan makes one request
-to GitHub to see whether a newer version exists. That request sends only your
-IP address and the app version; turn it off with `--no-update-check` or
-`CORVO_LAN_NO_UPDATE_CHECK=1`. Nothing else ever leaves your network.
+newest one; restart corvo-lan to use it. On Windows the old version is set
+aside as `corvo-lan.old.exe` and deleted the next time corvo-lan starts. At
+startup corvo-lan makes one request to GitHub to see whether a newer version
+exists. That request sends only your IP address and the app version; turn it
+off with `--no-update-check` or `CORVO_LAN_NO_UPDATE_CHECK=1`. Nothing else
+ever leaves your network.
 
 ### If peers don't find each other
 
@@ -88,8 +101,10 @@ corvo-lan --port 5000                      # on one machine
 corvo-lan --peer 192.168.1.20:5000         # on the other
 ```
 
-Your firewall must also allow incoming TCP on the port you use. `--debug`
-writes a log to `./corvo-lan.log`.
+Your firewall must also allow incoming TCP on the port you use. On Windows,
+allow corvo-lan on **private networks** when the firewall asks on first run,
+and make sure your Wi-Fi is set to *Private* (Settings → Network & internet →
+Wi-Fi → your network). `--debug` writes a log to `./corvo-lan.log`.
 
 ## Development
 
@@ -104,10 +119,10 @@ CI runs all three on every pull request.
 ## Releasing
 
 Work happens on `main`. To ship, bump `version` in `Cargo.toml`, then merge
-`main` into the `release` branch. That builds macOS and Linux binaries,
-tags `v<version>`, and publishes them as a GitHub Release, which is what the
-install script downloads. A version that's already released is refused, so
-bump it first.
+`main` into the `release` branch. That builds macOS, Linux and Windows
+binaries, tags `v<version>`, and publishes them as a GitHub Release, which is
+what the install script downloads. A version that's already released is
+refused, so bump it first.
 
 ## License
 
