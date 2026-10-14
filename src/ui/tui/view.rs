@@ -272,12 +272,13 @@ fn input_layout(editor: &Editor, width: usize) -> (Vec<String>, (usize, usize)) 
     (out, cursor)
 }
 
-fn draw_input(frame: &mut Frame, area: Rect, state: &TuiState) {
+fn draw_input(frame: &mut Frame, area: Rect, session: &Session, state: &TuiState) {
     let (rows, (crow, ccol)) = input_layout(&state.editor, (area.width as usize).saturating_sub(2));
     let height = area.height as usize;
     let first = crow.saturating_sub(height.saturating_sub(1));
     let lines: Vec<Line> = if state.editor.is_empty() {
-        vec![Line::from(vec![Span::raw("> "), Span::styled("type a message…", tone_style(Tone::Dim, state.color))])]
+        let hint = session.prompt().unwrap_or_else(|| "type a message…".into());
+        vec![Line::from(vec![Span::raw("> "), Span::styled(hint, tone_style(Tone::Dim, state.color))])]
     } else {
         rows.iter()
             .enumerate()
@@ -399,7 +400,7 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
         Paragraph::new("─".repeat(sep_a.width as usize)).style(tone_style(Tone::Dim, state.color)),
         sep_a,
     );
-    draw_input(frame, input_a, state);
+    draw_input(frame, input_a, session, state);
     draw_popup(frame, input_a, state);
     draw_status_bar(frame, status_a, session, state, now);
 }
@@ -507,6 +508,15 @@ mod tests {
         assert!(find(&buf, "online").is_some());
         assert!(find(&buf, "● carolFox").is_some());
         assert_eq!(state.hit(x + 3, y), Some(Hit::Person("bobRoger".into())));
+    }
+
+    #[test]
+    fn the_input_shows_the_create_question() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        s.on_line("/create cat", None);
+        let buf = render(&s, &mut state, 80, 20);
+        assert!(find(&buf, "> how many people in #cat…?").is_some(), "{:#?}", rows(&buf));
     }
 
     #[test]

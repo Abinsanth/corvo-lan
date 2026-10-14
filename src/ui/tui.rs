@@ -195,6 +195,7 @@ fn apply_key(session: &mut Session, state: &mut TuiState, action: Action) -> Key
         Action::GoTab(i) => state.select_tab(session, i),
         Action::PageUp => state.scroll.page_up(total, height),
         Action::PageDown => state.scroll.page_down(total, height),
+        Action::Esc if state.editor.is_empty() && session.cancel_prompt() => {}
         Action::Esc if state.editor.is_empty() => state.scroll.to_bottom(),
         Action::Esc => state.editor.clear(),
         Action::Complete => state.complete(&Candidates::from_store(&session.store)),
@@ -229,11 +230,14 @@ fn follow_current(state: &mut TuiState, before: Option<Conv>, session: &Session)
 /// A line the user sent. Returns the reaction for `Ctx::act`, with its printed
 /// lines already moved to the corvo tab; `None` if nothing should happen.
 fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Instant) -> Option<Reaction> {
-    if text.trim().is_empty() {
+    let asking = session.prompt().is_some();
+    if text.trim().is_empty() && !asking {
         return None;
     }
-    state.history.push(&text);
-    if state.on_status && !text.starts_with('/') {
+    if !text.trim().is_empty() {
+        state.history.push(&text);
+    }
+    if state.on_status && !text.starts_with('/') && !asking {
         say(state, "! this is the corvo tab — switch to a chat (Shift-Tab) to send messages", now);
         return None;
     }
@@ -245,6 +249,9 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     }
     if session.store.current().cloned() != before {
         follow_current(state, before, session);
+    }
+    if let Some(question) = session.prompt() {
+        state.flash(&question, now);
     }
     Some(reaction)
 }
@@ -416,6 +423,30 @@ mod tests {
         assert!(state.flash_text(now).is_some());
         let r = on_send(&mut s, &mut state, "/who".into(), now).unwrap();
         assert_eq!(r.commands, vec![crate::api::Command::ListPeers]);
+    }
+
+    #[test]
+    fn the_create_question_is_answered_from_any_tab_and_esc_drops_it() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        state.on_status = true;
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        assert!(state.flash_text(now).is_some_and(|t| t.contains("how many people")), "the question flashes");
+        let r = on_send(&mut s, &mut state, String::new(), now).expect("Enter answers");
+        assert_eq!(r.commands, vec![crate::api::Command::CreateRoom { base: "cat".into(), max: 13 }]);
+
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        let r = on_send(&mut s, &mut state, "4".into(), now).expect("not refused on the corvo tab");
+        assert_eq!(r.commands, vec![crate::api::Command::CreateRoom { base: "cat".into(), max: 4 }]);
+
+        on_send(&mut s, &mut state, "/create cat".into(), now);
+        state.editor.insert('7');
+        apply_key(&mut s, &mut state, Action::Esc);
+        assert!(s.prompt().is_some(), "the first Esc clears the input");
+        apply_key(&mut s, &mut state, Action::Esc);
+        assert_eq!(s.prompt(), None);
+        assert_eq!(on_send(&mut s, &mut state, String::new(), now), None, "Enter does nothing again");
     }
 
     #[test]
