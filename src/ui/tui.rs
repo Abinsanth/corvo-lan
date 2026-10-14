@@ -257,7 +257,7 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
         && let Some(text) = text
     {
         state.push_status(now_millis(), &text, tone_of(event));
-        if matches!(event, Event::Error(_)) || tone_of(event) == Tone::Warn {
+        if matches!(event, Event::Error(_) | Event::JoinEnded { .. }) || tone_of(event) == Tone::Warn {
             state.flash(&text, now);
         }
     }
@@ -447,7 +447,12 @@ mod tests {
         on_event(&mut s, &mut state, &Event::Error("no room #x with that key".into()), now);
         assert_eq!(state.status_lines().last().unwrap().text, "! no room #x with that key");
         assert!(state.flash_text(now).is_some());
-        on_event(&mut s, &mut state, &Event::RoomJoined { name: "catPieR".into(), members: vec![] }, now);
+        on_event(
+            &mut s,
+            &mut state,
+            &Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] },
+            now,
+        );
         assert!(!state.on_status, "joining shows the room");
         state.scroll.page_up(100, 10);
         let msg =
@@ -467,7 +472,12 @@ mod tests {
         let mut s = session();
         let mut state = TuiState::new(false);
         let now = Instant::now();
-        on_event(&mut s, &mut state, &Event::RoomJoined { name: "catPieR".into(), members: vec![] }, now);
+        on_event(
+            &mut s,
+            &mut state,
+            &Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] },
+            now,
+        );
         let room = Conv::Room("catPieR".into());
         state.scroll.page_up(100, 10);
         let msg = Event::Message { conv: room.clone(), from: "bobRoger".into(), text: "x".into(), ts: 0 };

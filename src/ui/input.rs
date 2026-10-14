@@ -20,9 +20,19 @@ pub enum Input {
         to: String,
         text: String,
     },
+    /// `max` is the head count as typed, if given.
     Create {
         base: String,
-        part: String,
+        max: Option<String>,
+    },
+    /// Let someone into a room; `room` if typed, else worked out from who's waiting where.
+    Approve {
+        nick: String,
+        room: Option<String>,
+    },
+    Deny {
+        nick: String,
+        room: Option<String>,
     },
     Leave(Option<String>),
     Rooms,
@@ -45,8 +55,8 @@ const SIGIL_HINT: &str = "use @name for people or #name for rooms";
 /// Every command name `parse_line` accepts, aliases included. Completion and
 /// typo hints read it, so keep it in step with the match below.
 pub const COMMANDS: &[&str] = &[
-    "msg", "m", "chat", "c", "create", "leave", "close", "rooms", "chats", "who", "update", "help", "h", "?", "quit",
-    "q",
+    "msg", "m", "chat", "c", "create", "approve", "deny", "leave", "close", "rooms", "chats", "who", "update", "help",
+    "h", "?", "quit", "q",
 ];
 
 /// Names that were dropped, and the command that replaced each.
@@ -90,9 +100,25 @@ pub fn parse_line(line: &str) -> Input {
             _ => Input::Error("usage: /chat @nick | /chat #room [key]".into()),
         },
         "create" => match words.as_slice() {
-            [base, part] => Input::Create { base: base.to_string(), part: part.to_string() },
-            _ => Input::Error("usage: /create <name> <key>".into()),
+            [base] => Input::Create { base: base.to_string(), max: None },
+            [base, max] => Input::Create { base: base.to_string(), max: Some(max.to_string()) },
+            _ => Input::Error("usage: /create <name> [people]".into()),
         },
+        "approve" | "deny" => {
+            let (nick, room) = match words.as_slice() {
+                [nick] => (nick.strip_prefix('@'), None),
+                [nick, room] => match room.strip_prefix('#') {
+                    Some(room) => (nick.strip_prefix('@'), Some(room.to_string())),
+                    None => return Input::Error(SIGIL_HINT.into()),
+                },
+                _ => return Input::Error(format!("usage: /{name} @nick [#room]")),
+            };
+            let Some(nick) = nick else {
+                return Input::Error(SIGIL_HINT.into());
+            };
+            let nick = nick.to_string();
+            if name == "approve" { Input::Approve { nick, room } } else { Input::Deny { nick, room } }
+        }
         "leave" => match words.as_slice() {
             [] => Input::Leave(None),
             [room] if room.starts_with('#') => Input::Leave(Some(room[1..].to_string())),
@@ -206,12 +232,30 @@ mod tests {
 
     #[test]
     fn room_commands() {
-        assert_eq!(parse_line("/create cat 123"), Input::Create { base: "cat".into(), part: "123".into() });
-        assert_eq!(parse_line("/create cat"), err("usage: /create <name> <key>"));
+        assert_eq!(parse_line("/create cat"), Input::Create { base: "cat".into(), max: None });
+        assert_eq!(parse_line("/create cat 5"), Input::Create { base: "cat".into(), max: Some("5".into()) });
+        assert_eq!(parse_line("/create"), err("usage: /create <name> [people]"));
+        assert_eq!(parse_line("/create cat 5 6"), err("usage: /create <name> [people]"));
         assert_eq!(parse_line("/leave"), Input::Leave(None));
         assert_eq!(parse_line("/leave #catPieR"), Input::Leave(Some("catPieR".into())));
         assert_eq!(parse_line("/leave catPieR"), err("usage: /leave [#room]"));
         assert_eq!(parse_line("/rooms"), Input::Rooms);
+    }
+
+    #[test]
+    fn approval_commands() {
+        let bob = || "bobRoger".to_string();
+        assert_eq!(parse_line("/approve @bobRoger"), Input::Approve { nick: bob(), room: None });
+        assert_eq!(
+            parse_line("/approve @bobRoger #catPieR"),
+            Input::Approve { nick: bob(), room: Some("catPieR".into()) }
+        );
+        assert_eq!(parse_line("/deny @bobRoger"), Input::Deny { nick: bob(), room: None });
+        assert_eq!(parse_line("/deny @bobRoger #catPieR"), Input::Deny { nick: bob(), room: Some("catPieR".into()) });
+        assert_eq!(parse_line("/deny bob"), err(SIGIL_HINT));
+        assert_eq!(parse_line("/approve @bob catPieR"), err(SIGIL_HINT));
+        assert_eq!(parse_line("/approve"), err("usage: /approve @nick [#room]"));
+        assert_eq!(parse_line("/deny"), err("usage: /deny @nick [#room]"));
     }
 
     #[test]

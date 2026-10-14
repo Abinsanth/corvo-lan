@@ -1,7 +1,10 @@
 //! Private rooms: keys, key derivation, sealing/opening room frames, replay checks.
 //!
-//! Knowing a room's name and key is membership. Every room frame goes to every
-//! peer; only members can derive `room_id` to recognise it and `enc_key` to read it.
+//! A room has two sets of keys. The *door* keys come from its name and the
+//! 6-character join key: anyone who has those can knock, nothing more. The
+//! *room* keys come from a random secret the creator made, which members hand
+//! to a newcomer once enough of them approve. Every room frame goes to every
+//! peer; only key holders can recognise (`room_id`) and read it.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -15,18 +18,19 @@ use sha2::Sha256;
 
 use crate::protocol::{Frame, PeerId};
 
-/// System part of a key: no look-alikes (`0 o 1 l i`).
+/// Join key characters: no look-alikes (`0 o 1 l i`).
 pub const SYS_ALPHABET: &[u8] = b"23456789abcdefghjkmnpqrstuvwxyz";
 pub const SYS_LEN: usize = 6;
-pub const MAX_PART_LEN: usize = 9;
 /// Room messages further than this from our clock are dropped.
 pub const MAX_SKEW_MS: u64 = 5 * 60 * 1000;
 /// Nonces remembered per room for replay detection.
 pub const REPLAY_WINDOW: usize = 1024;
 
 pub type RoomId = [u8; 16];
+/// The random value a room's creator makes; its room keys come from it.
+pub type Secret = [u8; 32];
 
-/// What a member derives from a room's name and key.
+/// An id and encryption key: a room's door keys or its room keys.
 #[derive(Clone)]
 pub struct RoomKeys {
     pub id: RoomId,
@@ -59,49 +63,79 @@ pub enum RoomBody {
         echo: Option<String>,
     },
     Leave,
+    /// Door channel, newcomer to everyone: let me in. `asked` is when the
+    /// newcomer first knocked (unix millis), the same on every re-knock.
+    Knock {
+        nonce: String,
+        asked: u64,
+    },
+    /// Door channel, member to a newcomer: someone's in, echoing its knock.
+    /// `members` counts the sender.
+    Door {
+        echo: String,
+        members: u8,
+        max: u8,
+    },
+    /// Door channel, approver to a newcomer: the room secret (hex).
+    Grant {
+        secret: String,
+        max: u8,
+    },
+    /// Door channel, member to a newcomer: not let in, because the room is
+    /// `full` or a member said no.
+    Refuse {
+        full: bool,
+    },
+    /// Room channel: a member approves (`yes`) or denies `peer`'s request.
+    Vote {
+        peer: PeerId,
+        asked: u64,
+        yes: bool,
+    },
 }
 
-/// The part of a key the creator types: 1–9 ASCII letters or digits.
-pub fn validate_part(part: &str) -> Result<(), String> {
-    if part.is_empty() || part.len() > MAX_PART_LEN || !part.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(format!("key must be 1–{MAX_PART_LEN} letters or digits before the system part"));
-    }
-    Ok(())
-}
-
-/// `part-xxxxxx` with the system part drawn from the OS-seeded CSPRNG.
-pub fn make_key(part: &str) -> String {
+/// A join key: `SYS_LEN` characters drawn from the OS-seeded CSPRNG.
+pub fn make_key() -> String {
     let mut rng = rand::rng();
-    let sys: String =
-        (0..SYS_LEN).map(|_| *SYS_ALPHABET.choose(&mut rng).expect("alphabet is not empty") as char).collect();
-    format!("{part}-{sys}")
+    (0..SYS_LEN).map(|_| *SYS_ALPHABET.choose(&mut rng).expect("alphabet is not empty") as char).collect()
 }
 
-/// A full key as shared by a room's creator.
+/// A join key as shared by a room's members.
 pub fn validate_key(key: &str) -> Result<(), String> {
-    let bad = || Err(format!("key must look like <part>-<{SYS_LEN} chars>"));
-    let Some((part, sys)) = key.rsplit_once('-') else {
-        return bad();
-    };
-    if validate_part(part).is_err() || sys.len() != SYS_LEN || !sys.bytes().all(|b| SYS_ALPHABET.contains(&b)) {
-        return bad();
+    if key.len() != SYS_LEN || !key.bytes().all(|b| SYS_ALPHABET.contains(&b)) {
+        return Err(format!("a room key is {SYS_LEN} letters and digits, like k7m9xq"));
     }
     Ok(())
 }
 
-/// Slow on purpose (Argon2id, ~19 MiB): call it off the async actor.
+pub fn new_secret() -> Secret {
+    rand::random()
+}
+
+/// The door keys for a room name and join key. Slow on purpose (Argon2id,
+/// ~19 MiB): call it off the async actor.
 pub fn derive(name: &str, key: &str) -> RoomKeys {
     let params = Params::new(19_456, 2, 1, Some(32)).expect("valid Argon2 params");
-    let salt = format!("corvo-lan room v3:{name}");
-    let mut secret = [0u8; 32];
+    let salt = format!("corvo-lan room v4:{name}");
+    let mut stretched = [0u8; 32];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(key.as_bytes(), salt.as_bytes(), &mut secret)
+        .hash_password_into(key.as_bytes(), salt.as_bytes(), &mut stretched)
         .expect("salt and output lengths are valid");
-    let hk = Hkdf::<Sha256>::new(None, &secret);
+    expand(None, &stretched, b"corvo-lan v4 door-id", b"corvo-lan v4 door-enc")
+}
+
+/// The room keys for a room name and its secret. The secret is random, so
+/// no stretching is needed.
+pub fn from_secret(name: &str, secret: &Secret) -> RoomKeys {
+    expand(Some(name.as_bytes()), secret, b"corvo-lan v4 room-id", b"corvo-lan v4 room-enc")
+}
+
+fn expand(salt: Option<&[u8]>, ikm: &[u8], id_label: &[u8], enc_label: &[u8]) -> RoomKeys {
+    let hk = Hkdf::<Sha256>::new(salt, ikm);
     let mut id = [0u8; 16];
     let mut enc = [0u8; 32];
-    hk.expand(b"corvo-lan v3 room-id", &mut id).expect("16 bytes is a valid length");
-    hk.expand(b"corvo-lan v3 room-enc", &mut enc).expect("32 bytes is a valid length");
+    hk.expand(id_label, &mut id).expect("16 bytes is a valid length");
+    hk.expand(enc_label, &mut enc).expect("32 bytes is a valid length");
     RoomKeys { id, enc }
 }
 
@@ -186,7 +220,7 @@ mod tests {
     /// Argon2 is slow, so derive the shared test room once.
     fn keys() -> &'static RoomKeys {
         static KEYS: OnceLock<RoomKeys> = OnceLock::new();
-        KEYS.get_or_init(|| derive("catPieR", "123-k7m9xq"))
+        KEYS.get_or_init(|| derive("catPieR", "k7m9xq"))
     }
 
     fn chat(text: &str, ts: u64) -> RoomEnvelope {
@@ -201,34 +235,56 @@ mod tests {
     }
 
     #[test]
-    fn keys_have_the_part_and_six_system_chars() {
-        let key = make_key("123");
-        let (part, sys) = key.split_once('-').unwrap();
-        assert_eq!(part, "123");
-        assert_eq!(sys.len(), SYS_LEN);
-        assert!(sys.bytes().all(|b| SYS_ALPHABET.contains(&b)));
+    fn keys_are_six_system_chars() {
+        let key = make_key();
+        assert_eq!(key.len(), SYS_LEN);
+        assert!(key.bytes().all(|b| SYS_ALPHABET.contains(&b)));
         assert!(validate_key(&key).is_ok());
-        assert_ne!(make_key("123"), make_key("123"));
+        assert_ne!(make_key(), make_key());
     }
 
     #[test]
     fn key_validation() {
-        assert!(validate_part("123").is_ok());
-        assert!(validate_part("").is_err());
-        assert!(validate_part("toolongpart").is_err());
-        assert!(validate_part("a-b").is_err());
-        assert!(validate_key("123-k7m9xq").is_ok());
-        assert!(validate_key("123").is_err());
-        assert!(validate_key("123-k7m9x").is_err()); // too short
-        assert!(validate_key("123-k7m9x0").is_err()); // '0' isn't in the alphabet
-        assert!(validate_key("-k7m9xq").is_err());
+        assert!(validate_key("k7m9xq").is_ok());
+        assert!(validate_key("123-k7m9xq").is_err(), "the old two-part form");
+        assert!(validate_key("k7m9x").is_err(), "too short");
+        assert!(validate_key("k7m9xqq").is_err(), "too long");
+        assert!(validate_key("k7m9x0").is_err(), "'0' isn't in the alphabet");
+        assert!(validate_key("").is_err());
+    }
+
+    #[test]
+    fn door_and_room_keys_differ_and_secret_derivation_is_deterministic() {
+        let secret = [7u8; 32];
+        let room = from_secret("catPieR", &secret);
+        assert_eq!(room.id, from_secret("catPieR", &secret).id);
+        assert_ne!(room.id, from_secret("dogPieR", &secret).id);
+        assert_ne!(room.id, from_secret("catPieR", &[8; 32]).id);
+        assert_ne!(room.id, keys().id, "door and room ids never coincide");
+        assert_ne!(new_secret(), new_secret());
+    }
+
+    #[test]
+    fn gate_bodies_round_trip() {
+        let bodies = [
+            RoomBody::Knock { nonce: "ab".into(), asked: 5 },
+            RoomBody::Door { echo: "ab".into(), members: 3, max: 13 },
+            RoomBody::Grant { secret: to_hex(&[1; 32]), max: 4 },
+            RoomBody::Refuse { full: true },
+            RoomBody::Vote { peer: BOB, asked: 5, yes: false },
+        ];
+        for body in bodies {
+            let env = RoomEnvelope { ts: 1, body };
+            let json = serde_json::to_string(&env).unwrap();
+            assert_eq!(serde_json::from_str::<RoomEnvelope>(&json).unwrap(), env);
+        }
     }
 
     #[test]
     fn derivation_is_deterministic_and_name_and_key_both_matter() {
-        assert_eq!(to_hex(&keys().id), to_hex(&derive("catPieR", "123-k7m9xq").id));
-        assert_ne!(keys().id, derive("dogPieR", "123-k7m9xq").id);
-        assert_ne!(keys().id, derive("catPieR", "123-k7m9xr").id);
+        assert_eq!(to_hex(&keys().id), to_hex(&derive("catPieR", "k7m9xq").id));
+        assert_ne!(keys().id, derive("dogPieR", "k7m9xq").id);
+        assert_ne!(keys().id, derive("catPieR", "k7m9xr").id);
     }
 
     #[test]
@@ -247,7 +303,7 @@ mod tests {
         let frame = seal(keys(), ALICE, &chat("hi", 1000));
         let (_, nonce, ct) = parts(&frame);
         assert!(open(keys(), BOB, nonce, ct).is_none(), "relabelled sender");
-        let other = derive("catPieR", "999-k7m9xq");
+        let other = derive("catPieR", "k7m9xr");
         assert!(open(&other, ALICE, nonce, ct).is_none(), "wrong key");
         let mut flipped = ct.to_string();
         let last = if flipped.ends_with('0') { '1' } else { '0' };

@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use corvo_lan::api::{Command, Conv, Event, LeaveReason, Target};
+use corvo_lan::api::{Command, Conv, Event, JoinEnd, LeaveReason, Target};
 use corvo_lan::identity::Keys;
 use corvo_lan::node::{self, NodeConfig, NodeHandle};
 use tokio::time::timeout;
@@ -95,18 +95,36 @@ async fn trio() -> (Peer, Peer, Peer) {
     (alice, bob, carol)
 }
 
-/// `p` creates a room from `base`/`part`; returns its (name, key).
-async fn create_room(p: &mut Peer, base: &str, part: &str) -> (String, String) {
-    send(p, Command::CreateRoom { base: base.into(), key_part: part.into() }).await;
+/// `p` creates a room from `base`; returns its (name, key).
+async fn create_room(p: &mut Peer, base: &str) -> (String, String) {
+    send(p, Command::CreateRoom { base: base.into(), max: 13 }).await;
     match wait_for(&mut p.node, "room created", |e| matches!(e, Event::RoomCreated { .. })).await {
-        Event::RoomCreated { name, key } => (name, key),
+        Event::RoomCreated { name, key, .. } => (name, key),
         _ => unreachable!(),
     }
 }
 
-async fn join_room(p: &mut Peer, name: &str, key: &str) -> Vec<String> {
+/// `p` asks to join `name`.
+async fn knock(p: &mut Peer, name: &str, key: &str) {
     send(p, Command::JoinRoom { name: name.into(), key: key.into() }).await;
-    match wait_for(&mut p.node, "room joined", |e| matches!(e, Event::RoomJoined { .. } | Event::Error(_))).await {
+}
+
+/// `member` sees `nick`'s request to join `room` and approves it.
+async fn approve(member: &mut Peer, room: &str, nick: &str) {
+    wait_for(&mut member.node, "join request", |e| matches!(e, Event::JoinRequest { nick: n, .. } if n == nick)).await;
+    send(member, Command::Approve { room: room.into(), nick: nick.into() }).await;
+}
+
+fn join_outcome(e: &Event) -> bool {
+    matches!(e, Event::RoomJoined { .. } | Event::JoinEnded { .. } | Event::Error(_))
+}
+
+/// `p` joins `name`, let in by `member`; returns the members `p` met on the way in.
+async fn join_room(p: &mut Peer, member: &mut Peer, name: &str, key: &str) -> Vec<String> {
+    knock(p, name, key).await;
+    let nick = p.nick.clone();
+    approve(member, name, &nick).await;
+    match wait_for(&mut p.node, "room joined", join_outcome).await {
         Event::RoomJoined { members, .. } => members,
         other => panic!("join failed: {other:?}"),
     }
@@ -153,10 +171,10 @@ async fn dm_reaches_its_target() {
 #[tokio::test]
 async fn room_messages_reach_members_only() {
     let (mut alice, mut bob, mut carol) = trio().await;
-    let (room, key) = create_room(&mut alice, "cat", "123").await;
+    let (room, key) = create_room(&mut alice, "cat").await;
     assert!(room.starts_with("cat") && room.ends_with('R'));
 
-    let members = join_room(&mut bob, &room, &key).await;
+    let members = join_room(&mut bob, &mut alice, &room, &key).await;
     assert_eq!(members, vec![alice.nick.clone()]);
     let joined = wait_for(&mut alice.node, "member joined", |e| matches!(e, Event::MemberJoined { .. })).await;
     assert_eq!(joined, Event::MemberJoined { room: room.clone(), nick: bob.nick.clone() });
@@ -176,19 +194,32 @@ async fn room_messages_reach_members_only() {
 #[tokio::test]
 async fn joining_with_the_wrong_key_fails() {
     let (mut alice, mut bob) = pair().await;
-    let (room, key) = create_room(&mut alice, "cat", "123").await;
+    let (room, key) = create_room(&mut alice, "cat").await;
     let wrong = format!("{}x", &key[..key.len() - 1]);
     let wrong = if wrong == key { format!("{}y", &key[..key.len() - 1]) } else { wrong };
-    send(&bob, Command::JoinRoom { name: room.clone(), key: wrong }).await;
-    let event = wait_for(&mut bob.node, "error", |e| matches!(e, Event::Error(_) | Event::RoomJoined { .. })).await;
-    assert_eq!(event, Event::Error(format!("no room #{room} with that key")));
+    knock(&mut bob, &room, &wrong).await;
+    let event = wait_for(&mut bob.node, "join outcome", join_outcome).await;
+    assert_eq!(event, Event::JoinEnded { name: room, why: JoinEnd::NoRoom });
+}
+
+#[tokio::test]
+async fn a_member_can_turn_a_newcomer_away() {
+    let (mut alice, mut bob) = pair().await;
+    let (room, key) = create_room(&mut alice, "cat").await;
+    knock(&mut bob, &room, &key).await;
+    let waiting = wait_for(&mut bob.node, "waiting", |e| matches!(e, Event::JoinWaiting { .. })).await;
+    assert_eq!(waiting, Event::JoinWaiting { name: room.clone(), members: 1, needs: 1 });
+    wait_for(&mut alice.node, "join request", |e| matches!(e, Event::JoinRequest { .. })).await;
+    send(&alice, Command::Deny { room: room.clone(), nick: bob.nick.clone() }).await;
+    let event = wait_for(&mut bob.node, "join outcome", join_outcome).await;
+    assert_eq!(event, Event::JoinEnded { name: room, why: JoinEnd::Denied { by: alice.nick.clone() } });
 }
 
 #[tokio::test]
 async fn a_room_is_gone_once_its_last_member_leaves() {
     let (mut alice, mut bob, mut carol) = trio().await;
-    let (room, key) = create_room(&mut alice, "cat", "123").await;
-    join_room(&mut bob, &room, &key).await;
+    let (room, key) = create_room(&mut alice, "cat").await;
+    join_room(&mut bob, &mut alice, &room, &key).await;
     // alice counts bob as a member once he has answered her challenge.
     wait_for(&mut alice.node, "member joined", |e| matches!(e, Event::MemberJoined { .. })).await;
 
@@ -201,16 +232,16 @@ async fn a_room_is_gone_once_its_last_member_leaves() {
     wait_for(&mut alice.node, "left", |e| matches!(e, Event::RoomLeft { .. })).await;
 
     // Nobody holds the room any more, so even the right key finds nothing.
-    send(&carol, Command::JoinRoom { name: room.clone(), key }).await;
-    let event = wait_for(&mut carol.node, "error", |e| matches!(e, Event::Error(_) | Event::RoomJoined { .. })).await;
-    assert_eq!(event, Event::Error(format!("no room #{room} with that key")));
+    knock(&mut carol, &room, &key).await;
+    let event = wait_for(&mut carol.node, "join outcome", join_outcome).await;
+    assert_eq!(event, Event::JoinEnded { name: room, why: JoinEnd::NoRoom });
 }
 
 #[tokio::test]
 async fn quitting_leaves_rooms_and_goes_offline() {
     let (mut alice, mut bob) = pair().await;
-    let (room, key) = create_room(&mut alice, "cat", "123").await;
-    join_room(&mut bob, &room, &key).await;
+    let (room, key) = create_room(&mut alice, "cat").await;
+    join_room(&mut bob, &mut alice, &room, &key).await;
     wait_for(&mut alice.node, "member joined", |e| matches!(e, Event::MemberJoined { .. })).await;
 
     send(&bob, Command::Quit).await;

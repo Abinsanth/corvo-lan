@@ -5,6 +5,7 @@ use super::render::{self, Style};
 use super::updates::UpdateAction;
 use crate::api::{Command, Conv, Event, Target};
 use crate::convo::Store;
+use crate::node::{MAX_MEMBERS, MIN_MEMBERS};
 
 pub const MAX_MESSAGE_LINES: usize = 50;
 
@@ -13,8 +14,9 @@ commands:
   <text>                 send to the current tab
   /msg @nick <text>      one-off private message (also /m)
   /chat @nick            open a private chat (also /c; the @ is optional)
-  /chat #room <key>      join a room (just /chat #room once you're in)
-  /create <name> <key>   create a private room; share its name and key to invite
+  /chat #room <key>      ask to join a room (just /chat #room once you're in)
+  /create <name> [n]     create a private room for n people, 2–13 (asks if you leave it out)
+  /approve @nick [#room] let someone who asked into a room; /deny @nick turns them away
   /leave [#room]         leave the current or named room
   /close [@nick]         close the current or named private chat
   /rooms  /chats  /who   list rooms, chats, connected people
@@ -91,7 +93,7 @@ impl Session {
                 Ok(text) => match shown.or(self.store.current()) {
                     Some(Conv::Room(n)) => Reaction::send(Command::Send { to: Target::Room(n.clone()), text }),
                     Some(Conv::Dm(n)) => Reaction::send(Command::Send { to: Target::Dm(n.clone()), text }),
-                    None => Reaction::say("! no conversation — /chat @nick or /create <name> <key>"),
+                    None => Reaction::say("! no conversation — /chat @nick or /create <name>"),
                 },
                 Err(e) => Reaction::say(format!("! {e}")),
             },
@@ -130,7 +132,21 @@ impl Session {
                 Ok(Conv::Room(_)) => Reaction::default(),
                 Err(e) => Reaction::say(format!("! {e}")),
             },
-            Input::Create { base, part } => Reaction::send(Command::CreateRoom { base, key_part: part }),
+            Input::Create { base, max } => match max.as_deref().map(str::parse::<u8>) {
+                None => Reaction::send(Command::CreateRoom { base, max: MAX_MEMBERS }),
+                Some(Ok(max)) if (MIN_MEMBERS..=MAX_MEMBERS).contains(&max) => {
+                    Reaction::send(Command::CreateRoom { base, max })
+                }
+                Some(_) => Reaction::say(format!("! a room holds {MIN_MEMBERS}–{MAX_MEMBERS} people")),
+            },
+            Input::Approve { nick, room } => match self.waiting_room(&nick, room, "approve") {
+                Ok(room) => Reaction::send(Command::Approve { room, nick }),
+                Err(e) => Reaction::say(format!("! {e}")),
+            },
+            Input::Deny { nick, room } => match self.waiting_room(&nick, room, "deny") {
+                Ok(room) => Reaction::send(Command::Deny { room, nick }),
+                Err(e) => Reaction::say(format!("! {e}")),
+            },
             Input::Leave(Some(name)) => Reaction::send(Command::LeaveRoom { name }),
             Input::Leave(None) => match self.store.current() {
                 Some(Conv::Room(n)) => Reaction::send(Command::LeaveRoom { name: n.clone() }),
@@ -201,6 +217,42 @@ impl Session {
         }
     }
 
+    /// The room `nick` is asking to join: the one typed, else the current
+    /// room if they wait there, else the only room they wait in.
+    fn waiting_room(&self, nick: &str, typed: Option<String>, cmd: &str) -> Result<String, String> {
+        if let Some(room) = typed {
+            return Ok(room);
+        }
+        let rooms: Vec<&String> = self
+            .store
+            .conversations()
+            .iter()
+            .filter(|c| c.waiting.contains_key(nick))
+            .filter_map(|c| match &c.conv {
+                Conv::Room(name) => Some(name),
+                Conv::Dm(_) => None,
+            })
+            .collect();
+        if let Some(Conv::Room(current)) = self.store.current()
+            && rooms.contains(&current)
+        {
+            return Ok(current.clone());
+        }
+        match rooms.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => Err(format!("@{nick} isn't waiting to join any of your rooms")),
+            many => {
+                let names: Vec<String> = many.iter().map(|r| format!("#{r}")).collect();
+                let (last, rest) = names.split_last().expect("at least two");
+                Err(format!(
+                    "@{nick} is waiting in {} and {last} — say which: /{cmd} @{nick} {}",
+                    rest.join(", "),
+                    names[0]
+                ))
+            }
+        }
+    }
+
     /// Shows `conv`; its tab already shows what's unread.
     fn switch(&mut self, conv: Conv) -> Reaction {
         self.store.switch(conv);
@@ -246,7 +298,7 @@ mod tests {
     #[test]
     fn plain_text_goes_to_the_current_conversation() {
         let mut s = session();
-        assert_eq!(typed(&mut s, "hello").print, vec!["! no conversation — /chat @nick or /create <name> <key>"]);
+        assert_eq!(typed(&mut s, "hello").print, vec!["! no conversation — /chat @nick or /create <name>"]);
         assert_eq!(typed(&mut s, "/chat @bobRoger"), Reaction::default());
         assert_eq!(s.store.current(), Some(&Conv::Dm("bobRoger".into())));
         assert_eq!(typed(&mut s, "hello"), send(Target::Dm("bobRoger".into()), "hello"));
@@ -255,11 +307,8 @@ mod tests {
     #[test]
     fn creating_or_joining_a_room_switches_to_it() {
         let mut s = session();
-        assert_eq!(
-            typed(&mut s, "/create cat 123"),
-            Reaction::send(Command::CreateRoom { base: "cat".into(), key_part: "123".into() })
-        );
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
+        assert_eq!(typed(&mut s, "/create cat 5"), Reaction::send(Command::CreateRoom { base: "cat".into(), max: 5 }));
+        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into(), max: 13 }, 0);
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
         assert_eq!(typed(&mut s, "meow"), send(Target::Room("catPieR".into()), "meow"));
 
@@ -268,11 +317,78 @@ mod tests {
             Reaction::send(Command::JoinRoom { name: "dogFoxR".into(), key: "1-abcdef".into() })
         );
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())), "not until the join succeeds");
-        s.on_event(&Event::RoomJoined { name: "dogFoxR".into(), members: vec!["bobRoger".into()] }, 0);
+        s.on_event(
+            &Event::RoomJoined {
+                name: "dogFoxR".into(),
+                key: "k7m9xq".into(),
+                max: 13,
+                members: vec!["bobRoger".into()],
+            },
+            0,
+        );
         assert_eq!(s.store.current(), Some(&Conv::Room("dogFoxR".into())));
         assert_eq!(typed(&mut s, "/chat #catPieR"), Reaction::default(), "already in: just switch");
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
         assert_eq!(typed(&mut s, "/chat #nopeMoonR").print, vec!["! join with /chat #nopeMoonR <key>"]);
+    }
+
+    #[test]
+    fn create_takes_an_optional_head_count() {
+        let mut s = session();
+        let create = |max| Reaction::send(Command::CreateRoom { base: "cat".into(), max });
+        assert_eq!(typed(&mut s, "/create cat"), create(13));
+        assert_eq!(typed(&mut s, "/create cat 2"), create(2));
+        for bad in ["1", "14", "x", "300"] {
+            assert_eq!(typed(&mut s, &format!("/create cat {bad}")).print, vec!["! a room holds 2–13 people"]);
+        }
+    }
+
+    /// We're in `rooms`, and bob is waiting to get into each.
+    fn bob_waits_in(rooms: &[&str]) -> Session {
+        let mut s = session();
+        for room in rooms {
+            s.on_event(&Event::RoomCreated { name: room.to_string(), key: "k7m9xq".into(), max: 13 }, 0);
+            let request = Event::JoinRequest { room: room.to_string(), nick: "bobRoger".into(), have: 0, need: 1 };
+            s.on_event(&request, 0);
+        }
+        s
+    }
+
+    fn approve(room: &str) -> Reaction {
+        Reaction::send(Command::Approve { room: room.into(), nick: "bobRoger".into() })
+    }
+
+    #[test]
+    fn approve_finds_the_room_they_wait_in() {
+        let mut s = bob_waits_in(&["catPieR"]);
+        typed(&mut s, "/chat @bobRoger");
+        assert_eq!(typed(&mut s, "/approve @bobRoger"), approve("catPieR"));
+        assert_eq!(
+            typed(&mut s, "/deny @bobRoger"),
+            Reaction::send(Command::Deny { room: "catPieR".into(), nick: "bobRoger".into() })
+        );
+        assert_eq!(typed(&mut s, "/approve @bobRoger #dogFoxR"), approve("dogFoxR"), "an explicit room is passed on");
+        assert_eq!(
+            typed(&mut s, "/approve @carolFox").print,
+            vec!["! @carolFox isn't waiting to join any of your rooms"]
+        );
+    }
+
+    #[test]
+    fn approve_prefers_the_current_room() {
+        let mut s = bob_waits_in(&["catPieR", "dogFoxR"]);
+        s.store.switch(Conv::Room("catPieR".into()));
+        assert_eq!(typed(&mut s, "/approve @bobRoger"), approve("catPieR"));
+    }
+
+    #[test]
+    fn approve_needs_a_room_when_ambiguous() {
+        let mut s = bob_waits_in(&["catPieR", "dogFoxR"]);
+        typed(&mut s, "/chat @bobRoger");
+        assert_eq!(
+            typed(&mut s, "/approve @bobRoger").print,
+            vec!["! @bobRoger is waiting in #catPieR and #dogFoxR — say which: /approve @bobRoger #catPieR"]
+        );
     }
 
     #[test]
@@ -284,7 +400,7 @@ mod tests {
         let shown = s.store.current().cloned();
         assert_eq!(shown, Some(Conv::Dm("bobRoger".into())));
         // ...and the join completes meanwhile, switching the current conversation.
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         assert_eq!(s.on_line("for bob only", shown.as_ref()), send(Target::Dm("bobRoger".into()), "for bob only"));
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())), "the next prompt shows the room");
     }
@@ -297,7 +413,7 @@ mod tests {
         let shown = s.store.current().cloned();
         assert_eq!(shown, None);
         // ...the room arrives while the user types, and that's where they mean.
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
+        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into(), max: 13 }, 0);
         assert_eq!(s.on_line("first!", shown.as_ref()), send(Target::Room("catPieR".into()), "first!"));
     }
 
@@ -305,7 +421,7 @@ mod tests {
     fn leave_uses_the_current_room_or_the_named_one() {
         let mut s = session();
         assert_eq!(typed(&mut s, "/leave").print, vec!["! you're not in a room here — /leave #room"]);
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "1-abcdef".into() }, 0);
+        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "1-abcdef".into(), max: 13 }, 0);
         assert_eq!(typed(&mut s, "/leave"), Reaction::send(Command::LeaveRoom { name: "catPieR".into() }));
         assert_eq!(typed(&mut s, "/leave #dogFoxR"), Reaction::send(Command::LeaveRoom { name: "dogFoxR".into() }));
         s.on_event(&Event::RoomLeft { name: "catPieR".into() }, 0);
@@ -344,6 +460,7 @@ mod tests {
         assert_eq!(typed(&mut s, "/help").print, vec![HELP]);
         assert!(HELP.contains("/close") && HELP.contains("Shift-Tab") && HELP.contains("/quit"));
         assert!(!HELP.contains("/line") && !HELP.contains("/his") && !HELP.contains("/tui"));
+        assert!(HELP.contains("/create <name> [n]") && HELP.contains("/approve @nick") && HELP.contains("/deny"));
     }
 
     #[test]
@@ -369,8 +486,8 @@ mod tests {
         let mut s = session(); // me: annMoon; online: bobRoger
         s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobKite".into() }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(4), nick: "carolFox".into() }, 0);
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
-        s.on_event(&Event::RoomJoined { name: "carolFoxR".into(), members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "carolFoxR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
 
         assert_eq!(typed(&mut s, "/chat catp"), Reaction::default());
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
@@ -419,7 +536,7 @@ mod tests {
         assert_eq!(typed(&mut s, "/close").print, vec!["* closed @bobRoger"]);
         assert!(s.store.get(&Conv::Dm("bobRoger".into())).is_none());
         assert_eq!(typed(&mut s, "/close").print, vec!["! no chat to close here"]);
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         assert_eq!(typed(&mut s, "/close").print, vec!["! use /leave for rooms"]);
         assert_eq!(typed(&mut s, "/close @ghostMoon").print, vec!["! no chat with @ghostMoon"]);
     }

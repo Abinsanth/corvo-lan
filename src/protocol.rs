@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
 /// Largest JSON body in one frame: a Noise message (65,535 bytes) minus its 16-byte tag.
 pub const MAX_FRAME_LEN: usize = 65_535 - 16;
 

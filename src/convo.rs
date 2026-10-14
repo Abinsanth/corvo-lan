@@ -1,9 +1,9 @@
 //! Conversations (rooms and DMs) built purely from `Event`s. UI-independent:
 //! the line UI uses it now and the v0.3 TUI will reuse it unchanged.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::api::{Conv, Event};
+use crate::api::{Conv, Event, RequestEnd};
 
 /// Lines kept per conversation.
 pub const MAX_LINES: usize = 1000;
@@ -34,6 +34,11 @@ pub struct Conversation {
     pub offline: bool,
     /// Room members other than us.
     pub members: BTreeSet<String>,
+    /// A room's join key and head count limit.
+    pub key: Option<String>,
+    pub max: Option<u8>,
+    /// People asking to join this room: nick → (approvals, approvals needed).
+    pub waiting: BTreeMap<String, (u8, u8)>,
 }
 
 #[derive(Debug, Default)]
@@ -43,6 +48,8 @@ pub struct Store {
     convs: Vec<Conversation>,
     current: Option<Conv>,
     online: BTreeSet<String>,
+    /// Rooms we've asked to join and are waiting to be let into.
+    pending: BTreeSet<String>,
 }
 
 /// Whether `text` mentions `@me`: the whole name, ignoring case, not part of
@@ -92,6 +99,11 @@ impl Store {
     /// Views no conversation (the TUI's corvo tab), so every message counts as unread.
     pub fn clear_current(&mut self) {
         self.current = None;
+    }
+
+    /// Rooms we're waiting to be let into.
+    pub fn pending(&self) -> impl Iterator<Item = &String> {
+        self.pending.iter()
     }
 
     pub fn is_online(&self, nick: &str) -> bool {
@@ -148,22 +160,57 @@ impl Store {
             Event::Sent { conv, text, ts } => {
                 push(self.entry(conv), Line { ts: *ts, kind: LineKind::Mine { text: text.clone() } })
             }
-            Event::RoomCreated { name, key } => {
+            Event::RoomCreated { name, key, max } => {
                 let c = self.entry(&Conv::Room(name.clone()));
-                push(
-                    c,
-                    Line {
-                        ts: now,
-                        kind: LineKind::Notice(format!("created #{name} — key {key} — share both to invite")),
-                    },
-                );
+                (c.key, c.max) = (Some(key.clone()), Some(*max));
+                let text = format!("created #{name} for up to {max} people — invite with /chat #{name} {key}");
+                push(c, Line { ts: now, kind: LineKind::Notice(text) });
             }
-            Event::RoomJoined { name, members } => {
+            Event::RoomJoined { name, key, max, members } => {
+                self.pending.remove(name);
                 let c = self.entry(&Conv::Room(name.clone()));
                 c.members = members.iter().cloned().collect();
+                (c.key, c.max) = (Some(key.clone()), Some(*max));
                 push(c, Line { ts: now, kind: LineKind::Notice(format!("joined #{name}")) });
             }
+            Event::JoinWaiting { name, .. } => {
+                self.pending.insert(name.clone());
+            }
+            Event::JoinEnded { name, .. } => {
+                self.pending.remove(name);
+            }
+            Event::JoinRequest { room, nick, have, need } => {
+                let unread = self.current.as_ref() != Some(&Conv::Room(room.clone()));
+                if let Some(c) = self.find_mut(&Conv::Room(room.clone())) {
+                    c.waiting.insert(nick.clone(), (*have, *need));
+                    let text = format!("@{nick} wants to join — /approve @{nick} or /deny @{nick}");
+                    push(c, Line { ts: now, kind: LineKind::Notice(text) });
+                    c.unread += u32::from(unread);
+                }
+            }
+            Event::Approved { room, nick, by, have, need } => {
+                if let Some(c) = self.find_mut(&Conv::Room(room.clone())) {
+                    c.waiting.insert(nick.clone(), (*have, *need));
+                    let text = format!("@{by} approved @{nick} ({have}/{need})");
+                    push(c, Line { ts: now, kind: LineKind::Notice(text) });
+                }
+            }
+            Event::RequestEnded { room, nick, why } => {
+                if let Some(c) = self.find_mut(&Conv::Room(room.clone())) {
+                    c.waiting.remove(nick);
+                    let text = match why {
+                        RequestEnd::Admitted => None,
+                        RequestEnd::Denied { by } => Some(format!("@{by} turned @{nick} away")),
+                        RequestEnd::Full => Some(format!("@{nick} couldn't join — the room is full")),
+                        RequestEnd::Gone => Some(format!("@{nick} stopped waiting")),
+                    };
+                    if let Some(text) = text {
+                        push(c, Line { ts: now, kind: LineKind::Notice(text) });
+                    }
+                }
+            }
             Event::RoomLeft { name } => {
+                self.pending.remove(name);
                 let conv = Conv::Room(name.clone());
                 self.convs.retain(|c| c.conv != conv);
                 if self.current.as_ref() == Some(&conv) {
@@ -195,6 +242,9 @@ impl Store {
         for c in &mut self.convs {
             if c.members.remove(old) {
                 c.members.insert(new.to_string());
+            }
+            if let Some(votes) = c.waiting.remove(old) {
+                c.waiting.insert(new.to_string(), votes);
             }
         }
         let (from, to) = (Conv::Dm(old.to_string()), Conv::Dm(new.to_string()));
@@ -243,6 +293,9 @@ impl Store {
             mentions: 0,
             offline,
             members: BTreeSet::new(),
+            key: None,
+            max: None,
+            waiting: BTreeMap::new(),
         });
         self.convs.last_mut().expect("just pushed")
     }
@@ -271,7 +324,7 @@ fn push(c: &mut Conversation, line: Line) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{LeaveReason, PeerId};
+    use crate::api::{JoinEnd, LeaveReason, PeerId, RequestEnd};
 
     fn room(n: &str) -> Conv {
         Conv::Room(n.into())
@@ -348,7 +401,15 @@ mod tests {
     #[test]
     fn rooms_track_members_and_vanish_on_leave() {
         let mut s = Store::new();
-        s.apply(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
+        s.apply(
+            &Event::RoomJoined {
+                name: "catPieR".into(),
+                key: "k7m9xq".into(),
+                max: 13,
+                members: vec!["bobRoger".into()],
+            },
+            0,
+        );
         s.switch(room("catPieR"));
         s.apply(&Event::MemberJoined { room: "catPieR".into(), nick: "carolFox".into() }, 0);
         s.apply(&Event::MemberLeft { room: "catPieR".into(), nick: "bobRoger".into() }, 0);
@@ -378,7 +439,15 @@ mod tests {
     fn a_renamed_peer_keeps_its_dm_and_room_membership() {
         let mut s = Store::new();
         s.apply(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0);
-        s.apply(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
+        s.apply(
+            &Event::RoomJoined {
+                name: "catPieR".into(),
+                key: "k7m9xq".into(),
+                max: 13,
+                members: vec!["bobRoger".into()],
+            },
+            0,
+        );
         s.apply(&msg(dm("bobRoger"), "bobRoger", "psst"), 0);
         s.switch(dm("bobRoger"));
         s.apply(&Event::Renamed { old: "bobRoger".into(), new: "bobPie".into() }, 0);
@@ -481,11 +550,73 @@ mod tests {
         s.apply(&Event::PeerJoined { id: PeerId::test(2), nick: "carolFox".into() }, 0);
         s.apply(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0);
         assert_eq!(s.online().cloned().collect::<Vec<_>>(), vec!["bobRoger", "carolFox"]);
-        s.apply(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
+        s.apply(&Event::RoomCreated { name: "catPieR".into(), key: "k7m9xq".into(), max: 5 }, 0);
         let c = s.get(&room("catPieR")).unwrap();
         assert_eq!(
             c.lines[0].kind,
-            LineKind::Notice("created #catPieR — key 123-k7m9xq — share both to invite".into())
+            LineKind::Notice("created #catPieR for up to 5 people — invite with /chat #catPieR k7m9xq".into())
         );
+        assert_eq!((c.key.as_deref(), c.max), (Some("k7m9xq"), Some(5)));
+    }
+
+    fn notices(s: &Store, conv: &Conv) -> Vec<String> {
+        s.get(conv)
+            .unwrap()
+            .lines
+            .iter()
+            .filter_map(|l| if let LineKind::Notice(n) = &l.kind { Some(n.clone()) } else { None })
+            .collect()
+    }
+
+    #[test]
+    fn rooms_keep_a_waiting_list_with_approvals() {
+        let mut s = Store::new();
+        s.apply(&Event::RoomCreated { name: "catPieR".into(), key: "k7m9xq".into(), max: 13 }, 0);
+        let r = || "catPieR".to_string();
+        s.apply(&Event::JoinRequest { room: r(), nick: "bobRoger".into(), have: 0, need: 2 }, 0);
+        s.apply(&Event::JoinRequest { room: r(), nick: "daveOak".into(), have: 0, need: 2 }, 0);
+        let c = s.get(&room("catPieR")).unwrap();
+        assert_eq!(c.waiting.get("bobRoger"), Some(&(0, 2)));
+        assert_eq!(c.unread, 2, "requests are worth a look from another tab");
+        s.apply(&Event::Approved { room: r(), nick: "bobRoger".into(), by: "carolFox".into(), have: 1, need: 2 }, 0);
+        s.apply(&Event::Renamed { old: "bobRoger".into(), new: "bobPie".into() }, 0);
+        assert_eq!(s.get(&room("catPieR")).unwrap().waiting.get("bobPie"), Some(&(1, 2)));
+        s.apply(&Event::RequestEnded { room: r(), nick: "bobPie".into(), why: RequestEnd::Admitted }, 0);
+        s.apply(&Event::RequestEnded { room: r(), nick: "daveOak".into(), why: RequestEnd::Full }, 0);
+        assert!(s.get(&room("catPieR")).unwrap().waiting.is_empty());
+        for (nick, why) in [("eveOwl", RequestEnd::Denied { by: "carolFox".into() }), ("fredElk", RequestEnd::Gone)] {
+            s.apply(&Event::JoinRequest { room: r(), nick: nick.into(), have: 0, need: 1 }, 0);
+            s.apply(&Event::RequestEnded { room: r(), nick: nick.into(), why }, 0);
+        }
+        assert_eq!(
+            notices(&s, &room("catPieR"))[1..],
+            [
+                "@bobRoger wants to join — /approve @bobRoger or /deny @bobRoger",
+                "@daveOak wants to join — /approve @daveOak or /deny @daveOak",
+                "@carolFox approved @bobRoger (1/2)",
+                "@daveOak couldn't join — the room is full",
+                "@eveOwl wants to join — /approve @eveOwl or /deny @eveOwl",
+                "@carolFox turned @eveOwl away",
+                "@fredElk wants to join — /approve @fredElk or /deny @fredElk",
+                "@fredElk stopped waiting",
+            ]
+        );
+    }
+
+    #[test]
+    fn our_own_requests_wait_until_they_end() {
+        let mut s = Store::new();
+        let waiting = || Event::JoinWaiting { name: "catPieR".into(), members: 4, needs: 2 };
+        s.apply(&waiting(), 0);
+        assert_eq!(s.pending().cloned().collect::<Vec<_>>(), vec!["catPieR"]);
+        s.apply(&Event::JoinEnded { name: "catPieR".into(), why: JoinEnd::TimedOut }, 0);
+        assert_eq!(s.pending().count(), 0);
+        s.apply(&waiting(), 0);
+        s.apply(&Event::RoomLeft { name: "catPieR".into() }, 0);
+        assert_eq!(s.pending().count(), 0);
+        s.apply(&waiting(), 0);
+        s.apply(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
+        assert_eq!(s.pending().count(), 0);
+        assert_eq!(s.get(&room("catPieR")).unwrap().key.as_deref(), Some("k7m9xq"));
     }
 }

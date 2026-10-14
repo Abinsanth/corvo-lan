@@ -419,7 +419,15 @@ mod tests {
         s.on_event(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "carolFox".into() }, 0);
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
+        s.on_event(
+            &Event::RoomJoined {
+                name: "catPieR".into(),
+                key: "k7m9xq".into(),
+                max: 13,
+                members: vec!["bobRoger".into()],
+            },
+            0,
+        );
         s
     }
 
@@ -546,7 +554,15 @@ mod tests {
     fn overflowing_tabs_keep_the_current_one_visible() {
         let mut s = session();
         for i in 0..12 {
-            s.on_event(&Event::RoomJoined { name: format!("room{i:02}LongNameR"), members: vec![] }, 0);
+            s.on_event(
+                &Event::RoomJoined {
+                    name: format!("room{i:02}LongNameR"),
+                    key: "k7m9xq".into(),
+                    max: 13,
+                    members: vec![],
+                },
+                0,
+            );
         }
         let mut state = TuiState::new(true);
         let last = tabs(&s).len() - 1;

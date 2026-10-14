@@ -367,7 +367,15 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
 /// Events shown in the corvo tab. Chat lines and member changes already live
 /// in their conversation.
 pub fn goes_to_status(event: &Event) -> bool {
-    !matches!(event, Event::Message { .. } | Event::Sent { .. } | Event::MemberJoined { .. } | Event::MemberLeft { .. })
+    !matches!(
+        event,
+        Event::Message { .. }
+            | Event::Sent { .. }
+            | Event::MemberJoined { .. }
+            | Event::MemberLeft { .. }
+            | Event::Approved { .. }
+            | Event::RequestEnded { .. }
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,7 +669,7 @@ mod tests {
     fn session_with_tabs() -> Session {
         let mut s = Session::new(false);
         s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         s.on_event(
             &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 },
             0,
@@ -819,7 +827,12 @@ mod tests {
         assert!(!goes_to_status(&Event::Sent { conv: Conv::Dm("b".into()), text: "x".into(), ts: 0 }));
         assert!(!goes_to_status(&Event::MemberJoined { room: "r".into(), nick: "b".into() }));
         assert!(goes_to_status(&Event::Error("x".into())));
-        assert!(goes_to_status(&Event::RoomCreated { name: "r".into(), key: "k".into() }));
+        assert!(goes_to_status(&Event::RoomCreated { name: "r".into(), key: "k".into(), max: 13 }));
         assert!(goes_to_status(&Event::PeerJoined { id: PeerId::test(1), nick: "b".into() }));
+        let approved = Event::Approved { room: "r".into(), nick: "b".into(), by: "c".into(), have: 1, need: 2 };
+        assert!(!goes_to_status(&approved));
+        let ended = Event::RequestEnded { room: "r".into(), nick: "b".into(), why: crate::api::RequestEnd::Gone };
+        assert!(!goes_to_status(&ended));
+        assert!(goes_to_status(&Event::JoinRequest { room: "r".into(), nick: "b".into(), have: 0, need: 1 }));
     }
 }

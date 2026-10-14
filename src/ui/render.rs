@@ -3,7 +3,7 @@
 
 use std::io::IsTerminal;
 
-use crate::api::{Conv, Event, LeaveReason};
+use crate::api::{Conv, Event, JoinEnd, LeaveReason};
 use crate::convo::Store;
 
 /// ANSI colour on or off.
@@ -92,7 +92,12 @@ pub fn tone_of(event: &Event) -> Tone {
         | Event::MemberJoined { .. }
         | Event::RoomCreated { .. }
         | Event::RoomJoined { .. } => Tone::Good,
-        Event::PeerLeft { .. } | Event::MemberLeft { .. } | Event::RoomLeft { .. } | Event::Error(_) => Tone::Bad,
+        Event::PeerLeft { .. }
+        | Event::MemberLeft { .. }
+        | Event::RoomLeft { .. }
+        | Event::JoinEnded { .. }
+        | Event::Error(_) => Tone::Bad,
+        Event::JoinRequest { .. } => Tone::Warn,
         Event::Info(text) if WARN_MARKERS.iter().any(|m| text.contains(m)) => Tone::Warn,
         _ => Tone::Plain,
     }
@@ -200,13 +205,17 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             format!("{} you → {}: {}", s.dim(&stamp(*ts)), s.nick(to), body(text))
         }
         Event::Sent { conv: Conv::Room(_), .. } => return None,
-        Event::RoomCreated { name, key } => {
-            format!("{} {} — key {} — share both to invite", s.tone(Tone::Good, "* created"), s.room(name), clean(key))
-        }
-        Event::RoomJoined { name, members } if members.is_empty() => {
+        Event::RoomCreated { name, key, max } => format!(
+            "{} {} for up to {max} people — invite with /chat #{} {}",
+            s.tone(Tone::Good, "* created"),
+            s.room(name),
+            clean(name),
+            clean(key)
+        ),
+        Event::RoomJoined { name, members, .. } if members.is_empty() => {
             format!("{} {}", s.tone(Tone::Good, "* joined"), s.room(name))
         }
-        Event::RoomJoined { name, members } => {
+        Event::RoomJoined { name, members, .. } => {
             let members: Vec<String> = members.iter().map(|m| s.nick(m)).collect();
             format!("{} {} with {}", s.tone(Tone::Good, "* joined"), s.room(name), members.join(", "))
         }
@@ -230,6 +239,32 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
         }
         Event::Error(msg) => s.tone(Tone::Bad, &format!("! {}", clean(msg))),
         Event::Info(msg) => s.tone(tone_of(event), &format!("* {}", clean(msg))),
+        Event::JoinWaiting { name, members, needs } => {
+            let who = if members == needs {
+                format!("its {members} member{}", if *members == 1 { "" } else { "s" })
+            } else {
+                format!("{needs} of its {members} members")
+            };
+            format!("* waiting to be let into {} — {who} must approve (/leave #{} to stop)", s.room(name), clean(name))
+        }
+        Event::JoinEnded { name, why } => {
+            let text = match why {
+                JoinEnd::NoRoom => format!("! no room {} with that key", s.room(name)),
+                JoinEnd::Full => format!("! {} is full", s.room(name)),
+                JoinEnd::Denied { by } => format!("! {} didn't let you into {}", s.nick(by), s.room(name)),
+                JoinEnd::TimedOut => format!("! nobody let you into {} — try again later", s.room(name)),
+            };
+            s.tone(Tone::Bad, &text)
+        }
+        Event::JoinRequest { room, nick, .. } => {
+            let n = clean(nick);
+            s.tone(
+                Tone::Warn,
+                &format!("* {} wants to join {} — /approve @{n} or /deny @{n}", s.nick(nick), s.room(room)),
+            )
+        }
+        // Shown inside the room's conversation.
+        Event::Approved { .. } | Event::RequestEnded { .. } => return None,
     })
 }
 
@@ -262,7 +297,7 @@ pub fn conv_name(conv: &Conv, style: &Style) -> String {
 /// `/chats`.
 pub fn chats(store: &Store, style: &Style) -> String {
     if store.conversations().is_empty() {
-        return "* no conversations yet — /chat @nick or /create <name> <key>".into();
+        return "* no conversations yet — /chat @nick or /create <name>".into();
     }
     let mut out = String::from("* conversations:");
     for c in store.conversations() {
@@ -287,8 +322,8 @@ pub fn chats(store: &Store, style: &Style) -> String {
 /// `/rooms`.
 pub fn rooms(store: &Store, style: &Style) -> String {
     let rooms: Vec<_> = store.conversations().iter().filter(|c| matches!(c.conv, Conv::Room(_))).collect();
-    if rooms.is_empty() {
-        return "* you're not in any rooms — /create <name> <key> or /chat #room <key>".into();
+    if rooms.is_empty() && store.pending().next().is_none() {
+        return "* you're not in any rooms — /create <name> or /chat #room <key>".into();
     }
     let mut out = String::from("* your rooms:");
     for c in rooms {
@@ -297,7 +332,12 @@ pub fn rooms(store: &Store, style: &Style) -> String {
         } else {
             c.members.iter().map(|m| style.nick(m)).collect::<Vec<_>>().join(", ")
         };
-        out.push_str(&format!("\n  {} {members}", pad(&conv_name(&c.conv, style), 18)));
+        let count = c.max.map(|max| format!("{}/{max} · ", c.members.len() + 1)).unwrap_or_default();
+        let key = c.key.as_ref().map(|k| format!("key {} · ", clean(k))).unwrap_or_default();
+        out.push_str(&format!("\n  {} {count}{key}{members}", pad(&conv_name(&c.conv, style), 18)));
+    }
+    for name in store.pending() {
+        out.push_str(&format!("\n  {} waiting to be let in", pad(&style.room(name), 18)));
     }
     out
 }
@@ -305,7 +345,7 @@ pub fn rooms(store: &Store, style: &Style) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{PeerId, PeerInfo};
+    use crate::api::{PeerId, PeerInfo, RequestEnd};
 
     const P: Style = Style { color: false };
 
@@ -329,9 +369,17 @@ mod tests {
 
     #[test]
     fn room_and_presence_notices() {
-        let created = Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() };
-        assert_eq!(event(&created, 0, &P).unwrap(), "* created #catPieR — key 123-k7m9xq — share both to invite");
-        let joined = Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into(), "carolFox".into()] };
+        let created = Event::RoomCreated { name: "catPieR".into(), key: "k7m9xq".into(), max: 13 };
+        assert_eq!(
+            event(&created, 0, &P).unwrap(),
+            "* created #catPieR for up to 13 people — invite with /chat #catPieR k7m9xq"
+        );
+        let joined = Event::RoomJoined {
+            name: "catPieR".into(),
+            key: "k7m9xq".into(),
+            max: 13,
+            members: vec!["bobRoger".into(), "carolFox".into()],
+        };
         assert_eq!(event(&joined, 0, &P).unwrap(), "* joined #catPieR with @bobRoger, @carolFox");
         let member = Event::MemberJoined { room: "catPieR".into(), nick: "carolFox".into() };
         assert_eq!(event(&member, 0, &P).unwrap(), format!("{} * @carolFox joined #catPieR", t(0)));
@@ -425,7 +473,15 @@ mod tests {
         let mut store = Store::new();
         assert!(chats(&store, &P).starts_with("* no conversations yet"));
         assert!(rooms(&store, &P).starts_with("* you're not in any rooms"));
-        store.apply(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
+        store.apply(
+            &Event::RoomJoined {
+                name: "catPieR".into(),
+                key: "k7m9xq".into(),
+                max: 13,
+                members: vec!["bobRoger".into()],
+            },
+            0,
+        );
         store.switch(Conv::Room("catPieR".into()));
         store.apply(
             &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 },
@@ -434,7 +490,38 @@ mod tests {
         let c = chats(&store, &P);
         assert!(c.contains("#catPieR") && c.contains("current"), "{c}");
         assert!(c.contains("@bobRoger") && c.contains("1 new") && c.contains("offline"), "{c}");
-        assert!(rooms(&store, &P).contains("#catPieR           @bobRoger"));
+        assert!(rooms(&store, &P).contains("#catPieR           2/13 · key k7m9xq · @bobRoger"));
+        store.apply(&Event::JoinWaiting { name: "dogPieR".into(), members: 3, needs: 1 }, 0);
+        assert!(rooms(&store, &P).contains("#dogPieR           waiting to be let in"), "{}", rooms(&store, &P));
+    }
+
+    #[test]
+    fn join_gate_lines() {
+        let name = || "catPieR".to_string();
+        let line = |e: Event| event(&e, 0, &P);
+        assert_eq!(
+            line(Event::JoinWaiting { name: name(), members: 4, needs: 2 }).unwrap(),
+            "* waiting to be let into #catPieR — 2 of its 4 members must approve (/leave #catPieR to stop)"
+        );
+        assert_eq!(
+            line(Event::JoinWaiting { name: name(), members: 1, needs: 1 }).unwrap(),
+            "* waiting to be let into #catPieR — its 1 member must approve (/leave #catPieR to stop)"
+        );
+        let ended = |why| line(Event::JoinEnded { name: name(), why }).unwrap();
+        assert_eq!(ended(JoinEnd::NoRoom), "! no room #catPieR with that key");
+        assert_eq!(ended(JoinEnd::Full), "! #catPieR is full");
+        assert_eq!(ended(JoinEnd::Denied { by: "bobRoger".into() }), "! @bobRoger didn't let you into #catPieR");
+        assert_eq!(ended(JoinEnd::TimedOut), "! nobody let you into #catPieR — try again later");
+        let request = Event::JoinRequest { room: name(), nick: "bobRoger".into(), have: 0, need: 1 };
+        assert_eq!(
+            line(request.clone()).unwrap(),
+            "* @bobRoger wants to join #catPieR — /approve @bobRoger or /deny @bobRoger"
+        );
+        assert_eq!(tone_of(&request), Tone::Warn, "flashes so it's seen from any tab");
+        assert_eq!(tone_of(&Event::JoinEnded { name: name(), why: JoinEnd::Full }), Tone::Bad);
+        let approved = Event::Approved { room: name(), nick: "b".into(), by: "c".into(), have: 1, need: 2 };
+        assert_eq!(line(approved), None, "shown in the room only");
+        assert_eq!(line(Event::RequestEnded { room: name(), nick: "b".into(), why: RequestEnd::Gone }), None);
     }
 
     #[test]
@@ -442,8 +529,11 @@ mod tests {
         let nick = || "bobRoger".to_string();
         assert_eq!(tone_of(&Event::PeerJoined { id: PeerId::test(1), nick: nick() }), Tone::Good);
         assert_eq!(tone_of(&Event::MemberJoined { room: "r".into(), nick: nick() }), Tone::Good);
-        assert_eq!(tone_of(&Event::RoomCreated { name: "r".into(), key: "k".into() }), Tone::Good);
-        assert_eq!(tone_of(&Event::RoomJoined { name: "r".into(), members: vec![] }), Tone::Good);
+        assert_eq!(tone_of(&Event::RoomCreated { name: "r".into(), key: "k".into(), max: 13 }), Tone::Good);
+        assert_eq!(
+            tone_of(&Event::RoomJoined { name: "r".into(), key: "k7m9xq".into(), max: 13, members: vec![] }),
+            Tone::Good
+        );
         assert_eq!(
             tone_of(&Event::PeerLeft { id: PeerId::test(1), nick: nick(), reason: LeaveReason::Quit }),
             Tone::Bad
