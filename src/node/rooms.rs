@@ -131,9 +131,10 @@ struct Room {
     door: RoomKeys,
     /// Other members, all proven.
     members: HashMap<PeerId, Member>,
-    /// Peers removed from the room while they still hold its key: ignored
-    /// until the next key switch, or until they're let back in through the door.
-    gone: HashSet<PeerId>,
+    /// Peers removed from the room, and when. For `GONE_FOR` they can't
+    /// prove themselves under any key, so the re-key that leaves them out
+    /// lands first; letting them back in through the door ends it sooner.
+    gone: HashMap<PeerId, Instant>,
     challenges: HashMap<PeerId, Challenge>,
     requests: HashMap<PeerId, Request>,
     /// Recently closed requests (their `asked`, and when), so a vote still on
@@ -404,7 +405,7 @@ impl Node {
             keys,
             door,
             members,
-            gone: HashSet::new(),
+            gone: HashMap::new(),
             challenges: HashMap::new(),
             requests: HashMap::new(),
             closed: HashMap::new(),
@@ -924,8 +925,8 @@ impl Node {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
-        // Whoever was removed holds this key until the re-key; they come back only through the door.
-        if room.gone.contains(&from) {
+        // Whoever was removed may hold this key, even a newer one made before their removal was seen.
+        if room.gone.get(&from).is_some_and(|at| now.saturating_duration_since(*at) < rekey::GONE_FOR) {
             return;
         }
         // Anyone may probe, member or not: answer privately, echoing their nonce.
@@ -1031,7 +1032,7 @@ impl Node {
     }
 
     /// Takes `member` out of room `id`, starting a re-key; true if they were a
-    /// member. From then on they only get back in through the door.
+    /// member. For `GONE_FOR` they only get back in through the door.
     fn forget_member(&mut self, id: RoomId, member: PeerId) -> bool {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return false;
@@ -1040,7 +1041,7 @@ impl Node {
         room.kick_votes.remove(&member);
         let was = room.members.remove(&member).is_some();
         if was {
-            room.gone.insert(member);
+            room.gone.insert(member, Instant::now());
             self.schedule_rekey(id);
         }
         was
@@ -1112,6 +1113,7 @@ impl Node {
             room.closed.retain(|_, (_, at)| now.saturating_duration_since(*at) < REQUEST_STALE);
             room.previous.retain(|k| now < k.until);
             room.resent.retain(|_, at| now.saturating_duration_since(*at) < HERE_INTERVAL);
+            room.gone.retain(|_, at| now.saturating_duration_since(*at) < rekey::GONE_FOR);
             room.kick_votes.retain(|_, votes| {
                 votes.retain(|_, at| now.saturating_duration_since(*at) < kick::KICK_VOTE_FOR);
                 !votes.is_empty()

@@ -22,6 +22,10 @@ pub const REKEY_BACKUP: Duration = Duration::from_secs(5);
 /// How long a replaced key still opens frames: messages already on their way,
 /// and members (or a newcomer) who missed the switch.
 pub const OLD_KEY_FOR: Duration = Duration::from_secs(30);
+/// How long a removed peer is kept from re-proving under any key: past the
+/// settle, the backup and propagation, so the re-key that leaves them out has
+/// landed.
+pub const GONE_FOR: Duration = Duration::from_secs(30);
 /// A `Rekey` claiming an epoch more than this far ahead of ours is ignored,
 /// so nobody can push the room to the last epoch and make the next re-key
 /// overflow.
@@ -69,13 +73,15 @@ impl Node {
     /// Makes a new secret, hands it to each member directly, and moves to it.
     pub(super) fn rekey(&mut self, id: RoomId) {
         let me = self.id;
-        let Some(room) = self.rooms.joined.get(&id) else {
+        let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
         // Only reachable through many re-keys in one room; better to keep the key than wrap and split the room.
         let Some(epoch) = room.epoch.checked_add(1) else {
+            room.rekey_backup = None;
             return;
         };
+        let room = &self.rooms.joined[&id];
         let secret = room::new_secret();
         let body = RoomBody::Rekey { epoch, by: me, secret: room::to_hex(&secret), kicks: room.kick_list() };
         let frame = self.seal(&room.keys, body);
@@ -178,9 +184,6 @@ impl Node {
         // A running timer stays: it may be for a removal this key doesn't cover yet.
         room.rekey_backup = None;
         room.challenges.clear();
-        // Whoever was removed lost the key with this switch; anyone who has the
-        // new one got it from a member who still counts them in.
-        room.gone.clear();
         // Lets a newcomer who just switched be challenged, and so proven, under the new key.
         let here = self.seal(&room.keys, RoomBody::Here { name: room.name.clone(), echo: None });
         self.rooms.doors.insert(room.door.id, new_id);
@@ -350,10 +353,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_removal_at_the_last_epoch_does_not_panic() {
         let mut h = with_peers();
-        let made = room_with(&mut h, &[BOB, CAROL]).await;
+        h.connect(ZED, "zedfox", true);
+        h.events(); // its PeerJoined
+        let made = room_with(&mut h, &[ZED, BOB, CAROL]).await;
         h.node.rooms.joined.get_mut(&made.id).unwrap().epoch = u32::MAX;
         deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Leave));
-        h.pump().await; // RekeyDue
+        h.pump().await; // RekeyDue: zed is lower, so a backup is set
+        assert!(room_of(&h, &made.name).rekey_backup.is_some());
+        h.node.on_tick(tokio::time::Instant::now() + REKEY_BACKUP);
+        assert!(room_of(&h, &made.name).rekey_backup.is_none(), "not tried again every tick");
+        deliver(&mut h, ZED, frame_from(ZED, &made.keys, RoomBody::Leave));
+        h.pump().await; // RekeyDue: now we're the lowest
         assert_eq!(room_of(&h, &made.name).epoch, u32::MAX);
         assert_eq!(keys_now(&h, &made.name).id, made.keys.id, "no re-key");
     }
@@ -439,7 +449,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn someone_dropped_only_on_our_side_proves_again_under_the_new_key() {
+    async fn someone_dropped_only_on_our_side_proves_again_after_a_while() {
         let mut h = with_peers();
         h.connect(ZED, "zedfox", true);
         h.events(); // its PeerJoined
@@ -451,11 +461,38 @@ mod tests {
         // Zed still counts bob, so its key reached him too.
         deliver(&mut h, ZED, frame_from(ZED, &made.keys, rekey_body(1, ZED, [5; 32])));
         let k1 = keys_now(&h, &made.name);
-        h.events();
         h.sent(BOB);
+        deliver(&mut h, BOB, frame_from(BOB, &k1, here(&made.name, None)));
+        assert!(h.sent(BOB).is_empty(), "right after the re-key he's still kept out");
+        tokio::time::advance(GONE_FOR).await;
+        deliver(&mut h, ZED, frame_from(ZED, &k1, here(&made.name, None)));
+        h.node.on_tick(tokio::time::Instant::now());
+        h.events();
         verify(&mut h, BOB, &made.name, &k1);
         assert!(room_of(&h, &made.name).members.contains_key(&BOB));
         assert!(h.events().contains(&Event::MemberJoined { room: made.name.clone(), nick: "bobroger".into() }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kicked_peer_given_a_key_made_before_the_kick_stays_out() {
+        let mut h = with_peers();
+        h.connect(ZED, "zedfox", true);
+        h.events(); // its PeerJoined
+        let made = room_with(&mut h, &[ZED, BOB, CAROL]).await;
+        deliver(&mut h, CAROL, frame_from(CAROL, &made.keys, RoomBody::Leave));
+        h.node.handle_command(Command::Kick { room: made.name.clone(), nick: "bobroger".into() });
+        assert!(!room_of(&h, &made.name).members.contains_key(&BOB));
+        // Zed re-keyed for carol before it tallied the kick, so bob got k1 too.
+        deliver(&mut h, ZED, frame_from(ZED, &made.keys, rekey_body(1, ZED, [5; 32])));
+        let k1 = keys_now(&h, &made.name);
+        h.sent(BOB);
+        deliver(&mut h, BOB, frame_from(BOB, &k1, here(&made.name, None)));
+        assert!(h.sent(BOB).is_empty(), "no challenge");
+        assert!(!room_of(&h, &made.name).members.contains_key(&BOB));
+        // Zed's next key leaves him out, and we don't pass it on to him either.
+        deliver(&mut h, ZED, frame_from(ZED, &k1, rekey_body(2, ZED, [6; 32])));
+        deliver(&mut h, BOB, frame_from(BOB, &k1, RoomBody::Chat { text: "still here".into() }));
+        assert!(rekeys(&k1, &h.sent(BOB)).is_empty());
     }
 
     #[tokio::test(start_paused = true)]
