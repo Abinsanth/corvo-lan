@@ -285,15 +285,20 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &TuiState) {
 pub const POPUP_ROWS: usize = 6;
 
 /// The completion list, just above the input and lined up with the word.
-fn draw_popup(frame: &mut Frame, input: Rect, state: &TuiState) {
+/// Shrinks to the rows that fit; closes it if none do, so a list nobody can
+/// see never takes Enter or the arrows.
+fn draw_popup(frame: &mut Frame, input: Rect, state: &mut TuiState) {
+    // Below the tab row, with a border above and below.
+    let room = (input.y as usize).saturating_sub(3);
     let Some(p) = &state.popup else {
         return;
     };
-    let rows = p.matches.len().min(POPUP_ROWS);
-    let height = rows as u16 + 2;
-    if input.y < height + 1 {
-        return; // no room above without covering the tabs
+    let rows = p.matches.len().min(POPUP_ROWS).min(room);
+    if rows == 0 {
+        state.popup = None;
+        return;
     }
+    let height = rows as u16 + 2;
     let longest = p.matches.iter().map(|m| m.chars().count()).max().unwrap_or(0) as u16;
     let width = (longest + 2).min(input.width);
     let before = &state.editor.before_cursor()[..p.start];
@@ -343,6 +348,7 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
     let area = frame.area();
     state.clear_hits();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        state.popup = None;
         frame.render_widget(Paragraph::new("terminal too small, make it bigger"), area);
         return;
     }
@@ -569,6 +575,22 @@ mod tests {
         assert_eq!(find(&buf, "@carolFox"), Some((6, 16)));
         assert!(buf[(6, 15)].modifier.contains(Modifier::REVERSED), "the choice is highlighted");
         assert!(!buf[(6, 16)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn a_short_terminal_still_shows_the_list_it_is_using() {
+        let mut s = session();
+        for i in 0..6 {
+            s.on_event(&Event::PeerJoined { id: PeerId::test(10 + i), nick: format!("zed{i}Owl") }, 0);
+        }
+        let mut state = TuiState::new(true);
+        state.editor.set("@".into());
+        state.complete(&crate::ui::complete::Candidates::from_store(&s.store));
+        let buf = render(&s, &mut state, 80, 10);
+        assert!(find(&buf, "@bobRoger").is_some(), "{:#?}", rows(&buf));
+        assert!(state.popup.is_some());
+        render(&s, &mut state, 39, 9);
+        assert!(state.popup.is_none(), "a list that can't be shown can't take keys");
     }
 
     #[test]
