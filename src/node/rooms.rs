@@ -25,9 +25,6 @@ use crate::room::{self, ReplayGuard, RoomBody, RoomEnvelope, RoomId, RoomKeys, S
 
 mod rekey;
 
-#[allow(unused_imports)] // OLD_KEY_FOR and REKEY_BACKUP are used by later tasks (old-key frames, kicking)
-pub use rekey::{OLD_KEY_FOR, REKEY_BACKUP, REKEY_SETTLE};
-
 /// Rooms you can be in at once, counting ones you're creating or waiting to get into.
 pub const MAX_ROOMS: usize = 3;
 pub const MIN_MEMBERS: u8 = 2;
@@ -147,6 +144,8 @@ struct Room {
     rekey_backup: Option<(Instant, u32)>,
     /// Keys we moved away from lately.
     previous: Vec<rekey::OldKey>,
+    /// When we last re-sent the key to someone still on an old one.
+    resent: HashMap<PeerId, Instant>,
 }
 
 impl Room {
@@ -408,6 +407,7 @@ impl Node {
             rekey_pending: false,
             rekey_backup: None,
             previous: Vec::new(),
+            resent: HashMap::new(),
         };
         self.rooms.joined.insert(id, room);
         id
@@ -708,6 +708,8 @@ impl Node {
                 return;
             }
             self.on_room_envelope(id, from, env, now);
+        } else if let Some(&current) = self.rooms.old_ids.get(&id) {
+            self.on_old_key_frame(current, id, from, nonce, ct, now);
         } else if let Some(&room_id) = self.rooms.doors.get(&id) {
             let Some(room) = self.rooms.joined.get_mut(&room_id) else {
                 return;
@@ -1084,6 +1086,7 @@ impl Node {
             room.challenges.retain(|_, c| now.saturating_duration_since(c.started) < CHALLENGE_TIMEOUT);
             room.closed.retain(|_, (_, at)| now.saturating_duration_since(*at) < REQUEST_STALE);
             room.previous.retain(|k| now < k.until);
+            room.resent.retain(|_, at| now.saturating_duration_since(*at) < HERE_INTERVAL);
         }
         let joined = &self.rooms.joined;
         self.rooms

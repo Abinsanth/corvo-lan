@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::RoomId;
+use super::{HERE_INTERVAL, RoomId, skewed};
 use crate::api::Event;
 use crate::node::{Node, NodeMsg};
-use crate::protocol::PeerId;
+use crate::protocol::{PeerId, now_millis};
 use crate::room::{self, RoomBody, RoomKeys, Secret};
 
 /// Removals this close together share one re-key.
@@ -92,6 +92,65 @@ impl Node {
         }
         room.merge_kicks(kicks);
         self.switch_key(id, secret, epoch, by);
+    }
+
+    /// A frame under one of room `current`'s old keys (old room id `old`). A
+    /// member still on it is sent the new key; a newcomer we let in with it is
+    /// answered and sent the new key; anyone else, whoever left or was kicked
+    /// included, is ignored.
+    pub(super) fn on_old_key_frame(
+        &mut self,
+        current: RoomId,
+        old: RoomId,
+        from: PeerId,
+        nonce: &str,
+        ct: &str,
+        now: Instant,
+    ) {
+        let Some(room) = self.rooms.joined.get_mut(&current) else {
+            return;
+        };
+        let Some(old_keys) = room.previous.iter().find(|k| k.keys.id == old).map(|k| k.keys.clone()) else {
+            return;
+        };
+        let Some((env, nonce)) = room::open(&old_keys, from, nonce, ct) else {
+            return;
+        };
+        if skewed(env.ts) || !room.replay.accept(nonce, env.ts, now_millis()) {
+            return;
+        }
+        if room.members.contains_key(&from) {
+            if !matches!(env.body, RoomBody::Leave) {
+                self.resend_key(current, from, &old_keys, now);
+            }
+            self.on_member_envelope(current, from, env, now);
+            return;
+        }
+        let admitted = room.requests.get(&from).is_some_and(|r| r.admitted.is_some());
+        if let (true, RoomBody::Probe { nonce }) = (admitted, env.body) {
+            let reply = RoomBody::Here { name: room.name.clone(), echo: Some(nonce) };
+            self.send_to(from, self.seal(&old_keys, reply));
+            self.resend_key(current, from, &old_keys, now);
+        }
+    }
+
+    /// Sends `to` the room's current secret, sealed with the `old` keys they
+    /// still use; at most once per `HERE_INTERVAL` each.
+    fn resend_key(&mut self, id: RoomId, to: PeerId, old: &RoomKeys, now: Instant) {
+        let Some(room) = self.rooms.joined.get_mut(&id) else {
+            return;
+        };
+        if room.resent.get(&to).is_some_and(|at| now.saturating_duration_since(*at) < HERE_INTERVAL) {
+            return;
+        }
+        room.resent.insert(to, now);
+        let body = RoomBody::Rekey {
+            epoch: room.epoch,
+            by: room.keyed_by,
+            secret: room::to_hex(&room.secret),
+            kicks: room.kick_list(),
+        };
+        self.send_to(to, self.seal(old, body));
     }
 
     /// Moves room `id` to `secret`. Everything but the keys and the id carries
@@ -284,6 +343,85 @@ mod tests {
         h.events();
         knock(&mut h, BOB, &made, 100);
         assert!(h.events().iter().any(|e| matches!(e, Event::Approved { by, .. } if by == "annmoon")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn whoever_left_cannot_read_or_get_back_in_with_the_old_key() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[BOB, CAROL]).await;
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Leave));
+        h.pump().await; // RekeyDue
+        h.events();
+        h.sent(BOB);
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Chat { text: "still here?".into() }));
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Probe { nonce: "p1".into() }));
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, here(&made.name, None)));
+        assert!(h.events().is_empty());
+        assert!(h.sent(BOB).is_empty(), "no answer, no challenge, no key");
+        assert!(!room_of(&h, &made.name).members.contains_key(&BOB));
+        h.node.handle_command(Command::Send { to: crate::api::Target::Room(made.name.clone()), text: "hi".into() });
+        assert!(bodies(&made.keys, &h.sent(BOB)).is_empty(), "the room's frames don't open with his key");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_member_who_missed_the_rekey_is_sent_the_key_again() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[BOB, CAROL]).await;
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Leave));
+        h.pump().await; // RekeyDue
+        h.sent(CAROL);
+        deliver(&mut h, CAROL, frame_from(CAROL, &made.keys, here(&made.name, None)));
+        let again = rekeys(&made.keys, &h.sent(CAROL));
+        assert_eq!(again.len(), 1);
+        assert_eq!(room::from_secret(&made.name, &again[0].2).id, keys_now(&h, &made.name).id);
+        deliver(&mut h, CAROL, frame_from(CAROL, &made.keys, RoomBody::Chat { text: "hello?".into() }));
+        assert!(rekeys(&made.keys, &h.sent(CAROL)).is_empty(), "once per interval");
+        assert!(h.events().iter().any(|e| matches!(e, Event::Message { text, .. } if text == "hello?")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_newcomer_let_in_with_the_old_key_ends_up_on_the_new_one() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[CAROL]).await;
+        knock(&mut h, BOB, &made, 100);
+        approve(&mut h, &made, "bobroger");
+        h.pump().await; // Settle: bob gets the secret that's about to be replaced
+        assert!(granted(&made, &h.sent(BOB)));
+        deliver(&mut h, CAROL, frame_from(CAROL, &made.keys, RoomBody::Leave));
+        h.pump().await; // RekeyDue
+        h.sent(BOB);
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Probe { nonce: "p1".into() }));
+        let sent = bodies(&made.keys, &h.sent(BOB));
+        assert_eq!(sent[0], here(&made.name, Some("p1")), "proves us to him first");
+        assert!(matches!(&sent[1], RoomBody::Rekey { epoch: 1, by, .. } if *by == ME));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn old_keys_are_forgotten_after_a_while() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[BOB, CAROL]).await;
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Leave));
+        h.pump().await; // RekeyDue
+        h.node.on_tick(tokio::time::Instant::now() + OLD_KEY_FOR);
+        assert!(h.node.rooms.old_ids.is_empty());
+        h.sent(CAROL);
+        deliver(&mut h, CAROL, frame_from(CAROL, &made.keys, here(&made.name, None)));
+        assert!(rekeys(&made.keys, &h.sent(CAROL)).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_crossing_rekey_under_the_key_we_left_still_counts() {
+        let mut h = with_peers();
+        h.connect(ZED, "zedfox", true);
+        h.events(); // its PeerJoined
+        let made = room_with(&mut h, &[ZED, BOB, CAROL]).await;
+        let id_of = |s: [u8; 32]| room::from_secret(&made.name, &s).id;
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, rekey_body(1, BOB, [1; 32])));
+        assert_eq!(keys_now(&h, &made.name).id, id_of([1; 32]));
+        deliver(&mut h, ZED, frame_from(ZED, &made.keys, rekey_body(1, ZED, [3; 32])));
+        assert_eq!(keys_now(&h, &made.name).id, id_of([3; 32]), "ZED is lower than BOB");
+        deliver(&mut h, CAROL, frame_from(CAROL, &made.keys, rekey_body(1, CAROL, [2; 32])));
+        assert_eq!(keys_now(&h, &made.name).id, id_of([3; 32]), "CAROL is higher: ignored");
     }
 
     #[test]
