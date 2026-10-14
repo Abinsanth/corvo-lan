@@ -9,19 +9,20 @@ use crate::convo::Store;
 pub const HELP_LINE: &str = "\
 commands:
   <text>                 send to the current conversation (shown in the prompt)
-  /msg @nick <text>      one-off private message
-  /chat @nick            switch to a private chat
+  /msg @nick <text>      one-off private message (also /m)
+  /chat @nick            switch to a private chat (also /c; the @ is optional)
   /chat #room <key>      join a room (just /chat #room once you're in)
   /create <name> <key>   create a private room; share its name and key to invite
   /leave [#room]         leave the current or named room
   /close [@nick]         close the current or named private chat
   /rooms                 your rooms and who's in them
   /chats                 your conversations, with unread counts
-  /history [n]           show the last n messages here (default 20)
+  /his [n]               show the last n messages here (default 20)
   /update [yes]          check for a newer version; yes installs it
   /who                   connected people
   /tui                   switch to the full-screen UI
-  /quit                  leave (also Ctrl-C / Ctrl-D)
+  /help                  this list (also /h, /?)
+  /quit                  leave (also /q, Ctrl-C / Ctrl-D)
   //text                 send a message starting with '/'";
 
 pub const MAX_MESSAGE_LINES: usize = 50;
@@ -29,8 +30,8 @@ pub const MAX_MESSAGE_LINES: usize = 50;
 pub const HELP_TUI: &str = "\
 commands:
   <text>                 send to the current tab
-  /msg @nick <text>      one-off private message
-  /chat @nick            open a private chat
+  /msg @nick <text>      one-off private message (also /m)
+  /chat @nick            open a private chat (also /c; the @ is optional)
   /chat #room <key>      join a room (just /chat #room once you're in)
   /create <name> <key>   create a private room; share its name and key to invite
   /leave [#room]         leave the current or named room
@@ -38,7 +39,8 @@ commands:
   /rooms  /chats  /who   list rooms, chats, connected people
   /update [yes]          check for a newer version; yes installs it
   /line                  switch to line mode
-  /quit                  leave (also Ctrl-C)
+  /help                  this list (also /h, /?)
+  /quit                  leave (also /q, Ctrl-C)
   //text                 send a message starting with '/'
 keys:
   Enter send · Alt+Enter or Shift+Enter new line · Tab/Shift-Tab or Alt-1..9 switch tabs
@@ -130,7 +132,11 @@ impl Session {
     /// plain text goes there even if a join switched us while the user typed.
     /// If the prompt showed none, the user means where they've just arrived.
     pub fn on_line(&mut self, line: &str, shown: Option<&Conv>) -> Reaction {
-        match parse_line(line) {
+        self.on_input(parse_line(line), shown)
+    }
+
+    fn on_input(&mut self, input: Input, shown: Option<&Conv>) -> Reaction {
+        match input {
             Input::Empty => Reaction::default(),
             Input::Error(e) => Reaction::say(format!("! {e}")),
             Input::Help => Reaction::say(if self.mode == Mode::Tui { HELP_TUI } else { HELP_LINE }),
@@ -168,6 +174,17 @@ impl Session {
                     None => Reaction::say(format!("! join with /chat #{name} <key>")),
                 }
             }
+            Input::ChatGuess(word) => match self.guess(&word, true) {
+                Ok(Conv::Dm(nick)) => self.on_input(Input::ChatDm(nick), shown),
+                Ok(Conv::Room(name)) => self.on_input(Input::ChatRoom { name, key: None }, shown),
+                Err(e) => Reaction::say(format!("! {e}")),
+            },
+            Input::MsgGuess { to, text } => match self.guess(&to, false) {
+                Ok(Conv::Dm(nick)) => self.on_input(Input::Msg { to: nick, text }, shown),
+                // Only people were searched.
+                Ok(Conv::Room(_)) => Reaction::default(),
+                Err(e) => Reaction::say(format!("! {e}")),
+            },
             Input::Create { base, part } => Reaction::send(Command::CreateRoom { base, key_part: part }),
             Input::Leave(Some(name)) => Reaction::send(Command::LeaveRoom { name }),
             Input::Leave(None) => match self.store.current() {
@@ -223,6 +240,42 @@ impl Session {
         }
     }
 
+    /// Resolves a name typed without a sigil: online people (not me), plus
+    /// joined rooms when `rooms`. An exact name (ignoring case) wins; else a
+    /// unique prefix.
+    fn guess(&self, word: &str, rooms: bool) -> Result<Conv, String> {
+        let me = self.store.me();
+        let mut all: Vec<Conv> =
+            self.store.online().filter(|n| Some(n.as_str()) != me).map(|n| Conv::Dm(n.clone())).collect();
+        if rooms {
+            all.extend(
+                self.store.conversations().iter().filter(|c| matches!(c.conv, Conv::Room(_))).map(|c| c.conv.clone()),
+            );
+        }
+        let lower = |c: &Conv| match c {
+            Conv::Dm(n) | Conv::Room(n) => n.to_lowercase(),
+        };
+        let typed = word.to_lowercase();
+        let exact: Vec<&Conv> = all.iter().filter(|c| lower(c) == typed).collect();
+        let found =
+            if exact.is_empty() { all.iter().filter(|c| lower(c).starts_with(&typed)).collect() } else { exact };
+        match found.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] if rooms => {
+                Err(format!("no one or no room called \"{word}\" — use @name for people or #name for rooms"))
+            }
+            [] => Err(format!("no one called \"{word}\" is online")),
+            many => {
+                let mut names: Vec<String> =
+                    many.iter().take(5).map(|c| render::conv_name(c, &Style::plain())).collect();
+                if many.len() > 5 {
+                    names.push("…".into());
+                }
+                Err(format!("\"{word}\" matches {} — be more specific", names.join(", ")))
+            }
+        }
+    }
+
     fn switch(&mut self, conv: Conv) -> Reaction {
         if self.mode == Mode::Tui {
             // The tab already shows the unread messages.
@@ -233,7 +286,7 @@ impl Session {
         self.store.switch(conv.clone());
         if unread > 0 {
             let name = render::conv_name(&conv, &self.style);
-            Reaction::say(format!("* {name}: {unread} unread — /history to see them"))
+            Reaction::say(format!("* {name}: {unread} unread — /his to see them"))
         } else {
             Reaction::default()
         }
@@ -362,8 +415,8 @@ mod tests {
             &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "two".into(), ts: 0 },
             0,
         );
-        assert_eq!(typed(&mut s, "/chat @bobRoger").print, vec!["* @bobRoger: 2 unread — /history to see them"]);
-        let shown = typed(&mut s, "/history 1").print;
+        assert_eq!(typed(&mut s, "/chat @bobRoger").print, vec!["* @bobRoger: 2 unread — /his to see them"]);
+        let shown = typed(&mut s, "/his 1").print;
         assert_eq!(shown.len(), 1);
         assert!(shown[0].ends_with("@bobRoger → you: two"), "{shown:?}");
     }
@@ -374,8 +427,47 @@ mod tests {
         assert_eq!(typed(&mut s, "/msg @bobRoger hi"), send(Target::Dm("bobRoger".into()), "hi"));
         assert_eq!(typed(&mut s, "/who"), Reaction::send(Command::ListPeers));
         assert!(typed(&mut s, "/quit").quit);
+        assert!(typed(&mut s, "/q").quit);
         assert_eq!(typed(&mut s, "/nick x").print, vec!["! names are assigned by the system and can't be changed"]);
-        assert_eq!(typed(&mut s, "/history").print, vec!["! no conversation — /chat @nick or /chat #room"]);
+        assert_eq!(typed(&mut s, "/his").print, vec!["! no conversation — /chat @nick or /chat #room"]);
+    }
+
+    #[test]
+    fn names_without_a_sigil_are_guessed() {
+        let mut s = session(); // me: annMoon; online: bobRoger
+        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobKite".into() }, 0);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(4), nick: "carolFox".into() }, 0);
+        s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "carolFoxR".into(), members: vec![] }, 0);
+
+        assert_eq!(typed(&mut s, "/chat catp"), Reaction::default());
+        assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
+        assert_eq!(typed(&mut s, "/c CAROLFOX"), Reaction::default(), "an exact name wins, any case");
+        assert_eq!(s.store.current(), Some(&Conv::Dm("carolFox".into())));
+        assert_eq!(
+            typed(&mut s, "/chat carol").print,
+            vec!["! \"carol\" matches @carolFox, #carolFoxR — be more specific"]
+        );
+        assert_eq!(typed(&mut s, "/chat bob").print, vec!["! \"bob\" matches @bobKite, @bobRoger — be more specific"]);
+        assert_eq!(
+            typed(&mut s, "/chat ann").print,
+            vec!["! no one or no room called \"ann\" — use @name for people or #name for rooms"],
+            "never me"
+        );
+        assert_eq!(typed(&mut s, "/msg bobk hi"), send(Target::Dm("bobKite".into()), "hi"));
+        assert_eq!(typed(&mut s, "/m catp hi").print, vec!["! no one called \"catp\" is online"], "/msg skips rooms");
+    }
+
+    #[test]
+    fn a_long_list_of_guesses_is_cut_short() {
+        let mut s = session();
+        for i in 0..7 {
+            s.on_event(&Event::PeerJoined { id: PeerId::test(10 + i), nick: format!("zed{i}Owl") }, 0);
+        }
+        assert_eq!(
+            typed(&mut s, "/chat zed").print,
+            vec!["! \"zed\" matches @zed0Owl, @zed1Owl, @zed2Owl, @zed3Owl, @zed4Owl, … — be more specific"]
+        );
     }
 
     #[test]
@@ -431,10 +523,11 @@ mod tests {
         assert_eq!(typed(&mut s, "/help").print, vec![HELP_LINE]);
         assert!(HELP_LINE.contains("/tui") && !HELP_LINE.contains("/line"));
         assert!(HELP_LINE.contains("/close [@nick]"), "/close works in line mode too");
+        assert!(HELP_LINE.contains("/quit") && HELP_LINE.contains("/q,") && HELP_LINE.contains("/his [n]"));
         s.set_mode(Mode::Tui);
         assert_eq!(typed(&mut s, "/help").print, vec![HELP_TUI]);
         assert!(HELP_TUI.contains("/line") && HELP_TUI.contains("/close") && HELP_TUI.contains("Alt+Enter"));
-        assert_eq!(typed(&mut s, "/history").print, vec!["* scroll with PgUp/PgDn"]);
+        assert_eq!(typed(&mut s, "/his").print, vec!["* scroll with PgUp/PgDn"]);
     }
 
     #[test]

@@ -98,11 +98,14 @@ After about two seconds you get a name, and you're connected to everyone else ru
 /chat #catPieR 123-k7m9xq  # someone else joins with the name and key
 /chat @bobRoger            # private chat
 /msg @bobRoger hi          # one-off private message
+/chat bob                  # the @ or # is optional when only one name matches
 /who                       # who's connected
 /update [yes]              # check for and install a newer version
 /close [@nick]             # close a private chat (TUI)
 /line  /tui                # switch between the full-screen view and a plain prompt
-/help                      # all commands
+/his [n]                   # recent messages here (line mode)
+/help  /h                  # all commands
+/quit  /q                  # leave
 ```
 
 corvo-lan opens a full-screen view: tabs for each chat along the top, the
