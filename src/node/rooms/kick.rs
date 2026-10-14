@@ -84,7 +84,8 @@ impl Node {
             return;
         }
         room.kick_votes.remove(&target);
-        *room.kicks.entry(target).or_default() += 1;
+        let kicks = room.kicks.entry(target).or_default();
+        *kicks = kicks.saturating_add(1);
         if target == me {
             self.removed(id);
         } else if self.forget_member(id, target)
@@ -284,6 +285,15 @@ mod tests {
         verify(&mut h, BOB, &made.name, &made.keys); // he still holds the key
         assert!(!room_of(&h, &made.name).members.contains_key(&BOB));
         assert!(h.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_kick_count_at_its_limit_does_not_overflow() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[BOB]).await;
+        h.node.rooms.joined.get_mut(&made.id).unwrap().kicks.insert(BOB, u8::MAX); // as a peer's counts could claim
+        kick(&mut h, &made, "bobroger");
+        assert_eq!(room_of(&h, &made.name).kicks.get(&BOB), Some(&u8::MAX));
     }
 
     #[tokio::test(start_paused = true)]

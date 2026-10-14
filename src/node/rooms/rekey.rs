@@ -22,6 +22,10 @@ pub const REKEY_BACKUP: Duration = Duration::from_secs(5);
 /// How long a replaced key still opens frames: messages already on their way,
 /// and members (or a newcomer) who missed the switch.
 pub const OLD_KEY_FOR: Duration = Duration::from_secs(30);
+/// A `Rekey` claiming an epoch more than this far ahead of ours is ignored,
+/// so nobody can push the room to the last epoch and make the next re-key
+/// overflow.
+pub const MAX_EPOCH_JUMP: u32 = 16;
 
 /// A key the room used before a re-key.
 pub(super) struct OldKey {
@@ -68,8 +72,11 @@ impl Node {
         let Some(room) = self.rooms.joined.get(&id) else {
             return;
         };
+        // Only reachable through many re-keys in one room; better to keep the key than wrap and split the room.
+        let Some(epoch) = room.epoch.checked_add(1) else {
+            return;
+        };
         let secret = room::new_secret();
-        let epoch = room.epoch + 1;
         let body = RoomBody::Rekey { epoch, by: me, secret: room::to_hex(&secret), kicks: room.kick_list() };
         let frame = self.seal(&room.keys, body);
         for member in room.members.keys() {
@@ -78,8 +85,9 @@ impl Node {
         self.switch_key(id, secret, epoch, me);
     }
 
-    /// A member's `Rekey`: taken if its epoch is newer, or the same epoch made
-    /// by a lower id than our current key's maker.
+    /// A member's `Rekey`: taken if its epoch is newer (by at most
+    /// `MAX_EPOCH_JUMP`), or the same epoch made by a lower id than our current
+    /// key's maker.
     pub(super) fn on_rekey(&mut self, id: RoomId, epoch: u32, by: PeerId, secret: &str, kicks: &[(PeerId, u8)]) {
         let Some(secret) = room::from_hex(secret).and_then(|s| Secret::try_from(s).ok()) else {
             return;
@@ -87,7 +95,7 @@ impl Node {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
-        if epoch < room.epoch || (epoch == room.epoch && by >= room.keyed_by) {
+        if epoch < room.epoch || (epoch == room.epoch && by >= room.keyed_by) || epoch - room.epoch > MAX_EPOCH_JUMP {
             return;
         }
         room.merge_kicks(kicks);
@@ -302,6 +310,29 @@ mod tests {
         assert_eq!(keys_now(&h, &made.name).id, id_of([3; 32]), "ZED is still lower than ME");
         deliver(&mut h, CAROL, frame_from(CAROL, &k2, rekey_body(2, CAROL, [2; 32])));
         assert_eq!(keys_now(&h, &made.name).id, id_of([2; 32]), "a higher epoch always wins");
+    }
+
+    #[tokio::test]
+    async fn a_rekey_too_far_ahead_is_ignored() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[BOB, CAROL]).await;
+        for epoch in [u32::MAX, MAX_EPOCH_JUMP + 1] {
+            deliver(&mut h, CAROL, frame_from(CAROL, &made.keys, rekey_body(epoch, CAROL, [4; 32])));
+            assert_eq!(keys_now(&h, &made.name).id, made.keys.id, "epoch {epoch}");
+        }
+        deliver(&mut h, CAROL, frame_from(CAROL, &made.keys, rekey_body(MAX_EPOCH_JUMP, CAROL, [4; 32])));
+        assert_eq!(room_of(&h, &made.name).epoch, MAX_EPOCH_JUMP, "a jump that big is still fine");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_at_the_last_epoch_does_not_panic() {
+        let mut h = with_peers();
+        let made = room_with(&mut h, &[BOB, CAROL]).await;
+        h.node.rooms.joined.get_mut(&made.id).unwrap().epoch = u32::MAX;
+        deliver(&mut h, BOB, frame_from(BOB, &made.keys, RoomBody::Leave));
+        h.pump().await; // RekeyDue
+        assert_eq!(room_of(&h, &made.name).epoch, u32::MAX);
+        assert_eq!(keys_now(&h, &made.name).id, made.keys.id, "no re-key");
     }
 
     #[tokio::test]
