@@ -419,6 +419,7 @@ impl Node {
             Command::LeaveRoom { name } => self.leave_room(&name),
             Command::Approve { room, nick } => self.approve(&room, &nick),
             Command::Deny { room, nick } => self.deny(&room, &nick),
+            Command::Kick { room, nick } => self.kick(&room, &nick),
             Command::PreviewName { base } => self.preview_name(base),
             Command::ConfirmName => self.confirm_name(),
             Command::Invite { nick, room } => self.invite(&nick, &room),

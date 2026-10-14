@@ -23,6 +23,7 @@ use crate::names;
 use crate::protocol::{Frame, PeerId, now_millis};
 use crate::room::{self, ReplayGuard, RoomBody, RoomEnvelope, RoomId, RoomKeys, Secret};
 
+mod kick;
 mod rekey;
 
 /// Rooms you can be in at once, counting ones you're creating or waiting to get into.
@@ -124,6 +125,8 @@ struct Room {
     keyed_by: PeerId,
     /// Times each peer has been kicked from this room; kept after they leave.
     kicks: HashMap<PeerId, u8>,
+    /// Live kick votes: target → voter → when.
+    kick_votes: HashMap<PeerId, HashMap<PeerId, Instant>>,
     keys: RoomKeys,
     door: RoomKeys,
     /// Other members, all proven.
@@ -394,6 +397,7 @@ impl Node {
             epoch: keying.epoch,
             keyed_by: keying.by,
             kicks: keying.kicks,
+            kick_votes: HashMap::new(),
             keys,
             door,
             members,
@@ -507,6 +511,9 @@ impl Node {
         let room = &self.rooms.joined[&id];
         if room.members.contains_key(&peer) {
             return self.emit(Event::Error(format!("@{nick} is already in #{name}")));
+        }
+        if room.banned(peer) {
+            return self.emit(Event::Error(format!("@{nick} is banned from #{name}")));
         }
         self.send_to(peer, Frame::Invite { room: name.to_string(), key: room.key.clone() });
         self.rooms.invited.insert((id, peer), Instant::now());
@@ -754,6 +761,10 @@ impl Node {
         match env.body {
             RoomBody::Knock { nonce, asked } => {
                 let door = room.door.clone();
+                if room.banned(from) {
+                    self.send_to(from, self.seal(&door, RoomBody::Refuse { full: false, banned: true }));
+                    return;
+                }
                 if let Some(request) = room.requests.get_mut(&from) {
                     request.seen = now;
                 } else if room.full() {
@@ -888,12 +899,13 @@ impl Node {
                 let members = self.nick_of(from).into_iter().collect();
                 self.emit(Event::RoomJoined { name, key, max, members });
             }
-            RoomBody::Refuse { full, .. } => {
+            RoomBody::Refuse { full, banned } => {
                 let Some(p) = self.rooms.joining.remove(&door) else {
                     return;
                 };
-                let why = match (full, self.nick_of(from)) {
-                    (false, Some(by)) => JoinEnd::Denied { by },
+                let why = match (banned, full, self.nick_of(from)) {
+                    (true, _, _) => JoinEnd::Banned,
+                    (false, false, Some(by)) => JoinEnd::Denied { by },
                     _ => JoinEnd::Full,
                 };
                 self.emit(Event::JoinEnded { name: p.name, why });
@@ -992,6 +1004,7 @@ impl Node {
             RoomBody::Leave => self.drop_member(id, from),
             RoomBody::Vote { peer, asked, yes } => self.on_vote(id, from, peer, asked, yes, now),
             RoomBody::Rekey { epoch, by, secret, kicks } => self.on_rekey(id, epoch, by, &secret, &kicks),
+            RoomBody::Kick { peer } => self.on_kick_vote(id, from, peer, now),
             _ => {}
         }
     }
@@ -1014,6 +1027,7 @@ impl Node {
             return false;
         };
         room.challenges.remove(&member);
+        room.kick_votes.remove(&member);
         let was = room.members.remove(&member).is_some();
         if was {
             self.schedule_rekey(id);
@@ -1087,6 +1101,10 @@ impl Node {
             room.closed.retain(|_, (_, at)| now.saturating_duration_since(*at) < REQUEST_STALE);
             room.previous.retain(|k| now < k.until);
             room.resent.retain(|_, at| now.saturating_duration_since(*at) < HERE_INTERVAL);
+            room.kick_votes.retain(|_, votes| {
+                votes.retain(|_, at| now.saturating_duration_since(*at) < kick::KICK_VOTE_FOR);
+                !votes.is_empty()
+            });
         }
         let joined = &self.rooms.joined;
         self.rooms
@@ -1188,9 +1206,7 @@ mod tests {
 
     /// Lower than `ME`, so re-keying is its job, not ours.
     pub(super) const ZED: PeerId = PeerId::test(1);
-    #[allow(dead_code)] // used by the kick tests
     pub(super) const FRED: PeerId = PeerId::test(0x6000_0000_0000_0000);
-    #[allow(dead_code)] // used by the kick tests
     pub(super) const GWEN: PeerId = PeerId::test(0x7000_0000_0000_0000);
 
     /// A room we made, with every one of `members` proven; events and sends so far drained.

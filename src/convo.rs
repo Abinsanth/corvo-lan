@@ -234,7 +234,7 @@ impl Store {
                     }
                 }
             }
-            Event::RoomLeft { name } => {
+            Event::RoomLeft { name } | Event::Removed { room: name } => {
                 self.pending.remove(name);
                 let conv = Conv::Room(name.clone());
                 self.convs.retain(|c| c.conv != conv);
@@ -257,6 +257,18 @@ impl Store {
             Event::Rekeyed { room } => {
                 if let Some(c) = self.find_mut(&Conv::Room(room.clone())) {
                     push(c, Line { ts: now, kind: LineKind::Notice("key changed".into()) });
+                }
+            }
+            Event::KickVote { room, nick, by, have, need } => {
+                if let Some(c) = self.find_mut(&Conv::Room(room.clone())) {
+                    let text = format!("@{by} wants @{nick} out ({have}/{need}) — /kick @{nick} to agree");
+                    push(c, Line { ts: now, kind: LineKind::Notice(text) });
+                }
+            }
+            Event::MemberRemoved { room, nick } => {
+                if let Some(c) = self.find_mut(&Conv::Room(room.clone())) {
+                    c.members.remove(nick);
+                    push(c, Line { ts: now, kind: LineKind::Notice(format!("@{nick} was removed")) });
                 }
             }
             Event::Peers { .. }
@@ -663,5 +675,40 @@ mod tests {
         s.apply(&Event::RoomJoined { name: "catpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         assert_eq!(s.pending().count(), 0);
         assert_eq!(s.get(&room("catpie")).unwrap().key.as_deref(), Some("k7m9xq"));
+    }
+
+    #[test]
+    fn kicks_show_in_the_room_and_being_removed_closes_it() {
+        let mut s = Store::new();
+        s.apply(
+            &Event::RoomJoined {
+                name: "catpie".into(),
+                key: "k7m9xq".into(),
+                max: 13,
+                members: vec!["bobroger".into()],
+            },
+            0,
+        );
+        s.switch(room("catpie"));
+        let vote = Event::KickVote {
+            room: "catpie".into(),
+            nick: "bobroger".into(),
+            by: "carolwolf".into(),
+            have: 1,
+            need: 2,
+        };
+        s.apply(&vote, 0);
+        s.apply(&Event::MemberRemoved { room: "catpie".into(), nick: "bobroger".into() }, 0);
+        let c = s.get(&room("catpie")).unwrap();
+        assert!(c.members.is_empty());
+        let notices: Vec<&LineKind> = c.lines.iter().map(|l| &l.kind).collect();
+        assert!(
+            notices
+                .contains(&&LineKind::Notice("@carolwolf wants @bobroger out (1/2) — /kick @bobroger to agree".into()))
+        );
+        assert!(notices.contains(&&LineKind::Notice("@bobroger was removed".into())));
+        s.apply(&Event::Removed { room: "catpie".into() }, 0);
+        assert!(s.get(&room("catpie")).is_none());
+        assert_eq!(s.current(), None);
     }
 }

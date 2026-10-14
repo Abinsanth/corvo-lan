@@ -96,6 +96,8 @@ pub fn tone_of(event: &Event) -> Tone {
         Event::PeerLeft { .. }
         | Event::MemberLeft { .. }
         | Event::RoomLeft { .. }
+        | Event::MemberRemoved { .. }
+        | Event::Removed { .. }
         | Event::JoinEnded { .. }
         | Event::Error(_) => Tone::Bad,
         Event::JoinRequest { .. } | Event::Invited { .. } => Tone::Warn,
@@ -227,6 +229,10 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
         Event::MemberLeft { room, nick } => {
             notice(now, &format!("{} {} {}", s.nick(nick), s.tone(Tone::Bad, "left"), s.room(room)), s)
         }
+        Event::MemberRemoved { room, nick } => {
+            notice(now, &format!("{} {} {}", s.nick(nick), s.tone(Tone::Bad, "was removed from"), s.room(room)), s)
+        }
+        Event::Removed { room } => s.tone(Tone::Bad, &format!("* you were removed from {}", s.room(room))),
         Event::Peers { you, nick, peers } if peers.is_empty() => {
             format!("* no peers connected — you are {}, fingerprint {}", s.nick(nick), you.fingerprint())
         }
@@ -258,6 +264,7 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
                 JoinEnd::Full => format!("! {} is full", s.room(name)),
                 JoinEnd::Denied { by } => format!("! {} didn't let you into {}", s.nick(by), s.room(name)),
                 JoinEnd::TimedOut => format!("! nobody let you into {} — try again later", s.room(name)),
+                JoinEnd::Banned => format!("! you're banned from {}", s.room(name)),
             };
             s.tone(Tone::Bad, &text)
         }
@@ -275,7 +282,9 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             format!("* {} declined your invite to {}", s.nick(by), s.room(room))
         }
         // Shown inside the room's conversation.
-        Event::Approved { .. } | Event::RequestEnded { .. } | Event::Rekeyed { .. } => return None,
+        Event::Approved { .. } | Event::RequestEnded { .. } | Event::Rekeyed { .. } | Event::KickVote { .. } => {
+            return None;
+        }
         Event::NamePreview { .. } => return None,
     })
 }
@@ -524,6 +533,7 @@ mod tests {
         assert_eq!(ended(JoinEnd::Full), "! #catPie is full");
         assert_eq!(ended(JoinEnd::Denied { by: "bobroger".into() }), "! @bobRoger didn't let you into #catPie");
         assert_eq!(ended(JoinEnd::TimedOut), "! nobody let you into #catPie — try again later");
+        assert_eq!(ended(JoinEnd::Banned), "! you're banned from #catPie");
         let request = Event::JoinRequest { room: name(), nick: "bobroger".into(), have: 0, need: 1 };
         assert_eq!(
             line(request.clone()).unwrap(),
@@ -640,5 +650,16 @@ mod tests {
             event(&e, 0, &P).unwrap(),
             "* your name was taken just now — you're @luffyMoon (restart to pick another name)"
         );
+    }
+
+    #[test]
+    fn kick_lines() {
+        let line = |e: Event| event(&e, 0, &P);
+        let removed = line(Event::MemberRemoved { room: "catpie".into(), nick: "bobroger".into() }).unwrap();
+        assert!(removed.contains("@bobRoger was removed from #catPie"), "{removed}");
+        assert_eq!(line(Event::Removed { room: "catpie".into() }).unwrap(), "* you were removed from #catPie");
+        let vote = Event::KickVote { room: "catpie".into(), nick: "b".into(), by: "c".into(), have: 1, need: 2 };
+        assert_eq!(line(vote), None, "shown in the room only");
+        assert_eq!(tone_of(&Event::Removed { room: "catpie".into() }), Tone::Bad);
     }
 }
