@@ -1,7 +1,7 @@
 //! UDP multicast discovery: announce ourselves every 2s, report peers we hear.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -16,6 +16,21 @@ use crate::protocol::{Announce, PROTOCOL_VERSION, PeerId};
 pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
 pub const PORT: u16 = 4299;
 pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Our address on the LAN: the one discovery packets go out from. Connecting
+/// a UDP socket only picks the route, it sends nothing. `None` without a network.
+pub fn lan_ip() -> Option<Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((GROUP, PORT)).ok()?;
+    usable(socket.local_addr().ok()?)
+}
+
+fn usable(addr: SocketAddr) -> Option<Ipv4Addr> {
+    match addr.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
 
 /// A peer heard on the multicast group.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,5 +150,20 @@ mod tests {
     #[test]
     fn garbage_is_ignored() {
         assert_eq!(parse_announce(b"\xff\x00garbage", src(), ME), None);
+    }
+
+    #[test]
+    fn only_a_real_ipv4_address_counts_as_the_lan_ip() {
+        assert_eq!(usable("192.168.1.9:6000".parse().unwrap()), Some(Ipv4Addr::new(192, 168, 1, 9)));
+        assert_eq!(usable("0.0.0.0:6000".parse().unwrap()), None, "no route");
+        assert_eq!(usable("127.0.0.1:6000".parse().unwrap()), None, "loopback");
+        assert_eq!(usable("[fe80::1]:6000".parse().unwrap()), None, "discovery is IPv4");
+    }
+
+    #[test]
+    fn lan_ip_is_a_real_address_or_nothing() {
+        if let Some(ip) = lan_ip() {
+            assert!(!ip.is_loopback() && !ip.is_unspecified(), "{ip}");
+        }
     }
 }

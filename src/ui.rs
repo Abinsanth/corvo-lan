@@ -16,6 +16,7 @@ use self::render::{Style, Tone, tone_of_text};
 use self::session::{Reaction, Session};
 use self::updates::Updater;
 use crate::api::{Command, Event};
+use crate::discovery;
 use crate::node::NodeHandle;
 
 pub struct Options {
@@ -44,6 +45,8 @@ pub struct Ctx {
     pub notices: mpsc::UnboundedReceiver<Notice>,
     pub notice_tx: mpsc::UnboundedSender<Notice>,
     pub updater: Updater,
+    /// Our LAN address for the status bar.
+    pub lan: String,
 }
 
 impl Ctx {
@@ -90,7 +93,8 @@ async fn run_ui(
 
 /// Runs the full-screen UI until the user quits, then waits for the Node to say goodbye.
 pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<()> {
-    let NodeHandle { commands, events, task, .. } = handle;
+    let NodeHandle { commands, events, task, local_addr, .. } = handle;
+    let lan = tui::view::lan_label(discovery::lan_ip(), local_addr.port());
     tui::install_panic_hook();
     let (notice_tx, notices) = mpsc::unbounded_channel();
     let updater = Updater::new(notice_tx.clone());
@@ -98,7 +102,7 @@ pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<()> {
         updater.check_at_startup();
     }
     let session = Session::new(Style::detect().color);
-    let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater };
+    let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater, lan };
     let result = run_ui(&mut ctx, std::io::stdout().is_terminal(), tui::run).await;
     let _ = task.await;
     result
@@ -124,6 +128,7 @@ mod tests {
             notices,
             notice_tx: notice_tx.clone(),
             updater: Updater::new(notice_tx),
+            lan: String::new(),
         };
         (ctx, event_tx, cmd_rx)
     }

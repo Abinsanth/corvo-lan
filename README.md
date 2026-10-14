@@ -114,8 +114,10 @@ people in the room and everyone online on the right. `Shift-Tab`,
 `Alt-←`/`Alt-→` or `Alt-1..9` switch tabs, `Tab` completes `@names`, `#rooms`
 and `/commands`, `Alt+Enter` (or `Shift+Enter` where your terminal supports it)
 adds a new line, `PgUp`/`PgDn` or the mouse wheel scroll, and clicking a name
-opens a private chat. Command output and errors appear in the `corvo` tab. To
-select text, hold Shift (Option on macOS) while dragging.
+opens a private chat. Command output and errors appear in the `corvo` tab. The
+bottom line shows your `ip` and `port`: on most home and office networks,
+people on the same LAN share the first three numbers of the ip. To select
+text, hold Shift (Option on macOS) while dragging.
 
 ### Rooms
 
@@ -169,7 +171,8 @@ ever leaves your network.
 ### If peers don't find each other
 
 Discovery uses multicast on `239.255.42.99:4299`. Some networks (guest Wi-Fi,
-corporate networks, some routers) block it. In that case, connect directly:
+corporate networks, some routers) block it. In that case, connect directly
+using the ip and port shown on the other person's bottom line:
 
 ```bash
 corvo-lan --port 5000                      # on one machine

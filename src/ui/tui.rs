@@ -347,6 +347,7 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
     let (tx, mut input) = mpsc::unbounded_channel();
     let reader = InputThread::start(tx);
     let mut state = TuiState::new(ctx.session.color());
+    state.lan = ctx.lan.clone();
     state.on_status = ctx.session.store.current().is_none();
     let mut tick = tokio::time::interval(TICK);
 
