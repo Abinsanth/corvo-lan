@@ -51,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Windows sets USERNAME rather than USER.
     let login = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok();
+    let ask_name = args.nick.is_none();
     let base = args.nick.map(|n| n.to_ascii_lowercase()).unwrap_or_else(|| names::default_base(login.as_deref()));
     names::validate_base(&base).map_err(|e| anyhow!("invalid --nick {base:?}: {e}"))?;
 
@@ -66,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         manual_peers: args.peers,
         name_wait: node::NAME_WAIT,
         fixed_word: None,
+        ask_name,
     })
     .await?;
     let env_off = update::check_disabled_by(std::env::var("CORVO_LAN_NO_UPDATE_CHECK").ok().as_deref());

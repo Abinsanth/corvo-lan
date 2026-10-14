@@ -35,10 +35,10 @@ pub enum Command {
         to: Target,
         text: String,
     },
-    /// `base` is what the user typed; the node adds the rest of the name and
-    /// makes the key. `max` counts everyone, the creator included.
+    /// A room name from `names::pick_name` (the UI previews it); the node makes the key.
+    /// `max` counts everyone, the creator included.
     CreateRoom {
-        base: String,
+        name: String,
         max: u8,
     },
     JoinRoom {
@@ -58,6 +58,12 @@ pub enum Command {
         room: String,
         nick: String,
     },
+    /// While picking our name: show the name `base` would get.
+    PreviewName {
+        base: String,
+    },
+    /// While picking our name: keep the last preview.
+    ConfirmName,
     ListPeers,
     Quit,
 }
@@ -109,6 +115,10 @@ pub enum Event {
     Assigned {
         nick: String,
         renamed: bool,
+    },
+    /// The name we'd get if the user keeps it (only when the app asks).
+    NamePreview {
+        nick: String,
     },
     PeerJoined {
         id: PeerId,

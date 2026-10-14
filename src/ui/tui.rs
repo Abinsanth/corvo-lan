@@ -287,6 +287,11 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
         }
     }
     follow_current(state, before, session);
+    if matches!(event, Event::NamePreview { .. })
+        && let Some(question) = session.prompt()
+    {
+        state.flash(&question, now);
+    }
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -443,22 +448,35 @@ mod tests {
     }
 
     #[test]
-    fn the_create_question_is_answered_from_any_tab_and_esc_drops_it() {
+    fn the_name_question_flashes_and_survives_a_tab_switch() {
+        let mut s = Session::new(false);
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_event(&mut s, &mut state, &Event::NamePreview { nick: "bobroger".into() }, now);
+        assert!(state.flash_text(now).is_some_and(|t| t.contains("you'll be @bobroger")));
+        state.select_tab(&mut s, 0);
+        apply_key(&mut s, &mut state, Action::Esc);
+        assert!(s.prompt().is_some_and(|p| p.contains("@bobroger")));
+        let r = on_send(&mut s, &mut state, String::new(), now).expect("Enter answers from the corvo tab");
+        assert_eq!(r.commands, vec![crate::api::Command::ConfirmName]);
+    }
+
+    #[test]
+    fn the_create_questions_are_answered_from_any_tab_and_esc_drops_them() {
         let mut s = session();
         let mut state = TuiState::new(false);
         let now = Instant::now();
         state.on_status = true;
         on_send(&mut s, &mut state, "/create cat".into(), now);
-        assert!(state.flash_text(now).is_some_and(|t| t.contains("how many people")), "the question flashes");
-        let r = on_send(&mut s, &mut state, String::new(), now).expect("Enter answers");
-        assert_eq!(r.commands, vec![crate::api::Command::CreateRoom { base: "cat".into(), max: 13 }]);
-
-        on_send(&mut s, &mut state, "/create cat".into(), now);
+        assert!(state.flash_text(now).is_some_and(|t| t.contains("new room #cat")), "the name step flashes");
+        on_send(&mut s, &mut state, String::new(), now).expect("Enter keeps the name");
+        assert!(state.flash_text(now).is_some_and(|t| t.contains("how many people")), "then the head count");
         let r = on_send(&mut s, &mut state, "4".into(), now).expect("not refused on the corvo tab");
-        assert_eq!(r.commands, vec![crate::api::Command::CreateRoom { base: "cat".into(), max: 4 }]);
+        assert!(matches!(r.commands.as_slice(),
+            [crate::api::Command::CreateRoom { name, max: 4 }] if name.starts_with("cat")));
 
         on_send(&mut s, &mut state, "/create cat".into(), now);
-        state.editor.insert('7');
+        state.editor.insert('d');
         apply_key(&mut s, &mut state, Action::Esc);
         assert!(s.prompt().is_some(), "the first Esc clears the input");
         apply_key(&mut s, &mut state, Action::Esc);
@@ -490,6 +508,7 @@ mod tests {
         let mut state = TuiState::new(false);
         let now = Instant::now();
         on_send(&mut s, &mut state, "/create cat".into(), now);
+        on_send(&mut s, &mut state, String::new(), now);
         on_send(&mut s, &mut state, "hello".into(), now);
         assert!(s.prompt().is_some());
         assert!(state.flash_text(now).is_some_and(|t| t.starts_with("! a room holds")), "{:?}", state.flash_text(now));

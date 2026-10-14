@@ -63,6 +63,9 @@ pub struct NodeConfig {
     pub manual_peers: Vec<SocketAddr>,
     /// Listen-only discovery time before naming (`NAME_WAIT`; tests use zero).
     pub name_wait: Duration,
+    /// Wait for `Command::ConfirmName` before going live, showing `Event::NamePreview`s
+    /// (the app without `--nick`). `false` names us as soon as `name_wait` ends.
+    pub ask_name: bool,
     /// Pin the Word part of our first name instead of drawing one; tests use
     /// it to force a same-moment clash. `None` (the app) picks at random.
     pub fixed_word: Option<String>,
@@ -220,6 +223,14 @@ struct Node {
     /// `Some(nicks seen so far)` during the listen-only naming window.
     naming: Option<HashSet<String>>,
     fixed_word: Option<String>,
+    /// See `NodeConfig::ask_name`.
+    ask_name: bool,
+    /// The name last sent as `Event::NamePreview`.
+    preview: Option<String>,
+    /// The user kept `preview`; we go live once the naming window is over too.
+    confirmed: bool,
+    /// `NAME_WAIT` has passed.
+    wait_over: bool,
     events: mpsc::UnboundedSender<Event>,
     msg_tx: mpsc::Sender<NodeMsg>,
     peers: HashMap<PeerId, PeerEntry>,
@@ -246,6 +257,7 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
     let mut node = Node::new(config.keys, config.base, event_tx, msg_tx.clone());
     node.naming = Some(HashSet::new());
     node.fixed_word = config.fixed_word;
+    node.ask_name = config.ask_name;
     node.listener = Some(listener);
     node.manual_peers = config.manual_peers;
     let (store, store_notice) = match config.known_peers {
@@ -283,6 +295,9 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
     }));
 
     node.emit(Event::Info("looking for peers…".into()));
+    if node.ask_name {
+        node.preview_name(node.base.clone());
+    }
     node.after(config.name_wait, NodeMsg::NameWaitOver);
     let task = tokio::spawn(node.run(cmd_rx, msg_rx));
     Ok(NodeHandle { id, local_addr, commands: cmd_tx, events: event_rx, task })
@@ -297,6 +312,10 @@ impl Node {
             nick: watch::Sender::new(String::new()),
             naming: None,
             fixed_word: None,
+            ask_name: false,
+            preview: None,
+            confirmed: false,
+            wait_over: false,
             events,
             msg_tx,
             peers: HashMap::new(),
@@ -377,7 +396,9 @@ impl Node {
     }
 
     fn handle_command(&mut self, cmd: Command) {
-        if self.naming.is_some() && !matches!(cmd, Command::ListPeers | Command::Quit) {
+        if self.naming.is_some()
+            && !matches!(cmd, Command::ListPeers | Command::Quit | Command::PreviewName { .. } | Command::ConfirmName)
+        {
             self.emit(Event::Error("still picking your name, try again in a moment".into()));
             return;
         }
@@ -391,11 +412,13 @@ impl Node {
                     Target::Room(name) => self.send_room(&name, text),
                 }
             }
-            Command::CreateRoom { base, max } => self.create_room(&base, max),
+            Command::CreateRoom { name, max } => self.create_room(&name, max),
             Command::JoinRoom { name, key } => self.join_room(&name, &key),
             Command::LeaveRoom { name } => self.leave_room(&name),
             Command::Approve { room, nick } => self.approve(&room, &nick),
             Command::Deny { room, nick } => self.deny(&room, &nick),
+            Command::PreviewName { base } => self.preview_name(base),
+            Command::ConfirmName => self.confirm_name(),
             Command::ListPeers => {
                 let mut peers: Vec<PeerInfo> =
                     self.peers.iter().map(|(id, p)| PeerInfo { id: *id, nick: p.nick.clone(), addr: p.addr }).collect();
@@ -448,7 +471,7 @@ impl Node {
                 }
                 None => self.emit(Event::Error(format!("could not connect to {addr}: {error}"))),
             },
-            NodeMsg::NameWaitOver => self.assign_name(),
+            NodeMsg::NameWaitOver => self.on_name_wait_over(),
             NodeMsg::Derived { job, attempt, keys } => self.on_derived(job, attempt, keys),
             NodeMsg::JoinTimeout(id, attempt) => self.on_join_timeout(id, attempt),
             NodeMsg::JoinExpired(id, attempt) => self.on_join_expired(id, attempt),
@@ -457,21 +480,64 @@ impl Node {
         }
     }
 
+    /// The listen-only window is over: go live, unless the user is still choosing.
+    fn on_name_wait_over(&mut self) {
+        self.wait_over = true;
+        if !self.ask_name || self.confirmed {
+            self.assign_name();
+        }
+    }
+
+    /// Shows the name `base` would get now. Only while naming and not yet confirmed.
+    fn preview_name(&mut self, base: String) {
+        if self.confirmed {
+            return;
+        }
+        let Some(seen) = &self.naming else {
+            return;
+        };
+        if let Err(e) = names::validate_base(&base) {
+            self.emit(Event::Error(e));
+            return;
+        }
+        let Some(nick) = names::pick_name(&base, |n| seen.contains(n)) else {
+            self.emit(Event::Error(format!("every name for '{base}' is taken — try another")));
+            return;
+        };
+        self.base = base;
+        self.preview = Some(nick.clone());
+        self.emit(Event::NamePreview { nick });
+    }
+
+    /// The user keeps the preview; we go live now if the window is over, else when it ends.
+    fn confirm_name(&mut self) {
+        if self.naming.is_none() || self.preview.is_none() {
+            return;
+        }
+        self.confirmed = true;
+        if self.wait_over {
+            self.assign_name();
+        }
+    }
+
     /// Ends the naming window: pick a name nobody announced, then go live.
     fn assign_name(&mut self) {
         let Some(seen) = self.naming.take() else {
             return;
         };
-        let picked = match &self.fixed_word {
-            Some(word) => Some(format!("{}{word}", self.base)),
-            None => names::pick_name(&self.base, |n| seen.contains(n)),
+        let (picked, renamed) = match (&self.fixed_word, self.preview.take()) {
+            (Some(word), _) => (Some(format!("{}{word}", self.base)), false),
+            (None, Some(kept)) if !seen.contains(&kept) => (Some(kept), false),
+            // Someone announced the preview while the user was deciding.
+            (None, Some(_)) => (names::pick_name(&self.base, |n| seen.contains(n)), true),
+            (None, None) => (names::pick_name(&self.base, |n| seen.contains(n)), false),
         };
         let Some(nick) = picked else {
             self.emit(Event::Error(format!("every name for '{}' is taken; restart with another --nick", self.base)));
             return;
         };
         self.nick.send_replace(nick.clone());
-        self.emit(Event::Assigned { nick, renamed: false });
+        self.emit(Event::Assigned { nick, renamed });
 
         if let Some(listener) = self.listener.take() {
             if let Ok(addr) = listener.local_addr() {
@@ -876,6 +942,101 @@ pub(super) mod tests {
         h.node.naming = Some(HashSet::new());
         h.node.handle_command(dm("bobroger", "hi"));
         assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("still picking")));
+    }
+
+    /// A node in its naming window that asks the user, like the app without `--nick`.
+    fn asking() -> Harness {
+        let mut h = Harness::new();
+        h.node.nick.send_replace(String::new());
+        h.node.naming = Some(HashSet::new());
+        h.node.ask_name = true;
+        h
+    }
+
+    fn sighting(i: u64, nick: &str) -> Sighting {
+        Sighting { id: PeerId::test(100 + i), nick: nick.into(), tcp_addr: "127.0.0.1:1".parse().unwrap() }
+    }
+
+    /// The nick of the one `NamePreview` waiting in `h`'s events.
+    fn previewed(h: &mut Harness) -> String {
+        match h.events().as_slice() {
+            [Event::NamePreview { nick }] => nick.clone(),
+            other => panic!("expected one NamePreview, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_asking_node_waits_for_the_user_to_confirm() {
+        let mut h = asking();
+        h.node.handle_command(Command::PreviewName { base: "luffy".into() });
+        let nick = previewed(&mut h);
+        assert!(nick.starts_with("luffy") && names::is_valid_name(&nick), "{nick}");
+        h.node.on_name_wait_over();
+        assert_eq!(h.node.my_nick(), "", "not until the user says so");
+        assert!(h.events().is_empty());
+
+        h.node.handle_command(Command::ConfirmName);
+        assert_eq!(h.node.my_nick(), nick);
+        assert_eq!(h.events(), vec![Event::Assigned { nick: nick.clone(), renamed: false }]);
+
+        h.node.handle_command(Command::PreviewName { base: "zoro".into() });
+        h.node.handle_command(Command::ConfirmName);
+        assert!(h.events().is_empty(), "too late to change");
+        assert_eq!(h.node.my_nick(), nick);
+    }
+
+    #[tokio::test]
+    async fn confirming_early_waits_for_the_window() {
+        let mut h = asking();
+        h.node.handle_command(Command::PreviewName { base: "nami".into() });
+        let nick = previewed(&mut h);
+        h.node.handle_command(Command::ConfirmName);
+        assert_eq!(h.node.my_nick(), "");
+        h.node.handle_command(Command::PreviewName { base: "zoro".into() });
+        assert!(h.events().is_empty(), "no new preview once confirmed");
+        h.node.on_name_wait_over();
+        assert_eq!(h.events(), vec![Event::Assigned { nick, renamed: false }]);
+    }
+
+    #[tokio::test]
+    async fn a_preview_someone_announces_meanwhile_gets_a_new_word() {
+        let mut h = asking();
+        h.node.handle_command(Command::PreviewName { base: "sanji".into() });
+        let nick = previewed(&mut h);
+        h.node.on_discovered(sighting(1, &nick));
+        h.node.on_name_wait_over();
+        h.node.handle_command(Command::ConfirmName);
+        let got = h.node.my_nick();
+        assert!(got.starts_with("sanji") && got != nick, "{got}");
+        assert_eq!(h.events(), vec![Event::Assigned { nick: got, renamed: true }]);
+    }
+
+    #[test]
+    fn previews_avoid_seen_names_and_check_the_base() {
+        let mut h = asking();
+        let words = crate::words::WORDS;
+        for (i, w) in words.iter().skip(1).enumerate() {
+            h.node.on_discovered(sighting(i as u64, &format!("ann{w}")));
+        }
+        h.node.handle_command(Command::PreviewName { base: "ann".into() });
+        assert_eq!(previewed(&mut h), format!("ann{}", words[0]));
+        h.node.handle_command(Command::PreviewName { base: "chat".into() });
+        h.node.handle_command(Command::PreviewName { base: "Bob".into() });
+        assert_eq!(
+            h.events(),
+            vec![Event::Error("'chat' is reserved".into()), Event::Error("name must be 1–9 letters or digits".into()),]
+        );
+        h.node.handle_command(dm("bobroger", "hi"));
+        assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("still picking")));
+    }
+
+    #[tokio::test]
+    async fn a_node_that_does_not_ask_goes_live_when_the_window_ends() {
+        let mut h = Harness::new();
+        h.node.nick.send_replace(String::new());
+        h.node.naming = Some(HashSet::new());
+        h.node.on_name_wait_over();
+        assert!(h.node.my_nick().starts_with("ann"));
     }
 
     #[tokio::test]
