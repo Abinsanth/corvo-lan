@@ -65,7 +65,8 @@ pub struct Session {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Asking {
     /// Startup: keep the previewed name or type another. Only a name ends it.
-    Name { preview: String },
+    /// `confirmed` once Enter kept it, until the node goes live.
+    Name { preview: String, confirmed: bool },
     /// `/create`, step 1: keep the previewed room name or type another. `max` if typed with it.
     RoomName { preview: String, max: Option<u8> },
     /// `/create`, step 2: how many people.
@@ -85,7 +86,7 @@ impl Session {
     pub fn on_event(&mut self, event: &Event, now: u64) -> Option<String> {
         self.store.apply(event, now);
         match event {
-            Event::NamePreview { nick } => self.asking = Some(Asking::Name { preview: nick.clone() }),
+            Event::NamePreview { nick } => self.asking = Some(Asking::Name { preview: nick.clone(), confirmed: false }),
             Event::Assigned { .. } if matches!(self.asking, Some(Asking::Name { .. })) => self.asking = None,
             _ => {}
         }
@@ -100,9 +101,9 @@ impl Session {
     /// plain text goes there even if a join switched us while the user typed.
     /// If the prompt showed none, the user means where they've just arrived.
     pub fn on_line(&mut self, line: &str, shown: Option<&Conv>) -> Reaction {
-        if let Some(Asking::Name { preview }) = &self.asking {
-            let preview = preview.clone();
-            return self.answer_name(&preview, line.trim());
+        if let Some(Asking::Name { preview, confirmed }) = &self.asking {
+            let (preview, confirmed) = (preview.clone(), *confirmed);
+            return self.answer_name(preview, confirmed, line.trim());
         }
         if let Some(asking) = self.asking.take()
             && !line.trim_start().starts_with('/')
@@ -119,7 +120,10 @@ impl Session {
     /// The question the input is waiting on, if any.
     pub fn prompt(&self) -> Option<String> {
         self.asking.as_ref().map(|asking| match asking {
-            Asking::Name { preview } => format!("you'll be @{preview} — Enter to keep it, or type a name"),
+            Asking::Name { preview, confirmed: false } => {
+                format!("you'll be @{preview} — Enter to keep it, or type a name")
+            }
+            Asking::Name { preview, confirmed: true } => format!("joining as @{preview}…"),
             Asking::RoomName { preview, .. } => {
                 format!("new room #{preview} — Enter to keep it, or type another name")
             }
@@ -138,15 +142,23 @@ impl Session {
     }
 
     /// Enter keeps the preview; a name asks for a new one. Only /quit gets past it.
-    fn answer_name(&mut self, preview: &str, answer: &str) -> Reaction {
+    /// Once kept, the name is settled: later lines just say so.
+    fn answer_name(&mut self, preview: String, confirmed: bool, answer: &str) -> Reaction {
+        if answer.starts_with('/') && parse_line(answer) == Input::Quit {
+            return self.on_input(Input::Quit, None);
+        }
+        if confirmed {
+            if answer.is_empty() {
+                return Reaction::default();
+            }
+            return Reaction::say(format!("! you're joining as @{preview} — restart to pick another name"));
+        }
         if answer.is_empty() {
+            self.asking = Some(Asking::Name { preview, confirmed: true });
             return Reaction::send(Command::ConfirmName);
         }
         if answer.starts_with('/') {
-            return match parse_line(answer) {
-                Input::Quit => self.on_input(Input::Quit, None),
-                _ => Reaction::say(format!("! pick your name first — Enter keeps @{preview}")),
-            };
+            return Reaction::say(format!("! pick your name first — Enter keeps @{preview}"));
         }
         let base = answer.to_ascii_lowercase();
         match crate::names::validate_base(&base) {
@@ -494,6 +506,21 @@ mod tests {
         assert_eq!(typed(&mut s, ""), Reaction::send(Command::ConfirmName));
         assert!(s.prompt().is_some(), "asked until the name arrives");
         s.on_event(&Event::Assigned { nick: "luffysunny".into(), renamed: false }, 0);
+        assert_eq!(s.prompt(), None);
+    }
+
+    #[test]
+    fn after_enter_the_name_question_says_it_is_joining() {
+        let mut s = naming("bobroger");
+        assert_eq!(typed(&mut s, ""), Reaction::send(Command::ConfirmName));
+        assert_eq!(s.prompt(), Some("joining as @bobroger…".into()));
+        let joining = Reaction::say("! you're joining as @bobroger — restart to pick another name");
+        assert_eq!(typed(&mut s, "zoro"), joining, "a name typed now isn't dropped silently");
+        assert_eq!(typed(&mut s, "/who"), joining);
+        assert_eq!(typed(&mut s, ""), Reaction::default(), "a second Enter does nothing");
+        assert!(!s.cancel_prompt());
+        assert!(typed(&mut s, "/quit").quit);
+        s.on_event(&Event::Assigned { nick: "bobroger".into(), renamed: false }, 0);
         assert_eq!(s.prompt(), None);
     }
 

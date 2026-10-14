@@ -1038,7 +1038,8 @@ mod tests {
         create(&mut h, 13).await;
         create(&mut h, 13).await;
         h.node.handle_command(Command::JoinRoom { name: "dogpie".into(), key: KEY.into() });
-        h.node.handle_command(Command::CreateRoom { name: "catpie".into(), max: 13 });
+        // `create` only picks cat… names, so this one is free.
+        h.node.handle_command(Command::CreateRoom { name: "owlpie".into(), max: 13 });
         assert_eq!(h.events(), vec![Event::Error(format!("you're in {MAX_ROOMS} rooms (the max) — /leave one first"))]);
     }
 
