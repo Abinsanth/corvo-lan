@@ -579,6 +579,22 @@ mod tests {
         assert!(leftovers(&bin).is_empty(), "{:?}", leftovers(&bin));
     }
 
+    /// The second rename fails (the new file is held open), so the first must
+    /// be undone.
+    #[cfg(windows)]
+    #[test]
+    fn a_swap_that_fails_midway_is_undone() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let bin = scratch("swap-midway-bin");
+        let target = old_binary(&bin);
+        let new = scratch("swap-midway-new").join("new.exe");
+        std::fs::write(&new, "new").unwrap();
+        let _held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&new).unwrap();
+        assert!(swap_in(&new, &target).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        assert!(!bin.join(OLD_EXE).exists());
+    }
+
     #[test]
     fn the_old_exe_is_removed_at_startup() {
         let bin = scratch("old-exe");
