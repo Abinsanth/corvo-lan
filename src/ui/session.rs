@@ -377,20 +377,20 @@ mod tests {
         assert_eq!(typed(&mut s, "meow"), send(Target::Room("catPieR".into()), "meow"));
 
         assert_eq!(
-            typed(&mut s, "/chat #dogFoxR 1-abcdef"),
-            Reaction::send(Command::JoinRoom { name: "dogFoxR".into(), key: "1-abcdef".into() })
+            typed(&mut s, "/chat #dogWolfR 1-abcdef"),
+            Reaction::send(Command::JoinRoom { name: "dogWolfR".into(), key: "1-abcdef".into() })
         );
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())), "not until the join succeeds");
         s.on_event(
             &Event::RoomJoined {
-                name: "dogFoxR".into(),
+                name: "dogWolfR".into(),
                 key: "k7m9xq".into(),
                 max: 13,
                 members: vec!["bobRoger".into()],
             },
             0,
         );
-        assert_eq!(s.store.current(), Some(&Conv::Room("dogFoxR".into())));
+        assert_eq!(s.store.current(), Some(&Conv::Room("dogWolfR".into())));
         assert_eq!(typed(&mut s, "/chat #catPieR"), Reaction::default(), "already in: just switch");
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
         assert_eq!(typed(&mut s, "/chat #nopeMoonR").print, vec!["! join with /chat #nopeMoonR <key>"]);
@@ -479,27 +479,27 @@ mod tests {
             typed(&mut s, "/deny @bobRoger"),
             Reaction::send(Command::Deny { room: "catPieR".into(), nick: "bobRoger".into() })
         );
-        assert_eq!(typed(&mut s, "/approve @bobRoger #dogFoxR"), approve("dogFoxR"), "an explicit room is passed on");
+        assert_eq!(typed(&mut s, "/approve @bobRoger #dogWolfR"), approve("dogWolfR"), "an explicit room is passed on");
         assert_eq!(
-            typed(&mut s, "/approve @carolFox").print,
-            vec!["! @carolFox isn't waiting to join any of your rooms"]
+            typed(&mut s, "/approve @carolWolf").print,
+            vec!["! @carolWolf isn't waiting to join any of your rooms"]
         );
     }
 
     #[test]
     fn approve_prefers_the_current_room() {
-        let mut s = bob_waits_in(&["catPieR", "dogFoxR"]);
+        let mut s = bob_waits_in(&["catPieR", "dogWolfR"]);
         s.store.switch(Conv::Room("catPieR".into()));
         assert_eq!(typed(&mut s, "/approve @bobRoger"), approve("catPieR"));
     }
 
     #[test]
     fn approve_needs_a_room_when_ambiguous() {
-        let mut s = bob_waits_in(&["catPieR", "dogFoxR"]);
+        let mut s = bob_waits_in(&["catPieR", "dogWolfR"]);
         typed(&mut s, "/chat @bobRoger");
         assert_eq!(
             typed(&mut s, "/approve @bobRoger").print,
-            vec!["! @bobRoger is waiting in #catPieR and #dogFoxR — say which: /approve @bobRoger #catPieR"]
+            vec!["! @bobRoger is waiting in #catPieR and #dogWolfR — say which: /approve @bobRoger #catPieR"]
         );
     }
 
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(typed(&mut s, "/leave").print, vec!["! you're not in a room here — /leave #room"]);
         s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "1-abcdef".into(), max: 13 }, 0);
         assert_eq!(typed(&mut s, "/leave"), Reaction::send(Command::LeaveRoom { name: "catPieR".into() }));
-        assert_eq!(typed(&mut s, "/leave #dogFoxR"), Reaction::send(Command::LeaveRoom { name: "dogFoxR".into() }));
+        assert_eq!(typed(&mut s, "/leave #dogWolfR"), Reaction::send(Command::LeaveRoom { name: "dogWolfR".into() }));
         s.on_event(&Event::RoomLeft { name: "catPieR".into() }, 0);
         assert_eq!(s.store.current(), None);
     }
@@ -597,17 +597,17 @@ mod tests {
     fn names_without_a_sigil_are_guessed() {
         let mut s = session(); // me: annMoon; online: bobRoger
         s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobKite".into() }, 0);
-        s.on_event(&Event::PeerJoined { id: PeerId::test(4), nick: "carolFox".into() }, 0);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(4), nick: "carolWolf".into() }, 0);
         s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
-        s.on_event(&Event::RoomJoined { name: "carolFoxR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "carolWolfR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
 
         assert_eq!(typed(&mut s, "/chat catp"), Reaction::default());
         assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
-        assert_eq!(typed(&mut s, "/c CAROLFOX"), Reaction::default(), "an exact name wins, any case");
-        assert_eq!(s.store.current(), Some(&Conv::Dm("carolFox".into())));
+        assert_eq!(typed(&mut s, "/c CAROLWOLF"), Reaction::default(), "an exact name wins, any case");
+        assert_eq!(s.store.current(), Some(&Conv::Dm("carolWolf".into())));
         assert_eq!(
             typed(&mut s, "/chat carol").print,
-            vec!["! \"carol\" matches @carolFox, #carolFoxR — be more specific"]
+            vec!["! \"carol\" matches @carolWolf, #carolWolfR — be more specific"]
         );
         assert_eq!(typed(&mut s, "/chat bob").print, vec!["! \"bob\" matches @bobKite, @bobRoger — be more specific"]);
         assert_eq!(

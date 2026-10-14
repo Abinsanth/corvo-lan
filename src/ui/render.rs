@@ -378,11 +378,11 @@ mod tests {
             name: "catPieR".into(),
             key: "k7m9xq".into(),
             max: 13,
-            members: vec!["bobRoger".into(), "carolFox".into()],
+            members: vec!["bobRoger".into(), "carolWolf".into()],
         };
-        assert_eq!(event(&joined, 0, &P).unwrap(), "* joined #catPieR with @bobRoger, @carolFox");
-        let member = Event::MemberJoined { room: "catPieR".into(), nick: "carolFox".into() };
-        assert_eq!(event(&member, 0, &P).unwrap(), format!("{} * @carolFox joined #catPieR", t(0)));
+        assert_eq!(event(&joined, 0, &P).unwrap(), "* joined #catPieR with @bobRoger, @carolWolf");
+        let member = Event::MemberJoined { room: "catPieR".into(), nick: "carolWolf".into() };
+        assert_eq!(event(&member, 0, &P).unwrap(), format!("{} * @carolWolf joined #catPieR", t(0)));
         let lost = Event::PeerLeft { id: PeerId::test(1), nick: "bobRoger".into(), reason: LeaveReason::Lost };
         assert_eq!(event(&lost, 0, &P).unwrap(), format!("{} * @bobRoger went offline (connection lost)", t(0)));
         let assigned = Event::Assigned { nick: "annMoon".into(), renamed: false };
@@ -425,14 +425,14 @@ mod tests {
 
     #[test]
     fn plain_style_has_no_escape_codes() {
-        let e = Event::MemberJoined { room: "catPieR".into(), nick: "carolFox".into() };
+        let e = Event::MemberJoined { room: "catPieR".into(), nick: "carolWolf".into() };
         assert!(!event(&e, 0, &P).unwrap().contains('\x1b'));
     }
 
     #[test]
     fn nick_colours_are_stable_and_in_range() {
         assert_eq!(nick_color("bobRoger"), nick_color("bobRoger"));
-        for n in ["a", "bobRoger", "carolFox", "x9Moon"] {
+        for n in ["a", "bobRoger", "carolWolf", "x9Moon"] {
             assert!((31..=36).contains(&nick_color(n)));
         }
     }
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(tone_of_text("* an update check is already running"), Tone::Warn);
         assert_eq!(tone_of_text("* installed v0.3.0. Restart corvo-lan to use it."), Tone::Good);
         assert_eq!(tone_of_text("* you have 0.2.0. Newer:"), Tone::Plain);
-        assert_eq!(tone_of_notice("@carolFox joined"), Tone::Good);
+        assert_eq!(tone_of_notice("@carolWolf joined"), Tone::Good);
         assert_eq!(tone_of_notice("created #catPieR — key 1-x — share both to invite"), Tone::Good);
         assert_eq!(tone_of_notice("joined #catPieR"), Tone::Good);
         assert_eq!(tone_of_notice("@bobRoger left"), Tone::Bad);

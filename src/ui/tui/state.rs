@@ -682,7 +682,7 @@ mod tests {
     }
 
     fn bobs() -> Candidates {
-        Candidates { nicks: vec!["bobRoger".into(), "bobKite".into(), "carolFox".into()], ..Default::default() }
+        Candidates { nicks: vec!["bobRoger".into(), "bobKite".into(), "carolWolf".into()], ..Default::default() }
     }
 
     #[test]
@@ -690,7 +690,7 @@ mod tests {
         let mut t = TuiState::new(false);
         t.editor.set("hi @car".into());
         t.complete(&bobs());
-        assert_eq!(t.editor.text(), "hi @carolFox ");
+        assert_eq!(t.editor.text(), "hi @carolWolf ");
         assert_eq!(t.popup, None);
 
         t.editor.set("é @b".into());
@@ -704,7 +704,7 @@ mod tests {
 
         t.editor.set("line one\n@car".into());
         t.complete(&bobs());
-        assert_eq!(t.editor.text(), "line one\n@carolFox ");
+        assert_eq!(t.editor.text(), "line one\n@carolWolf ");
 
         t.editor.set("@zed".into());
         t.complete(&bobs());

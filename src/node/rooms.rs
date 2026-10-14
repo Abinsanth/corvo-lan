@@ -946,7 +946,7 @@ mod tests {
     fn with_peers() -> Harness {
         let mut h = Harness::new();
         h.connect(BOB, "bobRoger", true);
-        h.connect(CAROL, "carolFox", true);
+        h.connect(CAROL, "carolWolf", true);
         h.connect(DAVE, "daveOak", true);
         h.connect(ERIN, "erinOwl", true);
         h.events();
@@ -1145,7 +1145,7 @@ mod tests {
         h.pump().await; // Settle: not enough yet
         assert!(!granted(&made, &h.sent(BOB)));
         vote(&mut h, CAROL, &made, BOB, true);
-        assert!(matches!(h.events().as_slice(), [Event::Approved { by, have: 2, need: 2, .. }] if by == "carolFox"));
+        assert!(matches!(h.events().as_slice(), [Event::Approved { by, have: 2, need: 2, .. }] if by == "carolWolf"));
         h.pump().await; // Settle
         assert!(granted(&made, &h.sent(BOB)), "we approved, so we hand over the secret");
     }
@@ -1195,7 +1195,7 @@ mod tests {
         vote(&mut h, CAROL, &made, BOB, false);
         assert_eq!(
             h.events(),
-            vec![request_ended(&made.name, "bobRoger", RequestEnd::Denied { by: "carolFox".into() })]
+            vec![request_ended(&made.name, "bobRoger", RequestEnd::Denied { by: "carolWolf".into() })]
         );
         assert!(h.node.rooms.joined[&made.id].requests.is_empty());
     }
@@ -1312,7 +1312,7 @@ mod tests {
         assert_eq!(h.events(), vec![request_ended(&made.name, "bobRoger", RequestEnd::Gone)]);
         let conn = h.node.peers[&CAROL].conn;
         h.node.handle_msg(NodeMsg::PeerGone { conn, id: CAROL, reason: crate::api::LeaveReason::Lost });
-        assert!(h.events().contains(&request_ended(&made.name, "carolFox", RequestEnd::Gone)));
+        assert!(h.events().contains(&request_ended(&made.name, "carolWolf", RequestEnd::Gone)));
     }
 
     #[tokio::test]
@@ -1367,7 +1367,7 @@ mod tests {
         let RoomBody::Probe { nonce: probe } = &sent[0] else { panic!("{sent:?}") };
         assert!(matches!(&sent[1], RoomBody::Here { echo: None, .. }));
         deliver(&mut h, CAROL, frame_from(CAROL, &keys, here(NAME, Some(probe))));
-        assert_eq!(h.events(), vec![Event::MemberJoined { room: NAME.into(), nick: "carolFox".into() }]);
+        assert_eq!(h.events(), vec![Event::MemberJoined { room: NAME.into(), nick: "carolWolf".into() }]);
         deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Chat { text: "welcome".into() }));
         assert!(matches!(h.events().as_slice(), [Event::Message { text, .. }] if text == "welcome"));
     }
@@ -1421,7 +1421,7 @@ mod tests {
         deliver(&mut h, CAROL, frame_from(CAROL, &door(), RoomBody::Refuse { full: false }));
         assert_eq!(
             h.events(),
-            vec![Event::JoinEnded { name: NAME.into(), why: JoinEnd::Denied { by: "carolFox".into() } }]
+            vec![Event::JoinEnded { name: NAME.into(), why: JoinEnd::Denied { by: "carolWolf".into() } }]
         );
         let (nonce, _) = start_join(&mut h).await;
         door_says(&mut h, BOB, &nonce, 2, 13);

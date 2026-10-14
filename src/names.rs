@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn nick_and_room_shapes() {
         assert!(is_valid_nick("bobRoger"));
-        assert!(is_valid_nick("b2Fox"));
+        assert!(is_valid_nick("b2Wolf"));
         assert!(!is_valid_nick("bob")); // no word
         assert!(!is_valid_nick("Roger")); // empty base
         assert!(!is_valid_nick("bobZzz")); // not a listed word

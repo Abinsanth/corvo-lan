@@ -443,7 +443,7 @@ mod tests {
         let mut s = Session::new(false);
         s.on_event(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
-        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "carolFox".into() }, 0);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "carolWolf".into() }, 0);
         s.on_event(
             &Event::RoomJoined {
                 name: "catPieR".into(),
@@ -530,7 +530,7 @@ mod tests {
         let (x, y) = find(&buf, "● bobRoger").unwrap();
         assert_eq!(buf[(x, y)].fg, Color::Green);
         assert!(find(&buf, "online").is_some());
-        assert!(find(&buf, "● carolFox").is_some());
+        assert!(find(&buf, "● carolWolf").is_some());
         assert_eq!(state.hit(x + 3, y), Some(Hit::Person("bobRoger".into())));
     }
 
@@ -568,7 +568,7 @@ mod tests {
         let mut s = session();
         let mut state = TuiState::new(true);
         state.select_tab(&mut s, 1);
-        assert!(find(&render(&s, &mut state, 69, 20), "● carolFox").is_none());
+        assert!(find(&render(&s, &mut state, 69, 20), "● carolWolf").is_none());
         let tiny = render(&s, &mut state, 39, 9);
         assert!(find(&tiny, "terminal too small").is_some());
     }
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn the_completion_list_sits_above_the_input_lined_up_with_the_word() {
-        let s = session(); // me: annMoon; online: bobRoger, carolFox
+        let s = session(); // me: annMoon; online: bobRoger, carolWolf
         let mut state = TuiState::new(true);
         state.editor.set("hi @".into());
         state.complete(&crate::ui::complete::Candidates::from_store(&s.store));
@@ -649,7 +649,7 @@ mod tests {
         // Input on row 18; a 2-item list is 4 rows tall (with borders): rows 14–17.
         // "hi " is 3 columns after the 2-column prompt, plus 1 for the border.
         assert_eq!(find(&buf, "@bobRoger"), Some((6, 15)));
-        assert_eq!(find(&buf, "@carolFox"), Some((6, 16)));
+        assert_eq!(find(&buf, "@carolWolf"), Some((6, 16)));
         assert!(buf[(6, 15)].modifier.contains(Modifier::REVERSED), "the choice is highlighted");
         assert!(!buf[(6, 16)].modifier.contains(Modifier::REVERSED));
     }

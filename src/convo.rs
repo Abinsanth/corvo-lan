@@ -411,11 +411,11 @@ mod tests {
             0,
         );
         s.switch(room("catPieR"));
-        s.apply(&Event::MemberJoined { room: "catPieR".into(), nick: "carolFox".into() }, 0);
+        s.apply(&Event::MemberJoined { room: "catPieR".into(), nick: "carolWolf".into() }, 0);
         s.apply(&Event::MemberLeft { room: "catPieR".into(), nick: "bobRoger".into() }, 0);
         let c = s.get(&room("catPieR")).unwrap();
-        assert_eq!(c.members.iter().cloned().collect::<Vec<_>>(), vec!["carolFox".to_string()]);
-        assert!(c.lines.iter().any(|l| l.kind == LineKind::Notice("@carolFox joined".into())));
+        assert_eq!(c.members.iter().cloned().collect::<Vec<_>>(), vec!["carolWolf".to_string()]);
+        assert!(c.lines.iter().any(|l| l.kind == LineKind::Notice("@carolWolf joined".into())));
         s.apply(&Event::RoomLeft { name: "catPieR".into() }, 0);
         assert!(s.get(&room("catPieR")).is_none());
         assert_eq!(s.current(), None);
@@ -424,14 +424,14 @@ mod tests {
     #[test]
     fn full_store_evicts_the_oldest_offline_dm_first() {
         let mut s = Store::new();
-        s.switch(dm("keepFox")); // offline, but older ones go first
+        s.switch(dm("keepWolf")); // offline, but older ones go first
         for i in 0..MAX_CONVS - 1 {
             s.apply(&Event::PeerJoined { id: PeerId::test(i as u64), nick: format!("p{i}Moon") }, 0);
             s.switch(dm(&format!("p{i}Moon")));
         }
-        s.switch(room("catPieR")); // store is full: keepFox is the only offline DM
+        s.switch(room("catPieR")); // store is full: keepWolf is the only offline DM
         assert_eq!(s.conversations().len(), MAX_CONVS);
-        assert!(s.get(&dm("keepFox")).is_none());
+        assert!(s.get(&dm("keepWolf")).is_none());
         assert!(s.get(&room("catPieR")).is_some());
     }
 
@@ -547,9 +547,9 @@ mod tests {
     #[test]
     fn online_people_are_listed_in_order_and_created_rooms_show_their_key() {
         let mut s = Store::new();
-        s.apply(&Event::PeerJoined { id: PeerId::test(2), nick: "carolFox".into() }, 0);
+        s.apply(&Event::PeerJoined { id: PeerId::test(2), nick: "carolWolf".into() }, 0);
         s.apply(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0);
-        assert_eq!(s.online().cloned().collect::<Vec<_>>(), vec!["bobRoger", "carolFox"]);
+        assert_eq!(s.online().cloned().collect::<Vec<_>>(), vec!["bobRoger", "carolWolf"]);
         s.apply(&Event::RoomCreated { name: "catPieR".into(), key: "k7m9xq".into(), max: 5 }, 0);
         let c = s.get(&room("catPieR")).unwrap();
         assert_eq!(
@@ -578,13 +578,13 @@ mod tests {
         let c = s.get(&room("catPieR")).unwrap();
         assert_eq!(c.waiting.get("bobRoger"), Some(&(0, 2)));
         assert_eq!(c.unread, 2, "requests are worth a look from another tab");
-        s.apply(&Event::Approved { room: r(), nick: "bobRoger".into(), by: "carolFox".into(), have: 1, need: 2 }, 0);
+        s.apply(&Event::Approved { room: r(), nick: "bobRoger".into(), by: "carolWolf".into(), have: 1, need: 2 }, 0);
         s.apply(&Event::Renamed { old: "bobRoger".into(), new: "bobPie".into() }, 0);
         assert_eq!(s.get(&room("catPieR")).unwrap().waiting.get("bobPie"), Some(&(1, 2)));
         s.apply(&Event::RequestEnded { room: r(), nick: "bobPie".into(), why: RequestEnd::Admitted }, 0);
         s.apply(&Event::RequestEnded { room: r(), nick: "daveOak".into(), why: RequestEnd::Full }, 0);
         assert!(s.get(&room("catPieR")).unwrap().waiting.is_empty());
-        for (nick, why) in [("eveOwl", RequestEnd::Denied { by: "carolFox".into() }), ("fredElk", RequestEnd::Gone)] {
+        for (nick, why) in [("eveOwl", RequestEnd::Denied { by: "carolWolf".into() }), ("fredElk", RequestEnd::Gone)] {
             s.apply(&Event::JoinRequest { room: r(), nick: nick.into(), have: 0, need: 1 }, 0);
             s.apply(&Event::RequestEnded { room: r(), nick: nick.into(), why }, 0);
         }
@@ -593,10 +593,10 @@ mod tests {
             [
                 "@bobRoger wants to join — /approve @bobRoger or /deny @bobRoger",
                 "@daveOak wants to join — /approve @daveOak or /deny @daveOak",
-                "@carolFox approved @bobRoger (1/2)",
+                "@carolWolf approved @bobRoger (1/2)",
                 "@daveOak couldn't join — the room is full",
                 "@eveOwl wants to join — /approve @eveOwl or /deny @eveOwl",
-                "@carolFox turned @eveOwl away",
+                "@carolWolf turned @eveOwl away",
                 "@fredElk wants to join — /approve @fredElk or /deny @fredElk",
                 "@fredElk stopped waiting",
             ]

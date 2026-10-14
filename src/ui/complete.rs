@@ -106,7 +106,7 @@ mod tests {
 
     fn cands() -> Candidates {
         Candidates {
-            nicks: vec!["bobRoger".into(), "bobKite".into(), "carolFox".into()],
+            nicks: vec!["bobRoger".into(), "bobKite".into(), "carolWolf".into()],
             rooms: vec!["catPieR".into()],
             waiting: vec!["daveOak".into()],
         }
@@ -172,7 +172,7 @@ mod tests {
     fn candidates_put_room_members_first_and_leave_me_out() {
         let mut s = Store::new();
         s.apply(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
-        for (i, n) in ["annMoon", "zoeOwl", "carolFox", "bobRoger"].iter().enumerate() {
+        for (i, n) in ["annMoon", "zoeOwl", "carolWolf", "bobRoger"].iter().enumerate() {
             s.apply(&Event::PeerJoined { id: PeerId::test(i as u64), nick: n.to_string() }, 0);
         }
         s.apply(
@@ -185,7 +185,7 @@ mod tests {
             s.apply(&Event::JoinRequest { room: room.into(), nick: nick.into(), have: 0, need: 1 }, 0);
         }
         let c = Candidates::from_store(&s);
-        assert_eq!(c.nicks, vec!["zoeOwl", "bobRoger", "carolFox"]);
+        assert_eq!(c.nicks, vec!["zoeOwl", "bobRoger", "carolWolf"]);
         assert_eq!(c.waiting, vec!["daveOak", "eveOwl"], "everyone waiting in any of my rooms, once");
         assert_eq!(c.rooms, vec!["catR", "dogR"]);
     }

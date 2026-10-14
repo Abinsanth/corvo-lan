@@ -170,15 +170,15 @@ mod tests {
 
     #[test]
     fn a_known_key_under_a_base_met_with_other_keys_is_judged_there() {
-        let s = met(&[(1, "eveFox", DAY), (2, "bobRoger", 2 * DAY)]);
+        let s = met(&[(1, "eveWolf", DAY), (2, "bobRoger", 2 * DAY)]);
         assert_eq!(s.judge(PeerId::test(1), "bobMoon", &[]), Judgement::KeyChanged { last_seen: 2 * DAY });
         assert_eq!(s.judge(PeerId::test(1), "bobMoon", &[PeerId::test(2)]), Judgement::Known);
     }
 
     #[test]
     fn a_known_key_under_a_new_base_nobody_else_used_is_silent() {
-        let s = met(&[(1, "eveFox", DAY)]);
-        assert_eq!(s.judge(PeerId::test(1), "carolFox", &[]), Judgement::Known);
+        let s = met(&[(1, "eveWolf", DAY)]);
+        assert_eq!(s.judge(PeerId::test(1), "carolWolf", &[]), Judgement::Known);
     }
 
     #[test]
@@ -190,8 +190,8 @@ mod tests {
     #[test]
     fn a_new_key_under_a_new_base_is_a_first_meeting() {
         let s = met(&[(1, "bobRoger", DAY)]);
-        assert_eq!(s.judge(PeerId::test(2), "carolFox", &[]), Judgement::FirstMeeting);
-        assert_eq!(Store::in_memory().judge(PeerId::test(2), "carolFox", &[]), Judgement::FirstMeeting);
+        assert_eq!(s.judge(PeerId::test(2), "carolWolf", &[]), Judgement::FirstMeeting);
+        assert_eq!(Store::in_memory().judge(PeerId::test(2), "carolWolf", &[]), Judgement::FirstMeeting);
     }
 
     #[test]
@@ -229,7 +229,7 @@ mod tests {
         for i in 0..MAX_ENTRIES as u64 {
             s.record(PeerId::test(i + 10), "bobRoger", i + 10);
         }
-        s.record(PeerId::test(1), "carolFox", 5_000);
+        s.record(PeerId::test(1), "carolWolf", 5_000);
         assert_eq!(s.entries.len(), MAX_ENTRIES);
         assert!(!s.entries.iter().any(|e| e.key == PeerId::test(10)), "the oldest went");
         assert!(s.entries.iter().any(|e| e.key == PeerId::test(1)));

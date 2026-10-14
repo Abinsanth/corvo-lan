@@ -780,7 +780,7 @@ pub(super) mod tests {
         let mut h = Harness::new();
         assert!(h.connect_key(BOB, "bobRoger", inb(7000)));
         h.events();
-        assert!(h.connect_key(BOB, "carolFox", out(9000)));
+        assert!(h.connect_key(BOB, "carolWolf", out(9000)));
         assert_eq!(h.node.nick_of(BOB), Some("bobRoger".to_string()));
         assert!(h.events().is_empty());
     }
@@ -791,7 +791,7 @@ pub(super) mod tests {
         h.connect(BOB, "bobRoger", true);
         h.events();
         let conn = h.node.peers[&BOB].conn;
-        h.node.on_frame(conn, BOB, Frame::Nick { nick: "eveFox".into() });
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "eveWolf".into() });
         assert!(h.events().is_empty());
         assert_eq!(h.node.nick_of(BOB), Some("bobRoger".to_string()));
         h.node.on_frame(conn, BOB, Frame::Nick { nick: "bobOtter".into() });
@@ -802,9 +802,9 @@ pub(super) mod tests {
     fn peer_count_is_capped() {
         let mut h = Harness::new();
         for i in 0..MAX_PEERS as u64 {
-            assert!(h.connect(PeerId::test(0x4000_0000_0000_0000 + i), &format!("p{i}Fox"), true));
+            assert!(h.connect(PeerId::test(0x4000_0000_0000_0000 + i), &format!("p{i}Wolf"), true));
         }
-        assert_eq!(h.connect_verdict(PeerId::test(0x5000_0000_0000_0000), "lateFox", out(1)), Verdict::Close);
+        assert_eq!(h.connect_verdict(PeerId::test(0x5000_0000_0000_0000), "lateWolf", out(1)), Verdict::Close);
         assert_eq!(h.node.peers.len(), MAX_PEERS);
     }
 
@@ -838,10 +838,10 @@ pub(super) mod tests {
     fn peer_rename_is_accepted_only_when_valid_and_free() {
         let mut h = Harness::new();
         h.connect(BOB, "bobRoger", true);
-        h.connect(CAROL, "carolFox", true);
+        h.connect(CAROL, "carolWolf", true);
         h.events();
         let conn = h.node.peers[&BOB].conn;
-        h.node.on_frame(conn, BOB, Frame::Nick { nick: "carolFox".into() }); // taken
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "carolWolf".into() }); // taken
         h.node.on_frame(conn, BOB, Frame::Nick { nick: "annMoon".into() }); // ours
         h.node.on_frame(conn, BOB, Frame::Nick { nick: "\u{1b}[2J".into() }); // invalid
         h.node.on_frame(conn, BOB, Frame::Nick { nick: "bobPie".into() });
@@ -854,13 +854,13 @@ pub(super) mod tests {
         let mut h = Harness::new();
         h.connect(BOB, "bobRoger", false);
         h.events();
-        let words = ["Pie", "Fox", "Owl", "Elk", "Bee"];
+        let words = ["Pie", "Wolf", "Owl", "Elk", "Bee"];
         for w in &words[..2] {
             let conn = h.node.peers[&BOB].conn;
             h.node.on_frame(conn, BOB, Frame::Nick { nick: format!("bob{w}") });
         }
         // A duplicate connection replacing the first doesn't reset the count.
-        h.connect(BOB, "bobFox", true);
+        h.connect(BOB, "bobWolf", true);
         for w in &words[2..] {
             let conn = h.node.peers[&BOB].conn;
             h.node.on_frame(conn, BOB, Frame::Nick { nick: format!("bob{w}") });
@@ -968,7 +968,7 @@ pub(super) mod tests {
     fn dm_goes_only_to_its_target_and_is_recorded() {
         let mut h = Harness::new();
         h.connect(BOB, "bobRoger", true);
-        h.connect(CAROL, "carolFox", true);
+        h.connect(CAROL, "carolWolf", true);
         h.events();
         h.node.handle_command(dm("bobRoger", "psst"));
         assert!(matches!(h.sent(BOB).as_slice(), [Frame::Direct { text, .. }] if text == "psst"));
