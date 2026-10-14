@@ -34,6 +34,11 @@ pub fn is_valid_room(name: &str) -> bool {
     name.strip_suffix('R').is_some_and(is_valid_nick)
 }
 
+/// `bobRoger` → `bob`: the part the user chose. `None` if `nick` isn't a valid nick.
+pub fn base_of(nick: &str) -> Option<&str> {
+    WORDS.iter().find_map(|w| nick.strip_suffix(w).filter(|base| validate_base(base).is_ok()))
+}
+
 /// `base + Word` for the first shuffled word whose name isn't taken.
 pub fn pick_nick(base: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
     pick(base, "", taken)
@@ -81,6 +86,14 @@ mod tests {
         assert!(is_valid_room("catPieR"));
         assert!(!is_valid_room("catPie"));
         assert!(!is_valid_room("catR"));
+    }
+
+    #[test]
+    fn base_is_the_nick_without_its_word() {
+        assert_eq!(base_of("bobRoger"), Some("bob"));
+        assert_eq!(base_of("Team42Moon"), Some("Team42"));
+        assert_eq!(base_of("bob"), None);
+        assert_eq!(base_of("Roger"), None, "no base left");
     }
 
     #[test]

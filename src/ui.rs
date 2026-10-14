@@ -146,7 +146,7 @@ mod tests {
     }
 
     fn joined(n: u64) -> Event {
-        Event::PeerJoined { id: PeerId(n), nick: format!("p{n}Fox") }
+        Event::PeerJoined { id: PeerId::test(n), nick: format!("p{n}Fox") }
     }
 
     #[tokio::test]

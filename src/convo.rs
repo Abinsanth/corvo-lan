@@ -166,7 +166,7 @@ impl Store {
                     push(c, Line { ts: now, kind: LineKind::Notice(format!("@{nick} left")) });
                 }
             }
-            Event::Peers(_) | Event::Error(_) | Event::Info(_) => {}
+            Event::Peers { .. } | Event::Error(_) | Event::Info(_) => {}
         }
     }
 
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn dm_partners_go_offline_and_back() {
         let mut s = Store::new();
-        let id = PeerId(1);
+        let id = PeerId::test(1);
         s.apply(&Event::PeerJoined { id, nick: "bobRoger".into() }, 0);
         s.switch(dm("bobRoger"));
         assert!(!s.get(&dm("bobRoger")).unwrap().offline);
@@ -347,7 +347,7 @@ mod tests {
         let mut s = Store::new();
         s.switch(dm("keepFox")); // offline, but older ones go first
         for i in 0..MAX_CONVS - 1 {
-            s.apply(&Event::PeerJoined { id: PeerId(i as u64), nick: format!("p{i}Moon") }, 0);
+            s.apply(&Event::PeerJoined { id: PeerId::test(i as u64), nick: format!("p{i}Moon") }, 0);
             s.switch(dm(&format!("p{i}Moon")));
         }
         s.switch(room("catPieR")); // store is full: keepFox is the only offline DM
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn a_renamed_peer_keeps_its_dm_and_room_membership() {
         let mut s = Store::new();
-        s.apply(&Event::PeerJoined { id: PeerId(1), nick: "bobRoger".into() }, 0);
+        s.apply(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0);
         s.apply(&Event::RoomJoined { name: "catPieR".into(), members: vec!["bobRoger".into()] }, 0);
         s.apply(&msg(dm("bobRoger"), "bobRoger", "psst"), 0);
         s.switch(dm("bobRoger"));
@@ -380,7 +380,7 @@ mod tests {
         let mut s = Store::new();
         let at = |conv, text: &str, ts| Event::Message { conv, from: "x".into(), text: text.into(), ts };
         s.apply(&at(dm("bobPie"), "older bobPie", 1), 0); // someone who went offline
-        s.apply(&Event::PeerJoined { id: PeerId(1), nick: "bobRoger".into() }, 0);
+        s.apply(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0);
         s.apply(&at(dm("bobRoger"), "from bobRoger", 2), 0);
         s.apply(&Event::Renamed { old: "bobRoger".into(), new: "bobPie".into() }, 0);
 
@@ -414,8 +414,8 @@ mod tests {
     #[test]
     fn online_people_are_listed_in_order_and_created_rooms_show_their_key() {
         let mut s = Store::new();
-        s.apply(&Event::PeerJoined { id: PeerId(2), nick: "carolFox".into() }, 0);
-        s.apply(&Event::PeerJoined { id: PeerId(1), nick: "bobRoger".into() }, 0);
+        s.apply(&Event::PeerJoined { id: PeerId::test(2), nick: "carolFox".into() }, 0);
+        s.apply(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0);
         assert_eq!(s.online().cloned().collect::<Vec<_>>(), vec!["bobRoger", "carolFox"]);
         s.apply(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
         let c = s.get(&room("catPieR")).unwrap();

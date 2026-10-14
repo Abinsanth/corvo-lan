@@ -62,6 +62,14 @@ while dragging, or switch to `/line`.
 Prefer a plain prompt? Start with `--line`, or type `/line` (and `/tui` to come
 back). Line mode is also used automatically when output isn't a terminal.
 
+### Encryption
+
+Everything between machines is encrypted, and each machine has its own key,
+kept in `~/.config/corvo-lan/`. `/who` shows a short fingerprint for everyone
+(and you); compare them in person if you want to be sure who you're talking
+to. If someone you've met before shows up with a different key, corvo-lan
+warns you.
+
 ### Updating
 
 Type `/update` to see newer versions, then `/update yes` to install the

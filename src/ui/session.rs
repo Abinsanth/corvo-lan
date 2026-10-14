@@ -261,7 +261,7 @@ mod tests {
     fn session() -> Session {
         let mut s = Session::new(Style::plain());
         s.on_event(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
-        s.on_event(&Event::PeerJoined { id: PeerId(2), nick: "bobRoger".into() }, 0);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
         s
     }
 
@@ -442,7 +442,7 @@ mod tests {
         let mut s = Session::new(Style { color: true });
         s.set_mode(Mode::Tui);
         assert!(s.color());
-        let text = s.on_event(&Event::PeerJoined { id: PeerId(3), nick: "daveElk".into() }, 0).unwrap();
+        let text = s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "daveElk".into() }, 0).unwrap();
         assert!(!text.contains('\x1b'), "{text:?}");
         s.on_event(
             &Event::Message { conv: Conv::Dm("daveElk".into()), from: "daveElk".into(), text: "x".into(), ts: 0 },
@@ -450,7 +450,9 @@ mod tests {
         );
         assert_eq!(typed(&mut s, "/chat @daveElk"), Reaction::default());
         s.set_mode(Mode::Line);
-        assert!(s.on_event(&Event::PeerJoined { id: PeerId(4), nick: "eveOwl".into() }, 0).unwrap().contains('\x1b'));
+        assert!(
+            s.on_event(&Event::PeerJoined { id: PeerId::test(4), nick: "eveOwl".into() }, 0).unwrap().contains('\x1b')
+        );
     }
 
     #[test]

@@ -67,7 +67,7 @@ pub enum Tone {
 }
 
 /// Info texts that are warnings. The node doesn't label them, so match wording.
-const WARN_MARKERS: &[&str] = &["sending too fast", "clock is", "already running"];
+const WARN_MARKERS: &[&str] = &["sending too fast", "clock is", "already running", "different key"];
 
 pub fn tone_of(event: &Event) -> Tone {
     match event {
@@ -195,11 +195,14 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
         Event::MemberLeft { room, nick } => {
             notice(now, &format!("{} {} {}", s.nick(nick), s.tone(Tone::Bad, "left"), s.room(room)), s)
         }
-        Event::Peers(peers) if peers.is_empty() => "* no peers connected".into(),
-        Event::Peers(peers) => {
+        Event::Peers { you, nick, peers } if peers.is_empty() => {
+            format!("* no peers connected — you are {}, fingerprint {}", s.nick(nick), you.fingerprint())
+        }
+        Event::Peers { you, nick, peers } => {
             let mut out = format!("* {} peer(s) online:", peers.len());
+            out.push_str(&format!("\n  {:<16} {}", format!("you {}", s.nick(nick)), you.fingerprint()));
             for p in peers {
-                out.push_str(&format!("\n  {:<16} {}  {}", s.nick(&p.nick), p.id, p.addr));
+                out.push_str(&format!("\n  {:<16} {}  {}", s.nick(&p.nick), p.id.fingerprint(), p.addr));
             }
             out
         }
@@ -317,17 +320,28 @@ mod tests {
         assert_eq!(event(&joined, 0, &P).unwrap(), "* joined #catPieR with @bobRoger, @carolFox");
         let member = Event::MemberJoined { room: "catPieR".into(), nick: "carolFox".into() };
         assert_eq!(event(&member, 0, &P).unwrap(), format!("{} * @carolFox joined #catPieR", t(0)));
-        let lost = Event::PeerLeft { id: PeerId(1), nick: "bobRoger".into(), reason: LeaveReason::Lost };
+        let lost = Event::PeerLeft { id: PeerId::test(1), nick: "bobRoger".into(), reason: LeaveReason::Lost };
         assert_eq!(event(&lost, 0, &P).unwrap(), format!("{} * @bobRoger went offline (connection lost)", t(0)));
         let assigned = Event::Assigned { nick: "annMoon".into(), renamed: false };
         assert_eq!(event(&assigned, 0, &P).unwrap(), "* the system assigned you @annMoon — this name can't be changed");
-        let peers = Event::Peers(vec![PeerInfo {
-            id: PeerId(1),
-            nick: "bobRoger".into(),
-            addr: "10.0.0.2:5000".parse().unwrap(),
-        }]);
+        let peers = Event::Peers {
+            you: PeerId::test(0x7f3a_9c0d_12e4_5b68),
+            nick: "annMoon".into(),
+            peers: vec![PeerInfo {
+                id: PeerId::test(0xa1b2_c3d4_e5f6_0718),
+                nick: "bobRoger".into(),
+                addr: "10.0.0.2:5000".parse().unwrap(),
+            }],
+        };
         let text = event(&peers, 0, &P).unwrap();
-        assert!(text.contains("@bobRoger") && text.contains("10.0.0.2:5000"));
+        let you = format!("\n  {:<16} 7f3a 9c0d 12e4 5b68", "you @annMoon");
+        let bob = format!("\n  {:<16} a1b2 c3d4 e5f6 0718  10.0.0.2:5000", "@bobRoger");
+        assert_eq!(text, format!("* 1 peer(s) online:{you}{bob}"));
+        let alone = Event::Peers { you: PeerId::test(0x7f3a_9c0d_12e4_5b68), nick: "annMoon".into(), peers: vec![] };
+        assert_eq!(
+            event(&alone, 0, &P).unwrap(),
+            "* no peers connected — you are @annMoon, fingerprint 7f3a 9c0d 12e4 5b68"
+        );
     }
 
     #[test]
@@ -398,11 +412,14 @@ mod tests {
     #[test]
     fn events_have_tones() {
         let nick = || "bobRoger".to_string();
-        assert_eq!(tone_of(&Event::PeerJoined { id: PeerId(1), nick: nick() }), Tone::Good);
+        assert_eq!(tone_of(&Event::PeerJoined { id: PeerId::test(1), nick: nick() }), Tone::Good);
         assert_eq!(tone_of(&Event::MemberJoined { room: "r".into(), nick: nick() }), Tone::Good);
         assert_eq!(tone_of(&Event::RoomCreated { name: "r".into(), key: "k".into() }), Tone::Good);
         assert_eq!(tone_of(&Event::RoomJoined { name: "r".into(), members: vec![] }), Tone::Good);
-        assert_eq!(tone_of(&Event::PeerLeft { id: PeerId(1), nick: nick(), reason: LeaveReason::Quit }), Tone::Bad);
+        assert_eq!(
+            tone_of(&Event::PeerLeft { id: PeerId::test(1), nick: nick(), reason: LeaveReason::Quit }),
+            Tone::Bad
+        );
         assert_eq!(tone_of(&Event::MemberLeft { room: "r".into(), nick: nick() }), Tone::Bad);
         assert_eq!(tone_of(&Event::RoomLeft { name: "r".into() }), Tone::Bad);
         assert_eq!(tone_of(&Event::Error("x".into())), Tone::Bad);
@@ -412,7 +429,10 @@ mod tests {
             Tone::Warn
         );
         assert_eq!(tone_of(&Event::Info("looking for peers…".into())), Tone::Plain);
-        assert_eq!(tone_of(&Event::Peers(vec![])), Tone::Plain);
+        assert_eq!(tone_of(&Event::Peers { you: PeerId::test(1), nick: "annMoon".into(), peers: vec![] }), Tone::Plain);
+        let changed = "@bobMoon has a different key from the bob you met before (last seen 2026-10-12). Compare fingerprints in /who.";
+        assert_eq!(tone_of(&Event::Info(changed.into())), Tone::Warn);
+        assert_eq!(tone_of(&Event::Info("first time meeting @bobRoger (7f3a 9c0d 12e4 5b68)".into())), Tone::Plain);
     }
 
     #[test]
@@ -439,10 +459,11 @@ mod tests {
         assert_eq!(c.tone(Tone::Plain, "x"), "x");
         assert_eq!(c.toned("! nope"), "\x1b[31m! nope\x1b[0m");
         assert_eq!(P.tone(Tone::Bad, "x"), "x");
-        let online = event(&Event::PeerJoined { id: PeerId(1), nick: "bobRoger".into() }, 0, &c).unwrap();
+        let online = event(&Event::PeerJoined { id: PeerId::test(1), nick: "bobRoger".into() }, 0, &c).unwrap();
         assert!(online.contains("\x1b[32mis online\x1b[0m"), "{online:?}");
-        let gone = event(&Event::PeerLeft { id: PeerId(1), nick: "bobRoger".into(), reason: LeaveReason::Quit }, 0, &c)
-            .unwrap();
+        let gone =
+            event(&Event::PeerLeft { id: PeerId::test(1), nick: "bobRoger".into(), reason: LeaveReason::Quit }, 0, &c)
+                .unwrap();
         assert!(gone.contains("\x1b[31mwent offline\x1b[0m"), "{gone:?}");
         let error = event(&Event::Error("no room".into()), 0, &c).unwrap();
         assert_eq!(error, "\x1b[31m! no room\x1b[0m");
