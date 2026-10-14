@@ -9,6 +9,8 @@ pub mod noise;
 pub mod peer;
 pub mod protocol;
 pub mod room;
+#[cfg(test)]
+mod testutil;
 pub mod ui;
 pub mod update;
 pub mod words;

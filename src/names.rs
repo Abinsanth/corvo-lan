@@ -55,8 +55,28 @@ fn pick(base: &str, tail: &str, taken: impl Fn(&str) -> bool) -> Option<String> 
     words.iter().map(|w| format!("{base}{w}{tail}")).find(|name| !taken(name))
 }
 
+/// The base used when `--nick` isn't given: the login name's letters and
+/// digits, cut to `MAX_BASE_LEN`, or `anon` if nothing usable is left.
+pub fn default_base(login: Option<&str>) -> String {
+    let base: String =
+        login.unwrap_or_default().chars().filter(char::is_ascii_alphanumeric).take(MAX_BASE_LEN).collect();
+    if validate_base(&base).is_ok() { base } else { "anon".into() }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_base_makes_any_login_usable() {
+        assert_eq!(default_base(Some("abinsanth")), "abinsanth");
+        assert_eq!(default_base(Some("John Smith")), "JohnSmith");
+        assert_eq!(default_base(Some("j.doe")), "jdoe");
+        assert_eq!(default_base(Some("christopher")), "christoph");
+        assert_eq!(default_base(Some("José")), "Jos");
+        assert_eq!(default_base(Some("help")), "anon", "reserved");
+        assert_eq!(default_base(Some("...")), "anon");
+        assert_eq!(default_base(None), "anon");
+    }
+
     use super::*;
 
     #[test]
