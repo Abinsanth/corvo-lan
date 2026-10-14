@@ -513,6 +513,7 @@ impl Node {
             return if keep_new_connection(self.id, id, existing.key, entry.key) {
                 // Dropping the old sender retires the old connection.
                 entry.renames = existing.renames;
+                entry.nick = existing.nick.clone();
                 self.peers.insert(id, entry);
                 Verdict::Keep
             } else {
@@ -598,7 +599,7 @@ impl Node {
             Frame::Nick { nick: new } => {
                 let taken = new == self.my_nick() || self.peer_by_nick(&new).is_some_and(|other| other != id);
                 let used_up = self.peers.get(&id).is_some_and(|p| p.renames >= MAX_RENAMES);
-                if !names::is_valid_nick(&new) || taken || used_up {
+                if !names::is_valid_nick(&new) || taken || used_up || names::base_of(&new) != names::base_of(&nick) {
                     debug!(%id, "ignoring rename to {new:?}");
                     return;
                 }
@@ -762,6 +763,29 @@ pub(super) mod tests {
         assert!(!h.connect_key(BOB, "bobRoger", out(8500))); // same direction, higher port rejected
         let joins = h.events().into_iter().filter(|e| matches!(e, Event::PeerJoined { .. })).count();
         assert_eq!(joins, 1);
+    }
+
+    #[test]
+    fn duplicate_connection_keeps_the_existing_nick() {
+        let mut h = Harness::new();
+        assert!(h.connect_key(BOB, "bobRoger", inb(7000)));
+        h.events();
+        assert!(h.connect_key(BOB, "carolFox", out(9000)));
+        assert_eq!(h.node.nick_of(BOB), Some("bobRoger".to_string()));
+        assert!(h.events().is_empty());
+    }
+
+    #[test]
+    fn a_rename_to_another_base_is_refused() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bobRoger", true);
+        h.events();
+        let conn = h.node.peers[&BOB].conn;
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "eveFox".into() });
+        assert!(h.events().is_empty());
+        assert_eq!(h.node.nick_of(BOB), Some("bobRoger".to_string()));
+        h.node.on_frame(conn, BOB, Frame::Nick { nick: "bobOtter".into() });
+        assert_eq!(h.events(), vec![Event::Renamed { old: "bobRoger".into(), new: "bobOtter".into() }]);
     }
 
     #[test]
