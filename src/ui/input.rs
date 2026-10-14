@@ -34,6 +34,8 @@ pub enum Input {
         nick: String,
         room: Option<String>,
     },
+    /// Copy the join line for the current or named room.
+    Invite(Option<String>),
     Leave(Option<String>),
     Rooms,
     Chats,
@@ -55,8 +57,8 @@ const SIGIL_HINT: &str = "use @name for people or #name for rooms";
 /// Every command name `parse_line` accepts, aliases included. Completion and
 /// typo hints read it, so keep it in step with the match below.
 pub const COMMANDS: &[&str] = &[
-    "msg", "m", "chat", "c", "create", "approve", "deny", "leave", "close", "rooms", "chats", "who", "update", "help",
-    "h", "?", "quit", "q",
+    "msg", "m", "chat", "c", "create", "invite", "approve", "deny", "leave", "close", "rooms", "chats", "who",
+    "update", "help", "h", "?", "quit", "q",
 ];
 
 /// Names that were dropped, and the command that replaced each.
@@ -119,6 +121,11 @@ pub fn parse_line(line: &str) -> Input {
             let nick = nick.to_string();
             if name == "approve" { Input::Approve { nick, room } } else { Input::Deny { nick, room } }
         }
+        "invite" => match words.as_slice() {
+            [] => Input::Invite(None),
+            [room] if room.starts_with('#') => Input::Invite(Some(room[1..].to_string())),
+            _ => Input::Error("usage: /invite [#room]".into()),
+        },
         "leave" => match words.as_slice() {
             [] => Input::Leave(None),
             [room] if room.starts_with('#') => Input::Leave(Some(room[1..].to_string())),
@@ -240,6 +247,13 @@ mod tests {
         assert_eq!(parse_line("/leave #catPieR"), Input::Leave(Some("catPieR".into())));
         assert_eq!(parse_line("/leave catPieR"), err("usage: /leave [#room]"));
         assert_eq!(parse_line("/rooms"), Input::Rooms);
+    }
+
+    #[test]
+    fn invite_takes_an_optional_room() {
+        assert_eq!(parse_line("/invite"), Input::Invite(None));
+        assert_eq!(parse_line("/invite #catPieR"), Input::Invite(Some("catPieR".into())));
+        assert_eq!(parse_line("/invite catPieR"), err("usage: /invite [#room]"));
     }
 
     #[test]

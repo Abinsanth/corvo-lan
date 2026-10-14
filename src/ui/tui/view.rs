@@ -222,13 +222,32 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, session: &Session, state: &mut Tu
         };
         Line::from(Span::styled(format!(" {dot} {}", truncate(&clean(nick), SIDEBAR_WIDTH as usize - 4)), style))
     };
+    let mut invites: Vec<(usize, String)> = Vec::new();
     if let (false, Some(Conv::Room(room))) = (state.on_status, session.store.current()) {
+        invites.push((lines.len(), room.clone()));
         lines
             .push(Line::from(Span::styled(format!("#{}", clean(room)), Style::default().add_modifier(Modifier::BOLD))));
         if let Some(c) = session.store.get(&Conv::Room(room.clone())) {
+            let dim = tone_style(Tone::Dim, state.color);
+            if let Some(key) = &c.key {
+                invites.push((lines.len(), room.clone()));
+                lines.push(Line::from(Span::styled(format!("key {} ⧉", clean(key)), dim)));
+            }
+            if let Some(max) = c.max {
+                lines.push(Line::from(Span::styled(format!("{}/{max} members", c.members.len() + 1), dim)));
+            }
             for m in &c.members {
                 people.push((lines.len(), m.clone()));
                 lines.push(person(m, session.store.is_online(m)));
+            }
+            if !c.waiting.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled("waiting", dim)));
+                for (nick, (have, need)) in &c.waiting {
+                    let name = truncate(&clean(nick), SIDEBAR_WIDTH as usize - 8);
+                    let text = format!(" ? {name} {have}/{need}");
+                    lines.push(Line::from(Span::styled(text, tone_style(Tone::Warn, state.color))));
+                }
             }
         }
         lines.push(Line::raw(""));
@@ -241,6 +260,11 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, session: &Session, state: &mut Tu
     for (row, nick) in people {
         if (row as u16) < inner.height {
             state.add_hit(Rect::new(inner.x, inner.y + row as u16, inner.width, 1), Hit::Person(nick));
+        }
+    }
+    for (row, room) in invites {
+        if (row as u16) < inner.height {
+            state.add_hit(Rect::new(inner.x, inner.y + row as u16, inner.width, 1), Hit::Invite(room));
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -508,6 +532,26 @@ mod tests {
         assert!(find(&buf, "online").is_some());
         assert!(find(&buf, "● carolFox").is_some());
         assert_eq!(state.hit(x + 3, y), Some(Hit::Person("bobRoger".into())));
+    }
+
+    #[test]
+    fn a_room_sidebar_shows_its_key_size_and_waiting_list() {
+        let mut s = session();
+        let request = |nick: &str| Event::JoinRequest { room: "catPieR".into(), nick: nick.into(), have: 0, need: 1 };
+        s.on_event(&request("daveOak"), 0);
+        let approved =
+            Event::Approved { room: "catPieR".into(), nick: "daveOak".into(), by: "bobRoger".into(), have: 1, need: 2 };
+        s.on_event(&approved, 0);
+        let mut state = TuiState::new(false);
+        state.select_tab(&mut s, 1);
+        let buf = render(&s, &mut state, 80, 20);
+        let (x, y) = find(&buf, "key k7m9xq").unwrap_or_else(|| panic!("{:#?}", rows(&buf)));
+        assert!(find(&buf, "2/13 members").is_some());
+        assert!(find(&buf, "waiting").is_some());
+        assert!(find(&buf, "? daveOak 1/2").is_some(), "{:#?}", rows(&buf));
+        assert_eq!(state.hit(x, y), Some(Hit::Invite("catPieR".into())), "click the key to copy the invite");
+        let (hx, hy) = find(&buf, "#catPieR").filter(|(hx, _)| *hx > 50).unwrap_or((x, y - 1));
+        assert_eq!(state.hit(hx, hy), Some(Hit::Invite("catPieR".into())), "or the room name");
     }
 
     #[test]

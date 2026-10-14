@@ -1,5 +1,6 @@
 //! The UI: a shared `Session` and the full-screen TUI.
 
+pub mod clip;
 pub mod complete;
 pub mod input;
 pub mod render;

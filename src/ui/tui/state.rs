@@ -288,6 +288,8 @@ pub fn tabs(session: &Session) -> Vec<Tab> {
 pub enum Hit {
     Tab(usize),
     Person(String),
+    /// A room's name or key in the sidebar: copies its invite.
+    Invite(String),
 }
 
 /// Completion choices shown above the input.
