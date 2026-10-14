@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 
 use crate::api::{Command, Conv, Event, LeaveReason, PeerInfo, Target};
 use crate::discovery::{self, Sighting};
+use crate::identity::Keys;
 use crate::names;
 use crate::peer::{self, ConnId, Me};
 use crate::protocol::{Frame, MAX_FRAME_LEN, PeerId, now_millis};
@@ -41,6 +42,8 @@ const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 pub struct NodeConfig {
+    /// This machine's keypair; `keys.public` is our `PeerId`.
+    pub keys: Keys,
     /// What the user typed for `--nick`; the system adds a word.
     pub base: String,
     /// TCP listen address; port 0 lets the OS choose.
@@ -189,6 +192,7 @@ struct Backoff {
 
 struct Node {
     id: PeerId,
+    keys: Keys,
     /// What the user typed; kept to re-roll after a clash.
     base: String,
     /// Empty until assigned.
@@ -211,14 +215,14 @@ struct Node {
 /// Binds the listener, starts discovery and the actor. Returns immediately;
 /// `Event::Assigned` follows once the naming window is over.
 pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
-    let id = PeerId::random();
+    let id = config.keys.public;
     let listener = TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (msg_tx, msg_rx) = mpsc::channel(256);
-    let mut node = Node::new(id, config.base, event_tx, msg_tx.clone());
+    let mut node = Node::new(config.keys, config.base, event_tx, msg_tx.clone());
     node.naming = Some(HashSet::new());
     node.fixed_word = config.fixed_word;
     node.listener = Some(listener);
@@ -256,9 +260,10 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
 }
 
 impl Node {
-    fn new(id: PeerId, base: String, events: mpsc::UnboundedSender<Event>, msg_tx: mpsc::Sender<NodeMsg>) -> Self {
+    fn new(keys: Keys, base: String, events: mpsc::UnboundedSender<Event>, msg_tx: mpsc::Sender<NodeMsg>) -> Self {
         Node {
-            id,
+            id: keys.public,
+            keys,
             base,
             nick: watch::Sender::new(String::new()),
             naming: None,
@@ -276,7 +281,7 @@ impl Node {
     }
 
     fn me(&self) -> Me {
-        Me { id: self.id, nick: self.nick.subscribe() }
+        Me { keys: self.keys.clone(), nick: self.nick.subscribe() }
     }
 
     fn my_nick(&self) -> String {
@@ -606,7 +611,7 @@ pub(super) mod tests {
         pub(in crate::node) fn new() -> Self {
             let (event_tx, events) = mpsc::unbounded_channel();
             let (msg_tx, msgs) = mpsc::channel(64);
-            let node = Node::new(ME, "ann".into(), event_tx, msg_tx);
+            let node = Node::new(Keys::fake(ME), "ann".into(), event_tx, msg_tx);
             node.nick.send_replace("annMoon".into());
             Harness { node, events, msgs, outboxes: HashMap::new(), next_conn: 1 }
         }

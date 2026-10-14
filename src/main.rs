@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use anyhow::anyhow;
 use clap::Parser;
 
+use corvo_lan::identity::Keys;
 use corvo_lan::names;
 use corvo_lan::node::{self, NodeConfig};
 use corvo_lan::ui;
@@ -48,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
     names::validate_base(&base).map_err(|e| anyhow!("invalid --nick {base:?}: {e}"))?;
 
     let handle = node::start(NodeConfig {
+        keys: Keys::generate(),
         base,
         listen: SocketAddr::from(([0, 0, 0, 0], args.port)),
         discovery: true,

@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use corvo_lan::api::{Command, Conv, Event, LeaveReason, Target};
+use corvo_lan::identity::Keys;
 use corvo_lan::node::{self, NodeConfig, NodeHandle};
 use tokio::time::timeout;
 
@@ -19,6 +20,7 @@ async fn spawn_node(base: &str, peers: &[SocketAddr]) -> Peer {
 
 async fn spawn_node_with_word(base: &str, peers: &[SocketAddr], word: Option<&str>) -> Peer {
     let mut node = node::start(NodeConfig {
+        keys: Keys::generate(),
         base: base.into(),
         listen: "127.0.0.1:0".parse().unwrap(),
         discovery: false,
