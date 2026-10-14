@@ -85,7 +85,8 @@ with a different key, corvo-lan warns you.
 
 Type `/update` to see newer versions, then `/update yes` to install the
 newest one; restart corvo-lan to use it. On Windows the old version is set
-aside as `corvo-lan.old.exe` and deleted the next time corvo-lan starts. At
+aside as `corvo-lan.old.exe` and deleted the next time corvo-lan starts; `/update` there needs Windows 10
+version 1803 or newer, which has the built-in curl and tar. At
 startup corvo-lan makes one request to GitHub to see whether a newer version
 exists. That request sends only your IP address and the app version; turn it
 off with `--no-update-check` or `CORVO_LAN_NO_UPDATE_CHECK=1`. Nothing else
