@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Windows sets USERNAME rather than USER.
     let login = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok();
-    let base = args.nick.unwrap_or_else(|| names::default_base(login.as_deref()));
+    let base = args.nick.map(|n| n.to_ascii_lowercase()).unwrap_or_else(|| names::default_base(login.as_deref()));
     names::validate_base(&base).map_err(|e| anyhow!("invalid --nick {base:?}: {e}"))?;
 
     // Holds the identity lock until the app exits.

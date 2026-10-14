@@ -128,7 +128,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let reply = timeout_at(deadline, hello).await.ok().context("no hello within 5s")??;
     match reply {
         Frame::Hello { v, .. } if v != PROTOCOL_VERSION => bail!("unsupported protocol version {v}"),
-        Frame::Hello { nick, .. } if !names::is_valid_nick(&nick) => bail!("invalid nick {nick:?}"),
+        Frame::Hello { nick, .. } if !names::is_valid_name(&nick) => bail!("invalid nick {nick:?}"),
         Frame::Hello { nick, .. } => Ok((id, nick, sealer, opener)),
         other => bail!("expected hello, got {other:?}"),
     }
@@ -333,7 +333,7 @@ mod tests {
 
     /// Our side of `handshake` against a peer that finishes Noise and then sends `hello`.
     async fn against(hello: Frame) -> anyhow::Result<(PeerId, String, Sealer, Opener)> {
-        let (_tx, me) = me("annMoon");
+        let (_tx, me) = me("annmoon");
         let (mut ours, mut theirs) = tokio::io::duplex(1 << 16);
         let them = Keys::generate();
         let peer = async move {
@@ -347,13 +347,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_good_hello_gives_the_peers_nick() {
-        let (_, nick, _, _) = against(Frame::Hello { v: PROTOCOL_VERSION, nick: "bobRoger".into() }).await.unwrap();
-        assert_eq!(nick, "bobRoger");
+        let (_, nick, _, _) = against(Frame::Hello { v: PROTOCOL_VERSION, nick: "bobroger".into() }).await.unwrap();
+        assert_eq!(nick, "bobroger");
     }
 
     #[tokio::test]
     async fn a_hello_with_another_version_is_refused() {
-        let err = against(Frame::Hello { v: 2, nick: "bobRoger".into() }).await.err().unwrap();
+        let err = against(Frame::Hello { v: 2, nick: "bobroger".into() }).await.err().unwrap();
         assert_eq!(format!("{err:#}"), "unsupported protocol version 2");
     }
 
@@ -365,7 +365,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_hello_shares_the_handshake_deadline() {
-        let (_tx, me) = me("annMoon");
+        let (_tx, me) = me("annmoon");
         let (mut ours, mut theirs) = tokio::io::duplex(1 << 16);
         let them = Keys::generate();
         let start = tokio::time::Instant::now();

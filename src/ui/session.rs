@@ -344,8 +344,8 @@ mod tests {
 
     fn session() -> Session {
         let mut s = Session::new(false);
-        s.on_event(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
-        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
+        s.on_event(&Event::Assigned { nick: "annmoon".into(), renamed: false }, 0);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobroger".into() }, 0);
         s
     }
 
@@ -363,37 +363,37 @@ mod tests {
     fn plain_text_goes_to_the_current_conversation() {
         let mut s = session();
         assert_eq!(typed(&mut s, "hello").print, vec!["! no conversation — /chat @nick or /create <name>"]);
-        assert_eq!(typed(&mut s, "/chat @bobRoger"), Reaction::default());
-        assert_eq!(s.store.current(), Some(&Conv::Dm("bobRoger".into())));
-        assert_eq!(typed(&mut s, "hello"), send(Target::Dm("bobRoger".into()), "hello"));
+        assert_eq!(typed(&mut s, "/chat @bobroger"), Reaction::default());
+        assert_eq!(s.store.current(), Some(&Conv::Dm("bobroger".into())));
+        assert_eq!(typed(&mut s, "hello"), send(Target::Dm("bobroger".into()), "hello"));
     }
 
     #[test]
     fn creating_or_joining_a_room_switches_to_it() {
         let mut s = session();
         assert_eq!(typed(&mut s, "/create cat 5"), Reaction::send(Command::CreateRoom { base: "cat".into(), max: 5 }));
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into(), max: 13 }, 0);
-        assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
-        assert_eq!(typed(&mut s, "meow"), send(Target::Room("catPieR".into()), "meow"));
+        s.on_event(&Event::RoomCreated { name: "catpie".into(), key: "123-k7m9xq".into(), max: 13 }, 0);
+        assert_eq!(s.store.current(), Some(&Conv::Room("catpie".into())));
+        assert_eq!(typed(&mut s, "meow"), send(Target::Room("catpie".into()), "meow"));
 
         assert_eq!(
-            typed(&mut s, "/chat #dogFoxR 1-abcdef"),
-            Reaction::send(Command::JoinRoom { name: "dogFoxR".into(), key: "1-abcdef".into() })
+            typed(&mut s, "/chat #dogwolf 1-abcdef"),
+            Reaction::send(Command::JoinRoom { name: "dogwolf".into(), key: "1-abcdef".into() })
         );
-        assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())), "not until the join succeeds");
+        assert_eq!(s.store.current(), Some(&Conv::Room("catpie".into())), "not until the join succeeds");
         s.on_event(
             &Event::RoomJoined {
-                name: "dogFoxR".into(),
+                name: "dogwolf".into(),
                 key: "k7m9xq".into(),
                 max: 13,
-                members: vec!["bobRoger".into()],
+                members: vec!["bobroger".into()],
             },
             0,
         );
-        assert_eq!(s.store.current(), Some(&Conv::Room("dogFoxR".into())));
-        assert_eq!(typed(&mut s, "/chat #catPieR"), Reaction::default(), "already in: just switch");
-        assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
-        assert_eq!(typed(&mut s, "/chat #nopeMoonR").print, vec!["! join with /chat #nopeMoonR <key>"]);
+        assert_eq!(s.store.current(), Some(&Conv::Room("dogwolf".into())));
+        assert_eq!(typed(&mut s, "/chat #catpie"), Reaction::default(), "already in: just switch");
+        assert_eq!(s.store.current(), Some(&Conv::Room("catpie".into())));
+        assert_eq!(typed(&mut s, "/chat #nopemoon").print, vec!["! join with /chat #nopemoon <key>"]);
     }
 
     #[test]
@@ -439,82 +439,82 @@ mod tests {
         let mut s = session();
         for room in rooms {
             s.on_event(&Event::RoomCreated { name: room.to_string(), key: "k7m9xq".into(), max: 13 }, 0);
-            let request = Event::JoinRequest { room: room.to_string(), nick: "bobRoger".into(), have: 0, need: 1 };
+            let request = Event::JoinRequest { room: room.to_string(), nick: "bobroger".into(), have: 0, need: 1 };
             s.on_event(&request, 0);
         }
         s
     }
 
     fn approve(room: &str) -> Reaction {
-        Reaction::send(Command::Approve { room: room.into(), nick: "bobRoger".into() })
+        Reaction::send(Command::Approve { room: room.into(), nick: "bobroger".into() })
     }
 
     #[test]
     fn invite_copies_the_join_line() {
-        let mut s = bob_waits_in(&["catPieR"]);
+        let mut s = bob_waits_in(&["catpie"]);
         let copied = Reaction {
-            copy: Some("/chat #catPieR k7m9xq".into()),
+            copy: Some("/chat #catpie k7m9xq".into()),
             print: vec![
-                "* invite copied: /chat #catPieR k7m9xq (if it didn't copy, Shift/Option-drag to select it)".into(),
+                "* invite copied: /chat #catpie k7m9xq (if it didn't copy, Shift/Option-drag to select it)".into(),
             ],
             ..Default::default()
         };
-        s.store.switch(Conv::Room("catPieR".into()));
+        s.store.switch(Conv::Room("catpie".into()));
         assert_eq!(typed(&mut s, "/invite"), copied);
-        typed(&mut s, "/chat @bobRoger");
-        assert_eq!(typed(&mut s, "/invite #catPieR"), copied);
+        typed(&mut s, "/chat @bobroger");
+        assert_eq!(typed(&mut s, "/invite #catpie"), copied);
         assert_eq!(
             typed(&mut s, "/invite").print,
             vec!["! /invite works in a room tab, or name the room: /invite #room"]
         );
-        assert_eq!(typed(&mut s, "/invite #nopeMoonR").print, vec!["! you're not in #nopeMoonR"]);
+        assert_eq!(typed(&mut s, "/invite #nopemoon").print, vec!["! you're not in #nopemoon"]);
     }
 
     #[test]
     fn approve_finds_the_room_they_wait_in() {
-        let mut s = bob_waits_in(&["catPieR"]);
-        typed(&mut s, "/chat @bobRoger");
-        assert_eq!(typed(&mut s, "/approve @bobRoger"), approve("catPieR"));
+        let mut s = bob_waits_in(&["catpie"]);
+        typed(&mut s, "/chat @bobroger");
+        assert_eq!(typed(&mut s, "/approve @bobroger"), approve("catpie"));
         assert_eq!(
-            typed(&mut s, "/deny @bobRoger"),
-            Reaction::send(Command::Deny { room: "catPieR".into(), nick: "bobRoger".into() })
+            typed(&mut s, "/deny @bobroger"),
+            Reaction::send(Command::Deny { room: "catpie".into(), nick: "bobroger".into() })
         );
-        assert_eq!(typed(&mut s, "/approve @bobRoger #dogFoxR"), approve("dogFoxR"), "an explicit room is passed on");
+        assert_eq!(typed(&mut s, "/approve @bobroger #dogwolf"), approve("dogwolf"), "an explicit room is passed on");
         assert_eq!(
-            typed(&mut s, "/approve @carolFox").print,
-            vec!["! @carolFox isn't waiting to join any of your rooms"]
+            typed(&mut s, "/approve @carolwolf").print,
+            vec!["! @carolwolf isn't waiting to join any of your rooms"]
         );
     }
 
     #[test]
     fn approve_prefers_the_current_room() {
-        let mut s = bob_waits_in(&["catPieR", "dogFoxR"]);
-        s.store.switch(Conv::Room("catPieR".into()));
-        assert_eq!(typed(&mut s, "/approve @bobRoger"), approve("catPieR"));
+        let mut s = bob_waits_in(&["catpie", "dogwolf"]);
+        s.store.switch(Conv::Room("catpie".into()));
+        assert_eq!(typed(&mut s, "/approve @bobroger"), approve("catpie"));
     }
 
     #[test]
     fn approve_needs_a_room_when_ambiguous() {
-        let mut s = bob_waits_in(&["catPieR", "dogFoxR"]);
-        typed(&mut s, "/chat @bobRoger");
+        let mut s = bob_waits_in(&["catpie", "dogwolf"]);
+        typed(&mut s, "/chat @bobroger");
         assert_eq!(
-            typed(&mut s, "/approve @bobRoger").print,
-            vec!["! @bobRoger is waiting in #catPieR and #dogFoxR — say which: /approve @bobRoger #catPieR"]
+            typed(&mut s, "/approve @bobroger").print,
+            vec!["! @bobroger is waiting in #catpie and #dogwolf — say which: /approve @bobroger #catpie"]
         );
     }
 
     #[test]
     fn text_goes_where_the_prompt_pointed_even_if_a_join_switched_us() {
         let mut s = session();
-        typed(&mut s, "/chat @bobRoger");
-        typed(&mut s, "/chat #catPieR 1-abcdef");
-        // The user starts typing at the "@bobRoger> " prompt...
+        typed(&mut s, "/chat @bobroger");
+        typed(&mut s, "/chat #catpie 1-abcdef");
+        // The user starts typing at the "@bobroger> " prompt...
         let shown = s.store.current().cloned();
-        assert_eq!(shown, Some(Conv::Dm("bobRoger".into())));
+        assert_eq!(shown, Some(Conv::Dm("bobroger".into())));
         // ...and the join completes meanwhile, switching the current conversation.
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
-        assert_eq!(s.on_line("for bob only", shown.as_ref()), send(Target::Dm("bobRoger".into()), "for bob only"));
-        assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())), "the next prompt shows the room");
+        s.on_event(&Event::RoomJoined { name: "catpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
+        assert_eq!(s.on_line("for bob only", shown.as_ref()), send(Target::Dm("bobroger".into()), "for bob only"));
+        assert_eq!(s.store.current(), Some(&Conv::Room("catpie".into())), "the next prompt shows the room");
     }
 
     #[test]
@@ -525,44 +525,44 @@ mod tests {
         let shown = s.store.current().cloned();
         assert_eq!(shown, None);
         // ...the room arrives while the user types, and that's where they mean.
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into(), max: 13 }, 0);
-        assert_eq!(s.on_line("first!", shown.as_ref()), send(Target::Room("catPieR".into()), "first!"));
+        s.on_event(&Event::RoomCreated { name: "catpie".into(), key: "123-k7m9xq".into(), max: 13 }, 0);
+        assert_eq!(s.on_line("first!", shown.as_ref()), send(Target::Room("catpie".into()), "first!"));
     }
 
     #[test]
     fn leave_uses_the_current_room_or_the_named_one() {
         let mut s = session();
         assert_eq!(typed(&mut s, "/leave").print, vec!["! you're not in a room here — /leave #room"]);
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "1-abcdef".into(), max: 13 }, 0);
-        assert_eq!(typed(&mut s, "/leave"), Reaction::send(Command::LeaveRoom { name: "catPieR".into() }));
-        assert_eq!(typed(&mut s, "/leave #dogFoxR"), Reaction::send(Command::LeaveRoom { name: "dogFoxR".into() }));
-        s.on_event(&Event::RoomLeft { name: "catPieR".into() }, 0);
+        s.on_event(&Event::RoomCreated { name: "catpie".into(), key: "1-abcdef".into(), max: 13 }, 0);
+        assert_eq!(typed(&mut s, "/leave"), Reaction::send(Command::LeaveRoom { name: "catpie".into() }));
+        assert_eq!(typed(&mut s, "/leave #dogwolf"), Reaction::send(Command::LeaveRoom { name: "dogwolf".into() }));
+        s.on_event(&Event::RoomLeft { name: "catpie".into() }, 0);
         assert_eq!(s.store.current(), None);
     }
 
     #[test]
     fn chatting_with_yourself_or_someone_offline_is_refused() {
         let mut s = session();
-        assert_eq!(typed(&mut s, "/chat @annMoon").print, vec!["! that's you"]);
-        assert_eq!(typed(&mut s, "/chat @ghostMoon").print, vec!["! @ghostMoon is offline"]);
+        assert_eq!(typed(&mut s, "/chat @annmoon").print, vec!["! that's you"]);
+        assert_eq!(typed(&mut s, "/chat @ghostmoon").print, vec!["! @ghostmoon is offline"]);
     }
 
     #[test]
     fn switching_marks_read_and_says_nothing() {
         let mut s = session();
-        for text in ["one", "@annMoon two"] {
+        for text in ["one", "@annmoon two"] {
             s.on_event(
                 &Event::Message {
-                    conv: Conv::Dm("bobRoger".into()),
-                    from: "bobRoger".into(),
+                    conv: Conv::Dm("bobroger".into()),
+                    from: "bobroger".into(),
                     text: text.into(),
                     ts: 0,
                 },
                 0,
             );
         }
-        assert_eq!(typed(&mut s, "/chat @bobRoger"), Reaction::default(), "the tab already shows the counts");
-        let c = s.store.get(&Conv::Dm("bobRoger".into())).unwrap();
+        assert_eq!(typed(&mut s, "/chat @bobroger"), Reaction::default(), "the tab already shows the counts");
+        let c = s.store.get(&Conv::Dm("bobroger".into())).unwrap();
         assert_eq!((c.unread, c.mentions), (0, 0));
     }
 
@@ -579,14 +579,14 @@ mod tests {
     fn lines_are_plain_even_with_colour_on() {
         let mut s = Session::new(true);
         assert!(s.color());
-        let text = s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "daveElk".into() }, 0).unwrap();
+        let text = s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "daveelk".into() }, 0).unwrap();
         assert!(!text.contains('\x1b'), "{text:?}");
     }
 
     #[test]
     fn msg_who_quit_and_errors() {
         let mut s = session();
-        assert_eq!(typed(&mut s, "/msg @bobRoger hi"), send(Target::Dm("bobRoger".into()), "hi"));
+        assert_eq!(typed(&mut s, "/msg @bobroger hi"), send(Target::Dm("bobroger".into()), "hi"));
         assert_eq!(typed(&mut s, "/who"), Reaction::send(Command::ListPeers));
         assert!(typed(&mut s, "/quit").quit);
         assert!(typed(&mut s, "/q").quit);
@@ -595,27 +595,27 @@ mod tests {
 
     #[test]
     fn names_without_a_sigil_are_guessed() {
-        let mut s = session(); // me: annMoon; online: bobRoger
-        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobKite".into() }, 0);
-        s.on_event(&Event::PeerJoined { id: PeerId::test(4), nick: "carolFox".into() }, 0);
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
-        s.on_event(&Event::RoomJoined { name: "carolFoxR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
+        let mut s = session(); // me: annmoon; online: bobroger
+        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobkite".into() }, 0);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(4), nick: "carolwolf".into() }, 0);
+        s.on_event(&Event::RoomJoined { name: "catpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "carolpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
 
         assert_eq!(typed(&mut s, "/chat catp"), Reaction::default());
-        assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
-        assert_eq!(typed(&mut s, "/c CAROLFOX"), Reaction::default(), "an exact name wins, any case");
-        assert_eq!(s.store.current(), Some(&Conv::Dm("carolFox".into())));
+        assert_eq!(s.store.current(), Some(&Conv::Room("catpie".into())));
+        assert_eq!(typed(&mut s, "/c CAROLWOLF"), Reaction::default(), "an exact name wins, any case");
+        assert_eq!(s.store.current(), Some(&Conv::Dm("carolwolf".into())));
         assert_eq!(
             typed(&mut s, "/chat carol").print,
-            vec!["! \"carol\" matches @carolFox, #carolFoxR — be more specific"]
+            vec!["! \"carol\" matches @carolwolf, #carolpie — be more specific"]
         );
-        assert_eq!(typed(&mut s, "/chat bob").print, vec!["! \"bob\" matches @bobKite, @bobRoger — be more specific"]);
+        assert_eq!(typed(&mut s, "/chat bob").print, vec!["! \"bob\" matches @bobkite, @bobroger — be more specific"]);
         assert_eq!(
             typed(&mut s, "/chat ann").print,
             vec!["! no one or no room called \"ann\" — use @name for people or #name for rooms"],
             "never me"
         );
-        assert_eq!(typed(&mut s, "/msg bobk hi"), send(Target::Dm("bobKite".into()), "hi"));
+        assert_eq!(typed(&mut s, "/msg bobk hi"), send(Target::Dm("bobkite".into()), "hi"));
         assert_eq!(typed(&mut s, "/m catp hi").print, vec!["! no one called \"catp\" is online"], "/msg skips rooms");
     }
 
@@ -623,11 +623,11 @@ mod tests {
     fn a_long_list_of_guesses_is_cut_short() {
         let mut s = session();
         for i in 0..7 {
-            s.on_event(&Event::PeerJoined { id: PeerId::test(10 + i), nick: format!("zed{i}Owl") }, 0);
+            s.on_event(&Event::PeerJoined { id: PeerId::test(10 + i), nick: format!("zed{i}owl") }, 0);
         }
         assert_eq!(
             typed(&mut s, "/chat zed").print,
-            vec!["! \"zed\" matches @zed0Owl, @zed1Owl, @zed2Owl, @zed3Owl, @zed4Owl, … — be more specific"]
+            vec!["! \"zed\" matches @zed0owl, @zed1owl, @zed2owl, @zed3owl, @zed4owl, … — be more specific"]
         );
     }
 
@@ -644,13 +644,13 @@ mod tests {
     #[test]
     fn close_forgets_a_dm_but_not_a_room() {
         let mut s = session();
-        typed(&mut s, "/chat @bobRoger");
-        assert_eq!(typed(&mut s, "/close").print, vec!["* closed @bobRoger"]);
-        assert!(s.store.get(&Conv::Dm("bobRoger".into())).is_none());
+        typed(&mut s, "/chat @bobroger");
+        assert_eq!(typed(&mut s, "/close").print, vec!["* closed @bobroger"]);
+        assert!(s.store.get(&Conv::Dm("bobroger".into())).is_none());
         assert_eq!(typed(&mut s, "/close").print, vec!["! no chat to close here"]);
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
+        s.on_event(&Event::RoomJoined { name: "catpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         assert_eq!(typed(&mut s, "/close").print, vec!["! use /leave for rooms"]);
-        assert_eq!(typed(&mut s, "/close @ghostMoon").print, vec!["! no chat with @ghostMoon"]);
+        assert_eq!(typed(&mut s, "/close @ghostmoon").print, vec!["! no chat with @ghostmoon"]);
     }
 
     #[test]
@@ -662,9 +662,9 @@ mod tests {
         assert!(tidy_message(&vec!["x"; MAX_MESSAGE_LINES].join("\n")).is_ok());
 
         let mut s = session();
-        typed(&mut s, "/chat @bobRoger");
-        assert_eq!(typed(&mut s, "one\ntwo\n\n"), send(Target::Dm("bobRoger".into()), "one\ntwo"));
+        typed(&mut s, "/chat @bobroger");
+        assert_eq!(typed(&mut s, "one\ntwo\n\n"), send(Target::Dm("bobroger".into()), "one\ntwo"));
         assert_eq!(typed(&mut s, &long).print, vec![format!("! message has more than {MAX_MESSAGE_LINES} lines")]);
-        assert_eq!(typed(&mut s, "/msg @bobRoger a\nb\n"), send(Target::Dm("bobRoger".into()), "a\nb"));
+        assert_eq!(typed(&mut s, "/msg @bobroger a\nb\n"), send(Target::Dm("bobroger".into()), "a\nb"));
     }
 }

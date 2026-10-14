@@ -195,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn an_old_plaintext_hello_is_refused_at_the_preface() {
         let (mut ours, mut theirs) = duplex(1 << 16);
-        let body = br#"{"type":"hello","v":2,"id":"0000000000000001","nick":"bobRoger"}"#;
+        let body = br#"{"type":"hello","v":2,"id":"0000000000000001","nick":"bobroger"}"#;
         theirs.write_u32(body.len() as u32).await.unwrap();
         theirs.write_all(body).await.unwrap();
         let err = handshake(&mut ours, &Keys::generate(), false, None).await.err().unwrap();
@@ -234,7 +234,7 @@ mod tests {
         let ((mut seal, _), (_, mut open)) = test_pair().await;
         let (mut wr, mut rd) = duplex(1 << 20);
         let frames = vec![
-            Frame::Hello { v: PROTOCOL_VERSION, nick: "aliceMoon".into() },
+            Frame::Hello { v: PROTOCOL_VERSION, nick: "alicemoon".into() },
             Frame::Room { room_id: "ab".repeat(16), nonce: "cd".repeat(24), ct: "ef".repeat(20) },
             Frame::Direct { text: "psst".into(), ts: 2 },
             Frame::Nick { nick: "bob".into() },

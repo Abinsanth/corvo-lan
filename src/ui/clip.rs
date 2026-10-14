@@ -45,6 +45,6 @@ mod tests {
 
     #[test]
     fn osc52_wraps_the_text_for_the_clipboard() {
-        assert_eq!(osc52("/chat #catPieR k7m9xq"), "\x1b]52;c;L2NoYXQgI2NhdFBpZVIgazdtOXhx\x07");
+        assert_eq!(osc52("/chat #catpie k7m9xq"), "\x1b]52;c;L2NoYXQgI2NhdHBpZSBrN205eHE=\x07");
     }
 }

@@ -220,7 +220,7 @@ mod tests {
     /// Argon2 is slow, so derive the shared test room once.
     fn keys() -> &'static RoomKeys {
         static KEYS: OnceLock<RoomKeys> = OnceLock::new();
-        KEYS.get_or_init(|| derive("catPieR", "k7m9xq"))
+        KEYS.get_or_init(|| derive("catpie", "k7m9xq"))
     }
 
     fn chat(text: &str, ts: u64) -> RoomEnvelope {
@@ -256,10 +256,10 @@ mod tests {
     #[test]
     fn door_and_room_keys_differ_and_secret_derivation_is_deterministic() {
         let secret = [7u8; 32];
-        let room = from_secret("catPieR", &secret);
-        assert_eq!(room.id, from_secret("catPieR", &secret).id);
-        assert_ne!(room.id, from_secret("dogPieR", &secret).id);
-        assert_ne!(room.id, from_secret("catPieR", &[8; 32]).id);
+        let room = from_secret("catpie", &secret);
+        assert_eq!(room.id, from_secret("catpie", &secret).id);
+        assert_ne!(room.id, from_secret("dogpie", &secret).id);
+        assert_ne!(room.id, from_secret("catpie", &[8; 32]).id);
         assert_ne!(room.id, keys().id, "door and room ids never coincide");
         assert_ne!(new_secret(), new_secret());
     }
@@ -282,9 +282,9 @@ mod tests {
 
     #[test]
     fn derivation_is_deterministic_and_name_and_key_both_matter() {
-        assert_eq!(to_hex(&keys().id), to_hex(&derive("catPieR", "k7m9xq").id));
-        assert_ne!(keys().id, derive("dogPieR", "k7m9xq").id);
-        assert_ne!(keys().id, derive("catPieR", "k7m9xr").id);
+        assert_eq!(to_hex(&keys().id), to_hex(&derive("catpie", "k7m9xq").id));
+        assert_ne!(keys().id, derive("dogpie", "k7m9xq").id);
+        assert_ne!(keys().id, derive("catpie", "k7m9xr").id);
     }
 
     #[test]
@@ -303,7 +303,7 @@ mod tests {
         let frame = seal(keys(), ALICE, &chat("hi", 1000));
         let (_, nonce, ct) = parts(&frame);
         assert!(open(keys(), BOB, nonce, ct).is_none(), "relabelled sender");
-        let other = derive("catPieR", "k7m9xr");
+        let other = derive("catpie", "k7m9xr");
         assert!(open(&other, ALICE, nonce, ct).is_none(), "wrong key");
         let mut flipped = ct.to_string();
         let last = if flipped.ends_with('0') { '1' } else { '0' };

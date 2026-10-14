@@ -672,17 +672,17 @@ mod tests {
 
     fn session_with_tabs() -> Session {
         let mut s = Session::new(false);
-        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
-        s.on_event(&Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobroger".into() }, 0);
+        s.on_event(&Event::RoomJoined { name: "catpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         s.on_event(
-            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 },
+            &Event::Message { conv: Conv::Dm("bobroger".into()), from: "bobroger".into(), text: "x".into(), ts: 0 },
             0,
         );
         s
     }
 
     fn bobs() -> Candidates {
-        Candidates { nicks: vec!["bobRoger".into(), "bobKite".into(), "carolFox".into()], ..Default::default() }
+        Candidates { nicks: vec!["bobroger".into(), "bobkite".into(), "carolwolf".into()], ..Default::default() }
     }
 
     #[test]
@@ -690,21 +690,21 @@ mod tests {
         let mut t = TuiState::new(false);
         t.editor.set("hi @car".into());
         t.complete(&bobs());
-        assert_eq!(t.editor.text(), "hi @carolFox ");
+        assert_eq!(t.editor.text(), "hi @carolwolf ");
         assert_eq!(t.popup, None);
 
         t.editor.set("é @b".into());
         t.complete(&bobs());
         assert_eq!(t.editor.text(), "é @bob", "fills the shared prefix");
-        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobRoger", "@bobKite"]);
+        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobroger", "@bobkite"]);
         t.move_selection(1);
         t.accept();
-        assert_eq!(t.editor.text(), "é @bobKite ");
+        assert_eq!(t.editor.text(), "é @bobkite ");
         assert_eq!(t.popup, None);
 
         t.editor.set("line one\n@car".into());
         t.complete(&bobs());
-        assert_eq!(t.editor.text(), "line one\n@carolFox ");
+        assert_eq!(t.editor.text(), "line one\n@carolwolf ");
 
         t.editor.set("@zed".into());
         t.complete(&bobs());
@@ -720,7 +720,7 @@ mod tests {
         assert_eq!(t.popup.as_ref().unwrap().selected, 1);
         t.editor.insert('k');
         t.refresh_popup(&bobs());
-        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobKite"]);
+        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobkite"]);
         assert_eq!(t.popup.as_ref().unwrap().selected, 0);
         t.editor.insert(' ');
         t.refresh_popup(&bobs());
@@ -757,14 +757,14 @@ mod tests {
         let mut t = TuiState::new(false);
         assert_eq!(
             tabs(&s),
-            vec![Tab::Status, Tab::Conv(Conv::Room("catPieR".into())), Tab::Conv(Conv::Dm("bobRoger".into()))]
+            vec![Tab::Status, Tab::Conv(Conv::Room("catpie".into())), Tab::Conv(Conv::Dm("bobroger".into()))]
         );
         assert_eq!(t.current_tab(&s), 0);
         t.step_tab(&mut s, 1);
         assert_eq!(t.current_tab(&s), 1);
         t.step_tab(&mut s, 1);
-        assert_eq!(s.store.current(), Some(&Conv::Dm("bobRoger".into())));
-        assert_eq!(s.store.get(&Conv::Dm("bobRoger".into())).unwrap().unread, 0, "viewing marks read");
+        assert_eq!(s.store.current(), Some(&Conv::Dm("bobroger".into())));
+        assert_eq!(s.store.get(&Conv::Dm("bobroger".into())).unwrap().unread, 0, "viewing marks read");
         t.step_tab(&mut s, 1);
         assert!(t.on_status, "wraps to corvo");
         t.step_tab(&mut s, -1);
@@ -779,8 +779,8 @@ mod tests {
         let mut t = TuiState::new(false);
         t.select_tab(&mut s, 2);
         t.select_tab(&mut s, 0);
-        let bob = Conv::Dm("bobRoger".into());
-        s.on_event(&Event::Message { conv: bob.clone(), from: "bobRoger".into(), text: "hi".into(), ts: 0 }, 0);
+        let bob = Conv::Dm("bobroger".into());
+        s.on_event(&Event::Message { conv: bob.clone(), from: "bobroger".into(), text: "hi".into(), ts: 0 }, 0);
         assert_eq!(s.store.get(&bob).unwrap().unread, 1);
         assert_eq!(s.store.current(), None);
         assert_eq!(t.current_tab(&s), 0);
@@ -791,7 +791,7 @@ mod tests {
         let mut s = session_with_tabs();
         let mut t = TuiState::new(false);
         t.select_tab(&mut s, 2);
-        s.store.close(&Conv::Dm("bobRoger".into()));
+        s.store.close(&Conv::Dm("bobroger".into()));
         assert_eq!(t.current_tab(&s), 0, "no current conversation means the corvo tab");
         assert!(tabs(&s).len() == 2);
         t.step_tab(&mut s, 1);
@@ -816,9 +816,9 @@ mod tests {
     fn clicks_hit_what_was_drawn_there() {
         let mut t = TuiState::new(false);
         t.add_hit(Rect::new(0, 0, 7, 1), Hit::Tab(0));
-        t.add_hit(Rect::new(60, 3, 20, 1), Hit::Person("bobRoger".into()));
+        t.add_hit(Rect::new(60, 3, 20, 1), Hit::Person("bobroger".into()));
         assert_eq!(t.hit(3, 0), Some(Hit::Tab(0)));
-        assert_eq!(t.hit(79, 3), Some(Hit::Person("bobRoger".into())));
+        assert_eq!(t.hit(79, 3), Some(Hit::Person("bobroger".into())));
         assert_eq!(t.hit(80, 3), None);
         t.clear_hits();
         assert_eq!(t.hit(3, 0), None);

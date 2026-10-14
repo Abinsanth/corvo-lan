@@ -133,26 +133,26 @@ async fn join_room(p: &mut Peer, member: &mut Peer, name: &str, key: &str) -> Ve
 #[tokio::test]
 async fn names_are_assigned_from_the_base() {
     let (alice, bob) = pair().await;
-    assert!(alice.nick.starts_with("alice") && corvo_lan::names::is_valid_nick(&alice.nick));
-    assert!(bob.nick.starts_with("bob") && corvo_lan::names::is_valid_nick(&bob.nick));
+    assert!(alice.nick.starts_with("alice") && corvo_lan::names::is_valid_name(&alice.nick));
+    assert!(bob.nick.starts_with("bob") && corvo_lan::names::is_valid_name(&bob.nick));
 }
 
 #[tokio::test]
 async fn a_same_moment_name_clash_is_settled_by_the_higher_id() {
-    // Both draw "bobRoger": exactly one of them, the higher id, must re-roll.
-    let mut first = spawn_node_with_word("bob", &[], Some("Roger")).await;
-    let mut second = spawn_node_with_word("bob", &[first.node.local_addr], Some("Roger")).await;
-    assert_eq!((first.nick.as_str(), second.nick.as_str()), ("bobRoger", "bobRoger"));
+    // Both draw "bobroger": exactly one of them, the higher id, must re-roll.
+    let mut first = spawn_node_with_word("bob", &[], Some("roger")).await;
+    let mut second = spawn_node_with_word("bob", &[first.node.local_addr], Some("roger")).await;
+    assert_eq!((first.nick.as_str(), second.nick.as_str()), ("bobroger", "bobroger"));
     let (loser, keeper) =
         if first.node.id > second.node.id { (&mut first, &mut second) } else { (&mut second, &mut first) };
 
     let renamed = wait_for(&mut loser.node, "re-roll", |e| matches!(e, Event::Assigned { renamed: true, .. })).await;
     let Event::Assigned { nick: new_name, .. } = renamed else { unreachable!() };
-    assert!(new_name.starts_with("bob") && new_name != "bobRoger", "{new_name}");
+    assert!(new_name.starts_with("bob") && new_name != "bobroger", "{new_name}");
     // The lower id keeps its name and learns the other's new one.
     let seen = wait_for(&mut keeper.node, "rename", |e| matches!(e, Event::Renamed { .. })).await;
-    assert_eq!(seen, Event::Renamed { old: "bobRoger".into(), new: new_name.clone() });
-    assert_eq!(keeper.nick, "bobRoger");
+    assert_eq!(seen, Event::Renamed { old: "bobroger".into(), new: new_name.clone() });
+    assert_eq!(keeper.nick, "bobroger");
 
     // And the new name is addressable.
     say(keeper, Target::Dm(new_name.clone()), "which bob are you?").await;
@@ -172,7 +172,7 @@ async fn dm_reaches_its_target() {
 async fn room_messages_reach_members_only() {
     let (mut alice, mut bob, mut carol) = trio().await;
     let (room, key) = create_room(&mut alice, "cat").await;
-    assert!(room.starts_with("cat") && room.ends_with('R'));
+    assert!(room.starts_with("cat") && corvo_lan::names::is_valid_name(&room));
 
     let members = join_room(&mut bob, &mut alice, &room, &key).await;
     assert_eq!(members, vec![alice.nick.clone()]);
