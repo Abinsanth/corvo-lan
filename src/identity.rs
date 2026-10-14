@@ -281,6 +281,8 @@ mod tests {
         assert_eq!(lock_notice(&TryLockError::Error(std::io::Error::other("nope"))), NO_LOCK);
     }
 
+    // Unix paths: "/x" isn't absolute on Windows, which uses windows_config_dir instead.
+    #[cfg(unix)]
     #[test]
     fn config_dir_follows_xdg_rules() {
         assert_eq!(config_dir(Some("/x"), Some("/home/a")), Some(PathBuf::from("/x/corvo-lan")));
