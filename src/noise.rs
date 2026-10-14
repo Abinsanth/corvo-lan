@@ -205,15 +205,15 @@ mod tests {
     #[tokio::test]
     async fn another_version_byte_is_refused() {
         let (mut ours, mut theirs) = duplex(1 << 16);
-        theirs.write_all(b"CRVO\x05").await.unwrap();
+        theirs.write_all(b"CRVO\x06").await.unwrap();
         let err = handshake(&mut ours, &Keys::generate(), true, None).await.err().unwrap();
-        assert_eq!(err.to_string(), "unsupported protocol version 5");
+        assert_eq!(err.to_string(), "unsupported protocol version 6");
     }
 
     #[tokio::test]
     async fn garbage_after_the_preface_fails_cleanly() {
         let (mut ours, mut theirs) = duplex(1 << 16);
-        theirs.write_all(b"CRVO\x04").await.unwrap();
+        theirs.write_all(b"CRVO\x05").await.unwrap();
         theirs.write_u16(10).await.unwrap();
         theirs.write_all(&[7u8; 10]).await.unwrap();
         let err = handshake(&mut ours, &Keys::generate(), false, None).await.err().unwrap();
@@ -223,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn closing_mid_handshake_is_an_error() {
         let (mut ours, mut theirs) = duplex(1 << 16);
-        theirs.write_all(b"CRVO\x04").await.unwrap();
+        theirs.write_all(b"CRVO\x05").await.unwrap();
         drop(theirs);
         let err = handshake(&mut ours, &Keys::generate(), false, None).await.err().unwrap();
         assert!(matches!(err, HandshakeError::Io(_)), "{err}");

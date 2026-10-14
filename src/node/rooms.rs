@@ -99,12 +99,29 @@ struct Request {
     admitted: Option<Instant>,
 }
 
+/// A room's secret and where it came from.
+struct Keying {
+    secret: Secret,
+    /// Bumped by every re-key.
+    epoch: u32,
+    /// Who made the secret; when two re-keys cross, the lower id wins.
+    by: PeerId,
+    /// Times each peer has been kicked from the room.
+    kicks: HashMap<PeerId, u8>,
+}
+
 struct Room {
     name: String,
     /// The 6-character join key, for invitations.
     key: String,
     max: u8,
     secret: Secret,
+    /// Bumped by every re-key; with `keyed_by`, decides between crossing re-keys.
+    epoch: u32,
+    /// Who made the current secret.
+    keyed_by: PeerId,
+    /// Times each peer has been kicked from this room; kept after they leave.
+    kicks: HashMap<PeerId, u8>,
     keys: RoomKeys,
     door: RoomKeys,
     /// Other members, all proven.
@@ -122,6 +139,22 @@ struct Room {
 }
 
 impl Room {
+    /// The kick counts as `Grant` and `Rekey` carry them, in a stable order.
+    fn kick_list(&self) -> Vec<(PeerId, u8)> {
+        let mut list: Vec<(PeerId, u8)> = self.kicks.iter().map(|(p, n)| (*p, *n)).collect();
+        list.sort();
+        list
+    }
+
+    /// Takes in another member's counts; the higher count wins.
+    #[allow(dead_code)] // used once re-keying lands
+    fn merge_kicks(&mut self, kicks: &[(PeerId, u8)]) {
+        for (peer, n) in kicks {
+            let count = self.kicks.entry(*peer).or_default();
+            *count = (*count).max(*n);
+        }
+    }
+
     /// Members including us.
     fn size(&self) -> usize {
         self.members.len() + 1
@@ -299,7 +332,8 @@ impl Node {
         }
         match job {
             Job::Create { name, key, max } => {
-                self.hold_room(name.clone(), key.clone(), max, room::new_secret(), door, HashMap::new());
+                let keying = Keying { secret: room::new_secret(), epoch: 0, by: self.id, kicks: HashMap::new() };
+                self.hold_room(name.clone(), key.clone(), max, keying, door, HashMap::new());
                 self.emit(Event::RoomCreated { name, key, max });
             }
             Job::Join { name, key } => {
@@ -329,18 +363,21 @@ impl Node {
         name: String,
         key: String,
         max: u8,
-        secret: Secret,
+        keying: Keying,
         door: RoomKeys,
         members: HashMap<PeerId, Member>,
     ) -> RoomId {
-        let keys = room::from_secret(&name, &secret);
+        let keys = room::from_secret(&name, &keying.secret);
         let id = keys.id;
         self.rooms.doors.insert(door.id, id);
         let room = Room {
             name,
             key,
             max,
-            secret,
+            secret: keying.secret,
+            epoch: keying.epoch,
+            keyed_by: keying.by,
+            kicks: keying.kicks,
             keys,
             door,
             members,
@@ -572,7 +609,7 @@ impl Node {
         let vote = RoomBody::Vote { peer, asked: request.asked, yes: false };
         let (keys, door) = (room.keys.clone(), room.door.clone());
         self.broadcast(self.seal(&keys, vote));
-        self.send_to(peer, self.seal(&door, RoomBody::Refuse { full: false }));
+        self.send_to(peer, self.seal(&door, RoomBody::Refuse { full: false, banned: false }));
         let by = self.my_nick();
         self.emit(Event::RequestEnded { room: name.into(), nick: nick.into(), why: RequestEnd::Denied { by } });
     }
@@ -609,13 +646,19 @@ impl Node {
             }
         }
         let (name, door, max) = (room.name.clone(), room.door.clone(), room.max);
-        let secret = room::to_hex(&room.secret);
+        let grant = RoomBody::Grant {
+            secret: room::to_hex(&room.secret),
+            max,
+            epoch: room.epoch,
+            by: room.keyed_by,
+            kicks: room.kick_list(),
+        };
         for peer in grants {
-            self.send_to(peer, self.seal(&door, RoomBody::Grant { secret: secret.clone(), max }));
+            self.send_to(peer, self.seal(&door, grant.clone()));
         }
         for (peer, approved) in refusals {
             if approved {
-                self.send_to(peer, self.seal(&door, RoomBody::Refuse { full: true }));
+                self.send_to(peer, self.seal(&door, RoomBody::Refuse { full: true, banned: false }));
             }
             if let Some(nick) = self.nick_of(peer) {
                 self.emit(Event::RequestEnded { room: name.clone(), nick, why: RequestEnd::Full });
@@ -690,7 +733,7 @@ impl Node {
                 if let Some(request) = room.requests.get_mut(&from) {
                     request.seen = now;
                 } else if room.full() {
-                    self.send_to(from, self.seal(&door, RoomBody::Refuse { full: true }));
+                    self.send_to(from, self.seal(&door, RoomBody::Refuse { full: true, banned: false }));
                     return;
                 } else if room.requests.len() < MAX_REQUESTS {
                     let request = Request { asked, seen: now, approvals: HashSet::new(), admitted: None };
@@ -796,7 +839,7 @@ impl Node {
                 self.emit(Event::JoinWaiting { name, members, needs });
                 self.after(PENDING_FOR, NodeMsg::JoinExpired(door, attempt));
             }
-            RoomBody::Grant { secret, max } => {
+            RoomBody::Grant { secret, max, epoch, by, kicks } => {
                 let Some(secret) = room::from_hex(&secret).and_then(|s| Secret::try_from(s).ok()) else {
                     return;
                 };
@@ -810,7 +853,8 @@ impl Node {
                 let granter = Member { seen: now, floor: env.ts.saturating_sub(PROOF_GRACE_MS) };
                 let members = HashMap::from([(from, granter)]);
                 let (name, key) = (p.name.clone(), p.key.clone());
-                let id = self.hold_room(p.name, p.key, max, secret, p.door, members);
+                let keying = Keying { secret, epoch, by, kicks: kicks.into_iter().collect() };
+                let id = self.hold_room(p.name, p.key, max, keying, p.door, members);
                 let probe = fresh_nonce();
                 if let Some(room) = self.rooms.joined.get_mut(&id) {
                     room.probe = Some(probe.clone());
@@ -820,7 +864,7 @@ impl Node {
                 let members = self.nick_of(from).into_iter().collect();
                 self.emit(Event::RoomJoined { name, key, max, members });
             }
-            RoomBody::Refuse { full } => {
+            RoomBody::Refuse { full, .. } => {
                 let Some(p) = self.rooms.joining.remove(&door) else {
                     return;
                 };
@@ -1131,7 +1175,7 @@ mod tests {
 
     fn granted(made: &Made, frames: &[Frame]) -> bool {
         bodies(&made.door, frames).iter().any(|b| match b {
-            RoomBody::Grant { secret, max } => {
+            RoomBody::Grant { secret, max, .. } => {
                 let secret: room::Secret = room::from_hex(secret).unwrap().try_into().unwrap();
                 assert_eq!(room::from_secret(&made.name, &secret).id, made.keys.id, "the real secret");
                 assert!(*max >= MIN_MEMBERS);
@@ -1142,7 +1186,7 @@ mod tests {
     }
 
     fn refused(made: &Made, frames: &[Frame], full: bool) -> bool {
-        bodies(&made.door, frames).contains(&RoomBody::Refuse { full })
+        bodies(&made.door, frames).contains(&RoomBody::Refuse { full, banned: false })
     }
 
     fn request_ended(room: &str, nick: &str, why: RequestEnd) -> Event {
@@ -1208,6 +1252,22 @@ mod tests {
     }
 
     // ---- members: requests and votes ----
+
+    #[tokio::test(start_paused = true)]
+    async fn a_grant_carries_the_epoch_its_maker_and_kick_counts() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        h.node.rooms.joined.get_mut(&made.id).unwrap().kicks.insert(DAVE, 1);
+        knock(&mut h, BOB, &made, 100);
+        approve(&mut h, &made, "bobroger");
+        h.pump().await; // Settle
+        let grant = bodies(&made.door, &h.sent(BOB))
+            .into_iter()
+            .find(|b| matches!(b, RoomBody::Grant { .. }))
+            .expect("granted");
+        let RoomBody::Grant { epoch, by, kicks, .. } = grant else { unreachable!() };
+        assert_eq!((epoch, by, kicks), (0, ME, vec![(DAVE, 1)]));
+    }
 
     #[tokio::test]
     async fn knock_gets_a_private_door_reply_and_announces_once() {
@@ -1468,6 +1528,19 @@ mod tests {
 
     // ---- newcomers ----
 
+    #[tokio::test(start_paused = true)]
+    async fn a_newcomer_keeps_what_its_grant_carried() {
+        let mut h = with_peers();
+        let (nonce, _) = start_join(&mut h).await;
+        door_says(&mut h, BOB, &nonce, 2, 13);
+        let grant =
+            RoomBody::Grant { secret: room::to_hex(&SECRET), max: 13, epoch: 3, by: CAROL, kicks: vec![(DAVE, 1)] };
+        deliver(&mut h, BOB, frame_from(BOB, &door(), grant));
+        let room = &h.node.rooms.joined[&h.node.rooms.id_of(NAME).unwrap()];
+        assert_eq!((room.epoch, room.keyed_by), (3, CAROL));
+        assert_eq!(room.kicks.get(&DAVE), Some(&1));
+    }
+
     /// Starts joining `NAME`; returns the knock's nonce and ask time.
     async fn start_join(h: &mut Harness) -> (String, u64) {
         h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: KEY.into() });
@@ -1493,7 +1566,7 @@ mod tests {
         door_says(&mut h, DAVE, "stale", 4, 13);
         assert!(h.events().is_empty(), "announced once");
 
-        let grant = RoomBody::Grant { secret: room::to_hex(&SECRET), max: 13 };
+        let grant = RoomBody::Grant { secret: room::to_hex(&SECRET), max: 13, epoch: 0, by: BOB, kicks: vec![] };
         deliver(&mut h, BOB, frame_from(BOB, &door(), grant.clone()));
         assert_eq!(
             h.events(),
@@ -1559,7 +1632,7 @@ mod tests {
         let (nonce, _) = start_join(&mut h).await;
         door_says(&mut h, BOB, &nonce, 2, 13);
         h.events();
-        deliver(&mut h, CAROL, frame_from(CAROL, &door(), RoomBody::Refuse { full: false }));
+        deliver(&mut h, CAROL, frame_from(CAROL, &door(), RoomBody::Refuse { full: false, banned: false }));
         assert_eq!(
             h.events(),
             vec![Event::JoinEnded { name: NAME.into(), why: JoinEnd::Denied { by: "carolwolf".into() } }]
@@ -1567,7 +1640,7 @@ mod tests {
         let (nonce, _) = start_join(&mut h).await;
         door_says(&mut h, BOB, &nonce, 2, 13);
         h.events();
-        deliver(&mut h, BOB, frame_from(BOB, &door(), RoomBody::Refuse { full: true }));
+        deliver(&mut h, BOB, frame_from(BOB, &door(), RoomBody::Refuse { full: true, banned: false }));
         assert_eq!(h.events(), vec![Event::JoinEnded { name: NAME.into(), why: JoinEnd::Full }]);
     }
 
@@ -1581,7 +1654,7 @@ mod tests {
         assert_eq!(h.events(), vec![Event::RoomLeft { name: NAME.into() }]);
         assert_eq!(bodies(&door(), &h.sent(BOB)), vec![RoomBody::Leave]);
         assert_eq!(h.node.rooms.count(), 0);
-        let grant = RoomBody::Grant { secret: room::to_hex(&SECRET), max: 13 };
+        let grant = RoomBody::Grant { secret: room::to_hex(&SECRET), max: 13, epoch: 0, by: BOB, kicks: vec![] };
         deliver(&mut h, BOB, frame_from(BOB, &door(), grant));
         assert!(h.events().is_empty(), "a late grant is ignored");
     }
