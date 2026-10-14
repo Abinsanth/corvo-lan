@@ -25,9 +25,6 @@ struct Args {
     /// Write debug logs to ./corvo-lan.log
     #[arg(long)]
     debug: bool,
-    /// Start in line mode instead of the full-screen UI
-    #[arg(long)]
-    line: bool,
     /// Don't check GitHub for a newer version at startup (or set CORVO_LAN_NO_UPDATE_CHECK=1)
     #[arg(long)]
     no_update_check: bool,
@@ -72,5 +69,5 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
     let env_off = update::check_disabled_by(std::env::var("CORVO_LAN_NO_UPDATE_CHECK").ok().as_deref());
-    ui::run(handle, ui::Options { line: args.line, check_updates: !args.no_update_check && !env_off }).await
+    ui::run(handle, ui::Options { check_updates: !args.no_update_check && !env_off }).await
 }

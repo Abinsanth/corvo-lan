@@ -519,7 +519,6 @@ mod tests {
     use super::*;
     use crate::api::PeerId;
     use crate::ui::complete::Candidates;
-    use crate::ui::render::Style;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn ed(text: &str) -> Editor {
@@ -660,7 +659,7 @@ mod tests {
     }
 
     fn session_with_tabs() -> Session {
-        let mut s = Session::new(Style::plain());
+        let mut s = Session::new(false);
         s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
         s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
         s.on_event(

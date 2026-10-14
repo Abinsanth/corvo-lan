@@ -1,4 +1,4 @@
-//! What the user typed and what happened, turned into commands and text. Shared by both frontends; knows nothing about terminals.
+//! What the user typed and what happened, turned into commands and text. Used by the TUI; knows nothing about terminals.
 
 use super::input::{Input, parse_line};
 use super::render::{self, Style};
@@ -6,29 +6,9 @@ use super::updates::UpdateAction;
 use crate::api::{Command, Conv, Event, Target};
 use crate::convo::Store;
 
-pub const HELP_LINE: &str = "\
-commands:
-  <text>                 send to the current conversation (shown in the prompt)
-  /msg @nick <text>      one-off private message (also /m)
-  /chat @nick            switch to a private chat (also /c; the @ is optional)
-  /chat #room <key>      join a room (just /chat #room once you're in)
-  /create <name> <key>   create a private room; share its name and key to invite
-  /leave [#room]         leave the current or named room
-  /close [@nick]         close the current or named private chat
-  /rooms                 your rooms and who's in them
-  /chats                 your conversations, with unread counts
-  /his [n]               show the last n messages here (default 20)
-  /update [yes]          check for a newer version; yes installs it
-  /who                   connected people
-  /tui                   switch to the full-screen UI
-  /help                  this list (also /h, /?)
-  /quit                  leave (also /q, Ctrl-C / Ctrl-D)
-  //text                 send a message starting with '/'
-  Tab                    complete @names, #rooms and /commands";
-
 pub const MAX_MESSAGE_LINES: usize = 50;
 
-pub const HELP_TUI: &str = "\
+pub const HELP: &str = "\
 commands:
   <text>                 send to the current tab
   /msg @nick <text>      one-off private message (also /m)
@@ -39,7 +19,6 @@ commands:
   /close [@nick]         close the current or named private chat
   /rooms  /chats  /who   list rooms, chats, connected people
   /update [yes]          check for a newer version; yes installs it
-  /line                  switch to line mode
   /help                  this list (also /h, /?)
   /quit                  leave (also /q, Ctrl-C)
   //text                 send a message starting with '/'
@@ -48,13 +27,6 @@ keys:
   Shift-Tab, Alt-←/→ or Alt-1..9 switch tabs · PgUp/PgDn or mouse wheel scroll
   Esc close the list / clear input / back to latest · click a name to chat";
 
-/// Which frontend is showing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Line,
-    Tui,
-}
-
 /// What the UI loop should do after an input line.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Reaction {
@@ -62,7 +34,6 @@ pub struct Reaction {
     pub print: Vec<String>,
     pub quit: bool,
     pub update: Option<UpdateAction>,
-    pub switch: Option<Mode>,
 }
 
 impl Reaction {
@@ -77,42 +48,19 @@ impl Reaction {
 
 pub struct Session {
     pub store: Store,
-    mode: Mode,
-    /// What line mode prints with; the TUI renders plain text and colours it itself.
-    line_style: Style,
+    /// Whether the TUI may use colour (`NO_COLOR` turns it off).
+    color: bool,
+    /// Text is always plain; the TUI colours lines itself.
     style: Style,
 }
 
 impl Session {
-    pub fn new(style: Style) -> Self {
-        Session { store: Store::new(), mode: Mode::Line, line_style: style, style }
+    pub fn new(color: bool) -> Self {
+        Session { store: Store::new(), color, style: Style::plain() }
     }
 
-    pub fn mode(&self) -> Mode {
-        self.mode
-    }
-
-    pub fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
-        self.style = if mode == Mode::Tui { Style::plain() } else { self.line_style };
-    }
-
-    /// Whether colour is on (`NO_COLOR` and pipes turn it off).
     pub fn color(&self) -> bool {
-        self.line_style.color
-    }
-
-    /// Printed when line mode takes over from the TUI.
-    pub fn line_banner(&self) -> Vec<String> {
-        let mut out = vec!["* line mode — /tui to switch back".to_string()];
-        if self.store.conversations().iter().any(|c| c.unread > 0) {
-            out.push(render::chats(&self.store, &self.style));
-        }
-        out
-    }
-
-    pub fn prompt(&self) -> String {
-        render::prompt(self.store.current())
+        self.color
     }
 
     /// Folds an event into the store and returns what to print.
@@ -122,12 +70,7 @@ impl Session {
         if let Event::RoomCreated { name, .. } | Event::RoomJoined { name, .. } = event {
             self.store.switch(Conv::Room(name.clone()));
         }
-        render::event(event, now, self.store.me(), &self.style)
-    }
-
-    /// What the prompt shows: its text and the conversation plain text goes to.
-    pub fn prompt_state(&self) -> (String, Option<Conv>) {
-        (self.prompt(), self.store.current().cloned())
+        render::event(event, now, &self.style)
     }
 
     /// Handles a typed line. `shown` is the conversation its prompt showed:
@@ -141,7 +84,7 @@ impl Session {
         match input {
             Input::Empty => Reaction::default(),
             Input::Error(e) => Reaction::say(format!("! {e}")),
-            Input::Help => Reaction::say(if self.mode == Mode::Tui { HELP_TUI } else { HELP_LINE }),
+            Input::Help => Reaction::say(HELP),
             Input::Quit => Reaction { quit: true, ..Default::default() },
             Input::Who => Reaction::send(Command::ListPeers),
             Input::Text(text) => match tidy_message(&text) {
@@ -197,10 +140,6 @@ impl Session {
                 update: Some(if confirm { UpdateAction::Install } else { UpdateAction::Check }),
                 ..Default::default()
             },
-            Input::Line if self.mode == Mode::Line => Reaction::say("! already in line mode"),
-            Input::Tui if self.mode == Mode::Tui => Reaction::say("! already in the TUI"),
-            Input::Line => Reaction { switch: Some(Mode::Line), ..Default::default() },
-            Input::Tui => Reaction { switch: Some(Mode::Tui), ..Default::default() },
             Input::Close(target) => {
                 let conv = match target {
                     Some(nick) => Conv::Dm(nick),
@@ -223,22 +162,6 @@ impl Session {
             }
             Input::Rooms => Reaction::say(render::rooms(&self.store, &self.style)),
             Input::Chats => Reaction::say(render::chats(&self.store, &self.style)),
-            Input::History(n) => {
-                if self.mode == Mode::Tui {
-                    return Reaction::say("* scroll with PgUp/PgDn");
-                }
-                let Some(conv) = self.store.current().cloned() else {
-                    return Reaction::say("! no conversation — /chat @nick or /chat #room");
-                };
-                let lines = self.store.history(n);
-                if lines.is_empty() {
-                    return Reaction::say("* nothing here yet");
-                }
-                Reaction {
-                    print: lines.iter().map(|l| render::line(&conv, l, self.store.me(), &self.style)).collect(),
-                    ..Default::default()
-                }
-            }
         }
     }
 
@@ -278,21 +201,10 @@ impl Session {
         }
     }
 
+    /// Shows `conv`; its tab already shows what's unread.
     fn switch(&mut self, conv: Conv) -> Reaction {
-        if self.mode == Mode::Tui {
-            // The tab already shows the unread messages.
-            self.store.switch(conv);
-            return Reaction::default();
-        }
-        let (unread, mentioned) = self.store.get(&conv).map_or((0, 0), |c| (c.unread, c.mentions));
-        self.store.switch(conv.clone());
-        if unread > 0 {
-            let name = render::conv_name(&conv, &self.style);
-            let extra = if mentioned > 0 { format!(" ({})", render::mention_count(mentioned)) } else { String::new() };
-            Reaction::say(format!("* {name}: {unread} unread{extra} — /his to see them"))
-        } else {
-            Reaction::default()
-        }
+        self.store.switch(conv);
+        Reaction::default()
     }
 }
 
@@ -315,7 +227,7 @@ mod tests {
     use crate::api::PeerId;
 
     fn session() -> Session {
-        let mut s = Session::new(Style::plain());
+        let mut s = Session::new(false);
         s.on_event(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
         s
@@ -336,7 +248,7 @@ mod tests {
         let mut s = session();
         assert_eq!(typed(&mut s, "hello").print, vec!["! no conversation — /chat @nick or /create <name> <key>"]);
         assert_eq!(typed(&mut s, "/chat @bobRoger"), Reaction::default());
-        assert_eq!(s.prompt(), "@bobRoger> ");
+        assert_eq!(s.store.current(), Some(&Conv::Dm("bobRoger".into())));
         assert_eq!(typed(&mut s, "hello"), send(Target::Dm("bobRoger".into()), "hello"));
     }
 
@@ -348,18 +260,18 @@ mod tests {
             Reaction::send(Command::CreateRoom { base: "cat".into(), key_part: "123".into() })
         );
         s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "123-k7m9xq".into() }, 0);
-        assert_eq!(s.prompt(), "#catPieR> ");
+        assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
         assert_eq!(typed(&mut s, "meow"), send(Target::Room("catPieR".into()), "meow"));
 
         assert_eq!(
             typed(&mut s, "/chat #dogFoxR 1-abcdef"),
             Reaction::send(Command::JoinRoom { name: "dogFoxR".into(), key: "1-abcdef".into() })
         );
-        assert_eq!(s.prompt(), "#catPieR> ", "not until the join succeeds");
+        assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())), "not until the join succeeds");
         s.on_event(&Event::RoomJoined { name: "dogFoxR".into(), members: vec!["bobRoger".into()] }, 0);
-        assert_eq!(s.prompt(), "#dogFoxR> ");
+        assert_eq!(s.store.current(), Some(&Conv::Room("dogFoxR".into())));
         assert_eq!(typed(&mut s, "/chat #catPieR"), Reaction::default(), "already in: just switch");
-        assert_eq!(s.prompt(), "#catPieR> ");
+        assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())));
         assert_eq!(typed(&mut s, "/chat #nopeMoonR").print, vec!["! join with /chat #nopeMoonR <key>"]);
     }
 
@@ -374,7 +286,7 @@ mod tests {
         // ...and the join completes meanwhile, switching the current conversation.
         s.on_event(&Event::RoomJoined { name: "catPieR".into(), members: vec![] }, 0);
         assert_eq!(s.on_line("for bob only", shown.as_ref()), send(Target::Dm("bobRoger".into()), "for bob only"));
-        assert_eq!(s.prompt(), "#catPieR> ", "the next prompt shows the room");
+        assert_eq!(s.store.current(), Some(&Conv::Room("catPieR".into())), "the next prompt shows the room");
     }
 
     #[test]
@@ -397,7 +309,7 @@ mod tests {
         assert_eq!(typed(&mut s, "/leave"), Reaction::send(Command::LeaveRoom { name: "catPieR".into() }));
         assert_eq!(typed(&mut s, "/leave #dogFoxR"), Reaction::send(Command::LeaveRoom { name: "dogFoxR".into() }));
         s.on_event(&Event::RoomLeft { name: "catPieR".into() }, 0);
-        assert_eq!(s.prompt(), "> ");
+        assert_eq!(s.store.current(), None);
     }
 
     #[test]
@@ -408,26 +320,9 @@ mod tests {
     }
 
     #[test]
-    fn switching_mentions_unread_and_history_shows_them() {
+    fn switching_marks_read_and_says_nothing() {
         let mut s = session();
-        s.on_event(
-            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "one".into(), ts: 0 },
-            0,
-        );
-        s.on_event(
-            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "two".into(), ts: 0 },
-            0,
-        );
-        assert_eq!(typed(&mut s, "/chat @bobRoger").print, vec!["* @bobRoger: 2 unread — /his to see them"]);
-        let shown = typed(&mut s, "/his 1").print;
-        assert_eq!(shown.len(), 1);
-        assert!(shown[0].ends_with("@bobRoger → you: two"), "{shown:?}");
-    }
-
-    #[test]
-    fn switching_says_how_many_unread_messages_mention_me() {
-        let mut s = session();
-        for text in ["@annMoon look", "later"] {
+        for text in ["one", "@annMoon two"] {
             s.on_event(
                 &Event::Message {
                     conv: Conv::Dm("bobRoger".into()),
@@ -438,10 +333,25 @@ mod tests {
                 0,
             );
         }
-        assert_eq!(
-            typed(&mut s, "/chat @bobRoger").print,
-            vec!["* @bobRoger: 2 unread (1 mention) — /his to see them"]
-        );
+        assert_eq!(typed(&mut s, "/chat @bobRoger"), Reaction::default(), "the tab already shows the counts");
+        let c = s.store.get(&Conv::Dm("bobRoger".into())).unwrap();
+        assert_eq!((c.unread, c.mentions), (0, 0));
+    }
+
+    #[test]
+    fn help_lists_the_tui_commands_and_keys() {
+        let mut s = session();
+        assert_eq!(typed(&mut s, "/help").print, vec![HELP]);
+        assert!(HELP.contains("/close") && HELP.contains("Shift-Tab") && HELP.contains("/quit"));
+        assert!(!HELP.contains("/line") && !HELP.contains("/his") && !HELP.contains("/tui"));
+    }
+
+    #[test]
+    fn lines_are_plain_even_with_colour_on() {
+        let mut s = Session::new(true);
+        assert!(s.color());
+        let text = s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "daveElk".into() }, 0).unwrap();
+        assert!(!text.contains('\x1b'), "{text:?}");
     }
 
     #[test]
@@ -452,7 +362,6 @@ mod tests {
         assert!(typed(&mut s, "/quit").quit);
         assert!(typed(&mut s, "/q").quit);
         assert_eq!(typed(&mut s, "/nick x").print, vec!["! names are assigned by the system and can't be changed"]);
-        assert_eq!(typed(&mut s, "/his").print, vec!["! no conversation — /chat @nick or /chat #room"]);
     }
 
     #[test]
@@ -500,17 +409,7 @@ mod tests {
         assert_eq!(check.update, Some(UpdateAction::Check));
         assert!(check.commands.is_empty() && check.print.is_empty());
         assert_eq!(typed(&mut s, "/update yes").update, Some(UpdateAction::Install));
-        assert!(HELP_LINE.contains("/update [yes]"));
-    }
-
-    #[test]
-    fn mode_switches_are_refused_in_the_mode_you_are_in() {
-        let mut s = session();
-        assert_eq!(typed(&mut s, "/line").print, vec!["! already in line mode"]);
-        assert_eq!(typed(&mut s, "/tui").switch, Some(Mode::Tui));
-        s.set_mode(Mode::Tui);
-        assert_eq!(typed(&mut s, "/tui").print, vec!["! already in the TUI"]);
-        assert_eq!(typed(&mut s, "/line").switch, Some(Mode::Line));
+        assert!(HELP.contains("/update [yes]"));
     }
 
     #[test]
@@ -538,50 +437,5 @@ mod tests {
         assert_eq!(typed(&mut s, "one\ntwo\n\n"), send(Target::Dm("bobRoger".into()), "one\ntwo"));
         assert_eq!(typed(&mut s, &long).print, vec![format!("! message has more than {MAX_MESSAGE_LINES} lines")]);
         assert_eq!(typed(&mut s, "/msg @bobRoger a\nb\n"), send(Target::Dm("bobRoger".into()), "a\nb"));
-    }
-
-    #[test]
-    fn help_and_history_depend_on_the_mode() {
-        let mut s = session();
-        assert_eq!(typed(&mut s, "/help").print, vec![HELP_LINE]);
-        assert!(HELP_LINE.contains("/tui") && !HELP_LINE.contains("/line"));
-        assert!(HELP_LINE.contains("/close [@nick]"), "/close works in line mode too");
-        assert!(HELP_LINE.contains("/quit") && HELP_LINE.contains("/q,") && HELP_LINE.contains("/his [n]"));
-        assert!(HELP_TUI.contains("Shift-Tab") && HELP_LINE.contains("Tab"));
-        s.set_mode(Mode::Tui);
-        assert_eq!(typed(&mut s, "/help").print, vec![HELP_TUI]);
-        assert!(HELP_TUI.contains("/line") && HELP_TUI.contains("/close") && HELP_TUI.contains("Alt+Enter"));
-        assert_eq!(typed(&mut s, "/his").print, vec!["* scroll with PgUp/PgDn"]);
-    }
-
-    #[test]
-    fn the_tui_renders_plain_and_switching_there_says_nothing() {
-        let mut s = Session::new(Style { color: true });
-        s.set_mode(Mode::Tui);
-        assert!(s.color());
-        let text = s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "daveElk".into() }, 0).unwrap();
-        assert!(!text.contains('\x1b'), "{text:?}");
-        s.on_event(
-            &Event::Message { conv: Conv::Dm("daveElk".into()), from: "daveElk".into(), text: "x".into(), ts: 0 },
-            0,
-        );
-        assert_eq!(typed(&mut s, "/chat @daveElk"), Reaction::default());
-        s.set_mode(Mode::Line);
-        assert!(
-            s.on_event(&Event::PeerJoined { id: PeerId::test(4), nick: "eveOwl".into() }, 0).unwrap().contains('\x1b')
-        );
-    }
-
-    #[test]
-    fn line_banner_mentions_unread_chats() {
-        let mut s = session();
-        assert_eq!(s.line_banner(), vec!["* line mode — /tui to switch back"]);
-        s.on_event(
-            &Event::Message { conv: Conv::Dm("bobRoger".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 },
-            0,
-        );
-        let banner = s.line_banner();
-        assert_eq!(banner.len(), 2);
-        assert!(banner[1].contains("1 new"), "{banner:?}");
     }
 }
