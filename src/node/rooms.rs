@@ -37,6 +37,8 @@ pub const PENDING_FOR: Duration = Duration::from_secs(120);
 pub const INVITE_FOR: Duration = Duration::from_secs(600);
 /// Invitations an invitee holds; a newer one drops the oldest.
 pub const MAX_INVITES: usize = 5;
+/// Of those, how many can come from one person, so nobody can push out the rest.
+pub const MAX_INVITES_FROM_ONE: usize = 2;
 /// After a yes vote, wait this long for other votes before letting people in,
 /// so every member sees the same votes and picks the same people.
 pub const ADMIT_SETTLE: Duration = Duration::from_secs(1);
@@ -492,7 +494,16 @@ impl Node {
             return;
         };
         let invites = &mut self.rooms.invites;
+        // Only the inviter can change an invitation, or anyone could swap the key under /accept.
+        if invites.iter().any(|i| i.room == name && i.from != from) {
+            debug!(%from, "ignoring invite to {name:?}: someone else's is waiting");
+            return;
+        }
         invites.retain(|i| i.room != name);
+        if invites.iter().filter(|i| i.from == from).count() >= MAX_INVITES_FROM_ONE {
+            let oldest = invites.iter().position(|i| i.from == from).expect("counted above");
+            invites.remove(oldest);
+        }
         invites.push(Invite { from, room: name.clone(), key, at: now });
         if invites.len() > MAX_INVITES {
             invites.remove(0);
@@ -1920,15 +1931,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_repeat_replaces_and_the_sixth_drops_the_oldest() {
+    async fn invites_are_capped_per_inviter_and_overall() {
         let mut h = with_peers();
-        for room in ["apie", "bpie", "cpie", "dpie", "epie"] {
+        for room in ["apie", "bpie", "cpie"] {
             invite_from(&mut h, BOB, room);
         }
-        invite_from(&mut h, CAROL, "cpie");
-        invite_from(&mut h, BOB, "fpie");
-        assert_eq!(invited_rooms(&h), ["bpie", "dpie", "epie", "cpie", "fpie"]);
-        assert_eq!(h.node.rooms.invites[3].from, CAROL);
+        assert_eq!(invited_rooms(&h), ["bpie", "cpie"], "two per inviter: bob's oldest goes");
+        invite_from(&mut h, BOB, "cpie");
+        assert_eq!(invited_rooms(&h), ["bpie", "cpie"], "a repeat from the same inviter replaces theirs");
+        invite_from(&mut h, CAROL, "dpie");
+        invite_from(&mut h, CAROL, "epie");
+        invite_from(&mut h, DAVE, "fpie");
+        invite_from(&mut h, ERIN, "gpie");
+        assert_eq!(invited_rooms(&h), ["cpie", "dpie", "epie", "fpie", "gpie"], "the sixth drops the oldest");
+    }
+
+    #[tokio::test]
+    async fn another_peer_cannot_replace_an_invite() {
+        let mut h = with_peers();
+        invite_from(&mut h, BOB, NAME);
+        h.events();
+        deliver(&mut h, CAROL, Frame::Invite { room: NAME.into(), key: "x7y8z9".into() });
+        assert!(h.events().is_empty(), "carol's invite to the same room is ignored");
+        assert_eq!((h.node.rooms.invites[0].from, h.node.rooms.invites[0].key.as_str()), (BOB, KEY));
+        deliver(&mut h, BOB, Frame::Invite { room: NAME.into(), key: "m3n4p5".into() });
+        assert_eq!(h.node.rooms.invites[0].key, "m3n4p5", "bob can renew his own");
+    }
+
+    #[tokio::test]
+    async fn one_peer_cannot_push_out_other_invites() {
+        let mut h = with_peers();
+        invite_from(&mut h, BOB, NAME);
+        for room in ["apie", "bpie", "cpie", "dpie", "epie"] {
+            invite_from(&mut h, CAROL, room);
+        }
+        assert!(invited_rooms(&h).contains(&NAME), "{:?}", invited_rooms(&h));
     }
 
     #[tokio::test]

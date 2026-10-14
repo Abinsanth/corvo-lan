@@ -692,10 +692,15 @@ mod tests {
         s.on_event(&Event::Invited { from: "bobroger".into(), room: "owlpie".into() }, 0);
         s.on_event(&Event::JoinWaiting { name: "owlpie".into(), members: 2, needs: 1 }, 0);
         assert!(s.store.invites().is_empty(), "accepting it clears it");
-        for room in ["apie", "bpie", "cpie", "dpie", "epie", "fpie"] {
+        for room in ["apie", "bpie", "cpie"] {
             s.on_event(&Event::Invited { from: "bobroger".into(), room: room.into() }, 0);
         }
-        assert_eq!(s.store.invites().len(), crate::node::MAX_INVITES, "the oldest goes, like in the node");
+        let rooms = |s: &Session| s.store.invites().iter().map(|(_, r)| r.clone()).collect::<Vec<_>>();
+        assert_eq!(rooms(&s), ["bpie", "cpie"], "two per inviter, like in the node");
+        for (from, room) in [("carolwolf", "dpie"), ("carolwolf", "epie"), ("daveoak", "fpie"), ("erinowl", "gpie")] {
+            s.on_event(&Event::Invited { from: from.into(), room: room.into() }, 0);
+        }
+        assert_eq!(rooms(&s), ["cpie", "dpie", "epie", "fpie", "gpie"], "five in all: the oldest goes");
     }
 
     #[test]

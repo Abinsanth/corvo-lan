@@ -178,6 +178,10 @@ impl Store {
             }
             Event::Invited { from, room } => {
                 self.invites.retain(|(_, r)| r != room);
+                if self.invites.iter().filter(|(f, _)| f == from).count() >= crate::node::MAX_INVITES_FROM_ONE {
+                    let oldest = self.invites.iter().position(|(f, _)| f == from).expect("counted above");
+                    self.invites.remove(oldest);
+                }
                 self.invites.push((from.clone(), room.clone()));
                 if self.invites.len() > crate::node::MAX_INVITES {
                     self.invites.remove(0);
