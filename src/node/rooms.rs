@@ -297,9 +297,7 @@ impl Node {
         }
         match job {
             Job::Create { name, key, max } => {
-                let secret = room::new_secret();
-                let keys = room::from_secret(&name, &secret);
-                self.hold_room(name.clone(), key.clone(), max, secret, keys, door, HashMap::new());
+                self.hold_room(name.clone(), key.clone(), max, room::new_secret(), door, HashMap::new());
                 self.emit(Event::RoomCreated { name, key, max });
             }
             Job::Join { name, key } => {
@@ -330,10 +328,10 @@ impl Node {
         key: String,
         max: u8,
         secret: Secret,
-        keys: RoomKeys,
         door: RoomKeys,
         members: HashMap<PeerId, Member>,
     ) -> RoomId {
+        let keys = room::from_secret(&name, &secret);
         let id = keys.id;
         self.rooms.doors.insert(door.id, id);
         let room = Room {
@@ -794,7 +792,7 @@ impl Node {
                 let granter = Member { seen: now, floor: env.ts.saturating_sub(PROOF_GRACE_MS) };
                 let members = HashMap::from([(from, granter)]);
                 let (name, key) = (p.name.clone(), p.key.clone());
-                let id = self.hold_room(p.name, p.key, max, secret, keys.clone(), p.door, members);
+                let id = self.hold_room(p.name, p.key, max, secret, p.door, members);
                 let probe = fresh_nonce();
                 if let Some(room) = self.rooms.joined.get_mut(&id) {
                     room.probe = Some(probe.clone());
