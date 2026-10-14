@@ -103,6 +103,9 @@ struct Room {
     members: HashMap<PeerId, Member>,
     challenges: HashMap<PeerId, Challenge>,
     requests: HashMap<PeerId, Request>,
+    /// Recently closed requests (their `asked`, and when), so a vote still on
+    /// its way can't reopen one.
+    closed: HashMap<PeerId, (u64, Instant)>,
     /// Our probe from when we were let in; members echoing it are proven.
     probe: Option<String>,
     replay: ReplayGuard,
@@ -122,6 +125,13 @@ impl Room {
 
     fn full(&self) -> bool {
         self.size() + self.admitted() >= self.max as usize
+    }
+
+    /// Removes `peer`'s request and remembers it was closed.
+    fn close(&mut self, peer: PeerId) -> Option<Request> {
+        let request = self.requests.remove(&peer)?;
+        self.closed.insert(peer, (request.asked, Instant::now()));
+        Some(request)
     }
 
     /// Approvals from people still in the room.
@@ -316,6 +326,7 @@ impl Node {
             members,
             challenges: HashMap::new(),
             requests: HashMap::new(),
+            closed: HashMap::new(),
             probe: None,
             replay: ReplayGuard::default(),
             door_replay: ReplayGuard::default(),
@@ -434,7 +445,7 @@ impl Node {
             Err(e) => return self.emit(Event::Error(e)),
         };
         let room = self.rooms.joined.get_mut(&id).expect("found above");
-        let Some(request) = room.requests.remove(&peer) else {
+        let Some(request) = room.close(peer) else {
             return;
         };
         let vote = RoomBody::Vote { peer, asked: request.asked, yes: false };
@@ -472,7 +483,7 @@ impl Node {
                 if request.approvals.contains(&me) {
                     grants.push(peer);
                 }
-            } else if let Some(request) = room.requests.remove(&peer) {
+            } else if let Some(request) = room.close(peer) {
                 refusals.push((peer, request.approvals.contains(&me)));
             }
         }
@@ -560,6 +571,7 @@ impl Node {
                 } else if room.requests.len() < MAX_REQUESTS {
                     let request = Request { asked, seen: now, approvals: HashSet::new(), admitted: None };
                     room.requests.insert(from, request);
+                    room.closed.remove(&from);
                     let (name, need) = (room.name.clone(), needed(room.size()));
                     if let Some(nick) = self.nick_of(from) {
                         self.emit(Event::JoinRequest { room: name, nick, have: 0, need: small(need) });
@@ -582,7 +594,7 @@ impl Node {
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
-        if room.requests.remove(&peer).is_some() {
+        if room.close(peer).is_some() {
             let name = room.name.clone();
             if let Some(nick) = self.nick_of(peer) {
                 self.emit(Event::RequestEnded { room: name, nick, why });
@@ -604,14 +616,17 @@ impl Node {
         }
         let name = room.name.clone();
         if !yes {
-            if room.requests.remove(&peer).is_some() {
+            // Once someone's let in, a no that crossed with the yeses doesn't undo it.
+            if room.requests.get(&peer).is_some_and(|r| r.admitted.is_none()) {
+                room.close(peer);
                 self.emit(Event::RequestEnded { room: name, nick, why: RequestEnd::Denied { by } });
             }
             return;
         }
         let need = small(needed(room.size()));
         if !room.requests.contains_key(&peer) {
-            if room.requests.len() >= MAX_REQUESTS {
+            let reopens = room.closed.get(&peer).is_some_and(|(closed, _)| *closed == asked);
+            if reopens || room.requests.len() >= MAX_REQUESTS {
                 return;
             }
             let request = Request { asked, seen: now, approvals: HashSet::new(), admitted: None };
@@ -850,6 +865,7 @@ impl Node {
         }
         for room in self.rooms.joined.values_mut() {
             room.challenges.retain(|_, c| now.saturating_duration_since(c.started) < CHALLENGE_TIMEOUT);
+            room.closed.retain(|_, (_, at)| now.saturating_duration_since(*at) < REQUEST_STALE);
         }
         let mut knocks = Vec::new();
         for p in self.rooms.joining.values_mut() {
@@ -1182,6 +1198,40 @@ mod tests {
             vec![request_ended(&made.name, "bobRoger", RequestEnd::Denied { by: "carolFox".into() })]
         );
         assert!(h.node.rooms.joined[&made.id].requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_late_yes_does_not_revive_a_closed_request() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        verify(&mut h, CAROL, &made.name, &made.keys);
+        knock(&mut h, BOB, &made, 100);
+        knock(&mut h, DAVE, &made, 100);
+        h.node.handle_command(Command::Deny { room: made.name.clone(), nick: "bobRoger".into() });
+        deliver(&mut h, DAVE, frame_from(DAVE, &made.door, RoomBody::Leave));
+        h.events();
+        // carol approved each of them at the same moment.
+        vote(&mut h, CAROL, &made, BOB, true);
+        vote(&mut h, CAROL, &made, DAVE, true);
+        assert!(h.events().is_empty());
+        assert!(h.node.rooms.joined[&made.id].requests.is_empty());
+        // A fresh request (a new ask) is welcome again.
+        knock(&mut h, BOB, &made, 500);
+        assert!(matches!(h.events().as_slice(), [Event::JoinRequest { nick, .. }] if nick == "bobRoger"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_no_does_not_undo_letting_someone_in() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        verify(&mut h, CAROL, &made.name, &made.keys);
+        knock(&mut h, BOB, &made, 100);
+        approve(&mut h, &made, "bobRoger");
+        h.pump().await; // Settle: bob is let in
+        h.events();
+        vote(&mut h, CAROL, &made, BOB, false);
+        assert!(h.events().is_empty());
+        assert!(h.node.rooms.joined[&made.id].requests[&BOB].admitted.is_some(), "still holds his slot");
     }
 
     #[tokio::test]
