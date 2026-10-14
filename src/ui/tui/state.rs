@@ -367,7 +367,15 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
 /// Events shown in the corvo tab. Chat lines and member changes already live
 /// in their conversation.
 pub fn goes_to_status(event: &Event) -> bool {
-    !matches!(event, Event::Message { .. } | Event::Sent { .. } | Event::MemberJoined { .. } | Event::MemberLeft { .. })
+    !matches!(
+        event,
+        Event::Message { .. }
+            | Event::Sent { .. }
+            | Event::MemberJoined { .. }
+            | Event::MemberLeft { .. }
+            | Event::Approved { .. }
+            | Event::RequestEnded { .. }
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -821,5 +829,10 @@ mod tests {
         assert!(goes_to_status(&Event::Error("x".into())));
         assert!(goes_to_status(&Event::RoomCreated { name: "r".into(), key: "k".into(), max: 13 }));
         assert!(goes_to_status(&Event::PeerJoined { id: PeerId::test(1), nick: "b".into() }));
+        let approved = Event::Approved { room: "r".into(), nick: "b".into(), by: "c".into(), have: 1, need: 2 };
+        assert!(!goes_to_status(&approved));
+        let ended = Event::RequestEnded { room: "r".into(), nick: "b".into(), why: crate::api::RequestEnd::Gone };
+        assert!(!goes_to_status(&ended));
+        assert!(goes_to_status(&Event::JoinRequest { room: "r".into(), nick: "b".into(), have: 0, need: 1 }));
     }
 }

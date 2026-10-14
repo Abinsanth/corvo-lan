@@ -6,7 +6,7 @@ setup.
 
 - People find each other automatically (UDP multicast), then talk over direct TCP connections.
 - Everyone gets a unique name: you choose the start and a word is added (`--nick bob` → `@bobRoger`).
-- Private rooms are protected by a key and end-to-end encrypted. Only people with the room's name and key can read it.
+- Private rooms are end-to-end encrypted, and the people inside decide who joins. A room's key only lets you ask.
 - Direct messages go peer to peer, and every connection is encrypted.
 - Chats are never written to disk. Quitting forgets everything.
 
@@ -94,8 +94,9 @@ corvo-lan --nick bob        # or choose the start yourself
 After about two seconds you get a name, and you're connected to everyone else running it.
 
 ```
-/create cat 123            # creates e.g. #catPieR with key 123-k7m9xq
-/chat #catPieR 123-k7m9xq  # someone else joins with the name and key
+/create cat 5              # a room for up to 5 people, e.g. #catPieR with key k7m9xq
+/chat #catPieR k7m9xq      # someone else asks to join with the name and key
+/approve @bobRoger         # someone in the room lets them in (or /deny @bobRoger)
 /chat @bobRoger            # private chat
 /msg @bobRoger hi          # one-off private message
 /chat bob                  # the @ or # is optional when only one name matches
@@ -113,6 +114,26 @@ and `/commands`, `Alt+Enter` (or `Shift+Enter` where your terminal supports it)
 adds a new line, `PgUp`/`PgDn` or the mouse wheel scroll, and clicking a name
 opens a private chat. Command output and errors appear in the `corvo` tab. To
 select text (say, a room key), hold Shift (Option on macOS) while dragging.
+
+### Rooms
+
+A room holds 2–13 people (13 if you don't say), and you can be in up to 3
+rooms at once. Its key is 6 characters made up by the app. Anyone with the
+room's name and key can *ask* to join; the people already inside see the
+request and approve or deny it. A request waits up to 2 minutes.
+
+How many approvals a newcomer needs depends on how many people are in the room
+(online) right now:
+
+| In the room | Approvals needed |
+|---|---|
+| 1–3 | 1 |
+| 4–6 | 2 |
+| 7–9 | 3 |
+| 10–12 | 4 |
+
+One `/deny` turns the request away. If two people are let in for the last
+place, whoever asked first gets it.
 
 ### Encryption
 

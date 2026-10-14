@@ -257,7 +257,7 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
         && let Some(text) = text
     {
         state.push_status(now_millis(), &text, tone_of(event));
-        if matches!(event, Event::Error(_)) || tone_of(event) == Tone::Warn {
+        if matches!(event, Event::Error(_) | Event::JoinEnded { .. }) || tone_of(event) == Tone::Warn {
             state.flash(&text, now);
         }
     }
