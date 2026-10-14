@@ -37,7 +37,9 @@ pub fn parse_announce(bytes: &[u8], src: SocketAddr, me: PeerId) -> Option<Sight
 fn bind_socket() -> io::Result<std::net::UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
-    // Lets several instances on one machine share the discovery port.
+    // Lets several instances on one machine share the discovery port. On
+    // Windows SO_REUSEADDR alone does that; SO_REUSEPORT is Unix-only.
+    #[cfg(unix)]
     socket.set_reuse_port(true)?;
     socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PORT).into())?;
     socket.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED)?;

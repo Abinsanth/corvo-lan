@@ -4,6 +4,7 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -70,7 +71,7 @@ impl Identity {
     }
 }
 
-/// `$XDG_CONFIG_HOME/corvo-lan`, else `$HOME/.config/corvo-lan`. Empty or
+/// On Unix: `$XDG_CONFIG_HOME/corvo-lan`, else `$HOME/.config/corvo-lan`. Empty or
 /// relative values are ignored, as the XDG spec says.
 pub fn config_dir(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
     let absolute = |v: Option<&str>| v.map(PathBuf::from).filter(|p| p.is_absolute());
@@ -78,11 +79,20 @@ pub fn config_dir(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
     Some(base.join("corvo-lan"))
 }
 
+/// `%APPDATA%\corvo-lan`. Empty or relative values are ignored.
+pub fn windows_config_dir(appdata: Option<&str>) -> Option<PathBuf> {
+    appdata.map(PathBuf::from).filter(|p| p.is_absolute()).map(|p| p.join("corvo-lan"))
+}
+
 /// Loads this machine's identity from the default config directory.
 pub fn load() -> anyhow::Result<Identity> {
-    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
-    let home = std::env::var("HOME").ok();
-    load_from(config_dir(xdg.as_deref(), home.as_deref()))
+    let var = |name: &str| std::env::var(name).ok();
+    let dir = if cfg!(windows) {
+        windows_config_dir(var("APPDATA").as_deref())
+    } else {
+        config_dir(var("XDG_CONFIG_HOME").as_deref(), var("HOME").as_deref())
+    };
+    load_from(dir)
 }
 
 /// Errors only for a key file that exists but can't be used: replacing it
@@ -91,7 +101,7 @@ pub fn load_from(dir: Option<PathBuf>) -> anyhow::Result<Identity> {
     let Some(dir) = dir else {
         return Ok(Identity::throwaway(NO_DIR));
     };
-    if fs::create_dir_all(&dir).and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))).is_err() {
+    if private_dir(&dir).is_err() {
         return Ok(Identity::throwaway(NO_DIR));
     }
     let Ok(lock) = private_file().create(true).truncate(false).open(dir.join(LOCK_FILE)) else {
@@ -111,11 +121,22 @@ fn lock_notice(e: &TryLockError) -> &'static str {
     }
 }
 
-/// Write access to a file only we can read.
+/// Write access to a file only we can read: mode 0600 on Unix. On Windows the
+/// config folder sits in the user's profile, which is already private.
 pub(crate) fn private_file() -> OpenOptions {
     let mut options = OpenOptions::new();
-    options.write(true).mode(0o600);
+    options.write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
     options
+}
+
+/// Creates `dir` readable only by us (0700 on Unix; see `private_file`).
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
 }
 
 /// Writes beside `path` and renames, so a crash never leaves a half-written key.
@@ -155,6 +176,7 @@ fn read_or_create(path: &Path) -> anyhow::Result<Keys> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use crate::testutil::Scratch;
@@ -164,6 +186,7 @@ mod tests {
         scratch.path().join("corvo-lan")
     }
 
+    #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
@@ -184,8 +207,11 @@ mod tests {
         let first = load_from(Some(dir.clone())).unwrap();
         assert_eq!(first.notice, None);
         assert_eq!(first.known_peers, Some(dir.join("known_peers.json")));
-        assert_eq!(mode(&dir), 0o700);
-        assert_eq!(mode(&dir.join("identity.key")), 0o600);
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&dir), 0o700);
+            assert_eq!(mode(&dir.join("identity.key")), 0o600);
+        }
         let public = first.keys.public;
         drop(first);
         assert_eq!(load_from(Some(dir)).unwrap().keys.public, public);
@@ -245,6 +271,7 @@ mod tests {
         let saved = fs::read_to_string(dir.join("identity.key")).unwrap();
         assert_eq!(saved.trim(), to_hex(id.keys.secret()));
         assert!(!dir.join("identity.key.tmp").exists());
+        #[cfg(unix)]
         assert_eq!(mode(&dir.join("identity.key")), 0o600);
     }
 
@@ -262,5 +289,27 @@ mod tests {
         assert_eq!(config_dir(None, Some("/home/a")), Some(PathBuf::from("/home/a/.config/corvo-lan")));
         assert_eq!(config_dir(None, Some("")), None);
         assert_eq!(config_dir(None, None), None);
+    }
+
+    #[test]
+    fn windows_config_dir_needs_an_absolute_appdata() {
+        assert_eq!(windows_config_dir(None), None);
+        assert_eq!(windows_config_dir(Some("")), None);
+        assert_eq!(windows_config_dir(Some("relative\\dir")), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_dir_is_under_appdata() {
+        assert_eq!(
+            windows_config_dir(Some(r"C:\Users\a\AppData\Roaming")),
+            Some(PathBuf::from(r"C:\Users\a\AppData\Roaming\corvo-lan"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_config_dir_appends_corvo_lan() {
+        assert_eq!(windows_config_dir(Some("/appdata")), Some(PathBuf::from("/appdata/corvo-lan")));
     }
 }

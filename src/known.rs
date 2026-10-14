@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -137,7 +136,7 @@ impl Store {
 
     fn write(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("json.tmp");
-        let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut file = crate::identity::private_file().create(true).truncate(true).open(&tmp)?;
         file.write_all(&serde_json::to_vec_pretty(&self.entries).expect("entries always serialize"))?;
         file.sync_all()?;
         fs::rename(&tmp, path)
@@ -147,6 +146,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     const DAY: u64 = 86_400_000;
@@ -242,6 +242,7 @@ mod tests {
         assert_eq!(notice, None, "a missing file is just empty");
         s.record(PeerId::test(1), "bobRoger", DAY);
         s.save();
+        #[cfg(unix)]
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let (again, _) = Store::load(path);
         assert_eq!(again.judge(PeerId::test(1), "bobRoger", &[]), Judgement::Known);

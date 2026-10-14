@@ -13,7 +13,7 @@ use corvo_lan::update;
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// Base of your name, 1-9 letters or digits (default: $USER); the system adds a word
+    /// Base of your name, 1-9 letters or digits (default: your login name); the system adds a word
     #[arg(long)]
     nick: Option<String>,
     /// TCP port to listen on (0 = pick a free one)
@@ -45,7 +45,9 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
-    let base = args.nick.or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "anon".into());
+    // Windows sets USERNAME rather than USER.
+    let login = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok();
+    let base = args.nick.unwrap_or_else(|| names::default_base(login.as_deref()));
     names::validate_base(&base).map_err(|e| anyhow!("invalid --nick {base:?}: {e}"))?;
 
     // Holds the identity lock until the app exits.
