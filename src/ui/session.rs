@@ -568,7 +568,7 @@ mod tests {
         let mut s = naming("bobroger");
         let question = s.prompt();
         assert!(!s.cancel_prompt(), "Esc can't drop it");
-        assert_eq!(typed(&mut s, "Bob Smith"), Reaction::say("! name must be 1–9 letters or digits"));
+        assert_eq!(typed(&mut s, "Bob Smith"), Reaction::say("! name must be 1–6 letters or digits"));
         assert_eq!(typed(&mut s, "CHAT"), Reaction::say("! 'chat' is reserved"));
         assert_eq!(typed(&mut s, "/who"), Reaction::say("! pick your name first — Enter keeps @bobroger"));
         assert_eq!(
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(s.prompt(), Some(format!("new room #{first} — Enter to keep it, or type another name")));
 
         assert_eq!(typed(&mut s, "chat").print, vec!["! 'chat' is reserved"]);
-        assert_eq!(typed(&mut s, "a b").print, vec!["! name must be 1–9 letters or digits"]);
+        assert_eq!(typed(&mut s, "a b").print, vec!["! name must be 1–6 letters or digits"]);
         assert_eq!(room_preview(&s), first, "a bad name keeps the old preview");
 
         assert_eq!(typed(&mut s, "Dog"), Reaction::default());
