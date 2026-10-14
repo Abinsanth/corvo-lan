@@ -145,10 +145,10 @@ mod tests {
 
     #[test]
     fn announce_round_trips() {
-        let a = Announce { v: 3, id: PeerId::test(42), nick: "aliceMoon".into(), tcp_port: 54321 };
+        let a = Announce { v: 3, id: PeerId::test(42), nick: "alicemoon".into(), tcp_port: 54321 };
         let json = String::from_utf8(a.to_bytes()).unwrap();
         let hex = format!("000000000000002a{}", "0".repeat(48));
-        assert_eq!(json, format!(r#"{{"v":3,"id":"{hex}","nick":"aliceMoon","tcp_port":54321}}"#));
+        assert_eq!(json, format!(r#"{{"v":3,"id":"{hex}","nick":"alicemoon","tcp_port":54321}}"#));
         assert_eq!(Announce::from_bytes(json.as_bytes()).unwrap(), a);
     }
 

@@ -170,56 +170,56 @@ mod tests {
 
     #[test]
     fn a_known_key_under_a_base_met_with_other_keys_is_judged_there() {
-        let s = met(&[(1, "eveWolf", DAY), (2, "bobRoger", 2 * DAY)]);
-        assert_eq!(s.judge(PeerId::test(1), "bobMoon", &[]), Judgement::KeyChanged { last_seen: 2 * DAY });
-        assert_eq!(s.judge(PeerId::test(1), "bobMoon", &[PeerId::test(2)]), Judgement::Known);
+        let s = met(&[(1, "evewolf", DAY), (2, "bobroger", 2 * DAY)]);
+        assert_eq!(s.judge(PeerId::test(1), "bobmoon", &[]), Judgement::KeyChanged { last_seen: 2 * DAY });
+        assert_eq!(s.judge(PeerId::test(1), "bobmoon", &[PeerId::test(2)]), Judgement::Known);
     }
 
     #[test]
     fn a_known_key_under_a_new_base_nobody_else_used_is_silent() {
-        let s = met(&[(1, "eveWolf", DAY)]);
-        assert_eq!(s.judge(PeerId::test(1), "carolWolf", &[]), Judgement::Known);
+        let s = met(&[(1, "evewolf", DAY)]);
+        assert_eq!(s.judge(PeerId::test(1), "carolwolf", &[]), Judgement::Known);
     }
 
     #[test]
     fn a_known_key_is_silent() {
-        let s = met(&[(1, "bobRoger", DAY)]);
-        assert_eq!(s.judge(PeerId::test(1), "bobOtter", &[]), Judgement::Known);
+        let s = met(&[(1, "bobroger", DAY)]);
+        assert_eq!(s.judge(PeerId::test(1), "bobotter", &[]), Judgement::Known);
     }
 
     #[test]
     fn a_new_key_under_a_new_base_is_a_first_meeting() {
-        let s = met(&[(1, "bobRoger", DAY)]);
-        assert_eq!(s.judge(PeerId::test(2), "carolWolf", &[]), Judgement::FirstMeeting);
-        assert_eq!(Store::in_memory().judge(PeerId::test(2), "carolWolf", &[]), Judgement::FirstMeeting);
+        let s = met(&[(1, "bobroger", DAY)]);
+        assert_eq!(s.judge(PeerId::test(2), "carolwolf", &[]), Judgement::FirstMeeting);
+        assert_eq!(Store::in_memory().judge(PeerId::test(2), "carolwolf", &[]), Judgement::FirstMeeting);
     }
 
     #[test]
     fn a_new_key_under_a_base_met_before_is_a_key_change() {
-        let s = met(&[(1, "bobRoger", DAY), (3, "bobOtter", 3 * DAY)]);
-        assert_eq!(s.judge(PeerId::test(2), "bobMoon", &[]), Judgement::KeyChanged { last_seen: 3 * DAY });
+        let s = met(&[(1, "bobroger", DAY), (3, "bobotter", 3 * DAY)]);
+        assert_eq!(s.judge(PeerId::test(2), "bobmoon", &[]), Judgement::KeyChanged { last_seen: 3 * DAY });
     }
 
     #[test]
     fn two_machines_with_the_same_base_online_is_normal() {
-        let s = met(&[(1, "bobRoger", DAY)]);
-        assert_eq!(s.judge(PeerId::test(2), "bobMoon", &[PeerId::test(1)]), Judgement::FirstMeeting);
+        let s = met(&[(1, "bobroger", DAY)]);
+        assert_eq!(s.judge(PeerId::test(2), "bobmoon", &[PeerId::test(1)]), Judgement::FirstMeeting);
     }
 
     #[test]
     fn the_warning_fires_once() {
-        let mut s = met(&[(1, "bobRoger", DAY)]);
-        assert!(matches!(s.judge(PeerId::test(2), "bobMoon", &[]), Judgement::KeyChanged { .. }));
-        s.record(PeerId::test(2), "bobMoon", 2 * DAY);
-        assert_eq!(s.judge(PeerId::test(2), "bobMoon", &[]), Judgement::Known);
+        let mut s = met(&[(1, "bobroger", DAY)]);
+        assert!(matches!(s.judge(PeerId::test(2), "bobmoon", &[]), Judgement::KeyChanged { .. }));
+        s.record(PeerId::test(2), "bobmoon", 2 * DAY);
+        assert_eq!(s.judge(PeerId::test(2), "bobmoon", &[]), Judgement::Known);
     }
 
     #[test]
     fn recording_updates_the_name_and_time() {
-        let s = met(&[(1, "bobRoger", DAY), (1, "bobOtter", 2 * DAY)]);
+        let s = met(&[(1, "bobroger", DAY), (1, "bobotter", 2 * DAY)]);
         assert_eq!(
             s.entries,
-            vec![Entry { key: PeerId::test(1), base: "bob".into(), last_nick: "bobOtter".into(), last_seen: 2 * DAY }]
+            vec![Entry { key: PeerId::test(1), base: "bob".into(), last_nick: "bobotter".into(), last_seen: 2 * DAY }]
         );
     }
 
@@ -227,9 +227,9 @@ mod tests {
     fn a_full_store_drops_the_longest_unseen() {
         let mut s = Store::in_memory();
         for i in 0..MAX_ENTRIES as u64 {
-            s.record(PeerId::test(i + 10), "bobRoger", i + 10);
+            s.record(PeerId::test(i + 10), "bobroger", i + 10);
         }
-        s.record(PeerId::test(1), "carolWolf", 5_000);
+        s.record(PeerId::test(1), "carolwolf", 5_000);
         assert_eq!(s.entries.len(), MAX_ENTRIES);
         assert!(!s.entries.iter().any(|e| e.key == PeerId::test(10)), "the oldest went");
         assert!(s.entries.iter().any(|e| e.key == PeerId::test(1)));
@@ -240,12 +240,12 @@ mod tests {
         let (_scratch, path) = temp_file();
         let (mut s, notice) = Store::load(path.clone());
         assert_eq!(notice, None, "a missing file is just empty");
-        s.record(PeerId::test(1), "bobRoger", DAY);
+        s.record(PeerId::test(1), "bobroger", DAY);
         s.save();
         #[cfg(unix)]
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let (again, _) = Store::load(path);
-        assert_eq!(again.judge(PeerId::test(1), "bobRoger", &[]), Judgement::Known);
+        assert_eq!(again.judge(PeerId::test(1), "bobroger", &[]), Judgement::Known);
     }
 
     #[test]
@@ -266,7 +266,7 @@ mod tests {
         let (mut s, notice) = Store::load(path.clone());
         assert!(notice.unwrap().contains("couldn't read"));
         assert_eq!(s.path, None, "kept in memory only");
-        s.record(PeerId::test(1), "bobRoger", DAY);
+        s.record(PeerId::test(1), "bobroger", DAY);
         s.save();
         assert!(path.is_dir(), "never replaced");
     }
@@ -281,7 +281,7 @@ mod tests {
         let (mut s, notice) = Store::load(path.clone());
         assert!(notice.unwrap().contains("left it alone"));
         assert_eq!(s.path, None);
-        s.record(PeerId::test(1), "bobRoger", DAY);
+        s.record(PeerId::test(1), "bobroger", DAY);
         s.save();
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
     }
@@ -290,7 +290,7 @@ mod tests {
     fn loading_keeps_only_the_most_recently_seen() {
         let (_scratch, path) = temp_file();
         let entries: Vec<Entry> = (0..MAX_ENTRIES as u64 + 5)
-            .map(|i| Entry { key: PeerId::test(i + 1), base: "bob".into(), last_nick: "bobRoger".into(), last_seen: i })
+            .map(|i| Entry { key: PeerId::test(i + 1), base: "bob".into(), last_nick: "bobroger".into(), last_seen: i })
             .collect();
         fs::write(&path, serde_json::to_vec(&entries).unwrap()).unwrap();
         let (s, notice) = Store::load(path);
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn an_in_memory_store_writes_nothing() {
         let mut s = Store::in_memory();
-        s.record(PeerId::test(1), "bobRoger", DAY);
+        s.record(PeerId::test(1), "bobroger", DAY);
         s.save(); // no path: nothing to do, no panic
         assert_eq!(s.entries.len(), 1);
     }

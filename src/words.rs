@@ -1,27 +1,28 @@
-//! The 256 words that make names unique: `bob` → `bobRoger`, `cat` → `catPieR`.
+//! The 256 words that make names unique: `bob` → `bobroger`, `cat` → `catpie`.
 
-/// Every entry is 3–5 ASCII letters, capitalised, with no duplicates (see tests).
+/// Every entry is 3–5 lowercase ASCII letters, with no duplicates and none
+/// ending another, so a name splits into base and word only one way (see tests).
 pub const WORDS: [&str; 256] = [
-    "Ant", "Arch", "Ash", "Aspen", "Atom", "Axe", "Bay", "Bean", "Bear", "Bee", "Bell", "Berry", "Bird", "Bison",
-    "Blade", "Bloom", "Boat", "Bolt", "Brook", "Bud", "Bunny", "Cake", "Calm", "Camel", "Candy", "Cargo", "Cat",
-    "Cave", "Cedar", "Chalk", "Charm", "Chess", "Chip", "Cider", "Clay", "Cliff", "Cloud", "Clove", "Coast", "Cobra",
-    "Cocoa", "Comet", "Coral", "Crab", "Crane", "Creek", "Crow", "Cub", "Cup", "Curry", "Daisy", "Dawn", "Deer",
-    "Delta", "Dew", "Dingo", "Disco", "Dock", "Dove", "Drum", "Duck", "Dune", "Dusk", "Echo", "Elk", "Elm", "Fable",
-    "Fern", "Fig", "Finch", "Fire", "Fjord", "Flame", "Flint", "Flute", "Foam", "Fog", "Forge", "Frog", "Gecko", "Gem",
-    "Ghost", "Glade", "Glow", "Goat", "Gold", "Goose", "Grape", "Grove", "Gull", "Gust", "Hare", "Harp", "Hawk",
-    "Hazel", "Heron", "Hill", "Honey", "Hood", "Iris", "Ivy", "Jade", "Jam", "Jazz", "Jelly", "Jet", "Joy", "Kale",
-    "Kayak", "Kelp", "Kite", "Koala", "Lake", "Lamp", "Lark", "Lava", "Leaf", "Lime", "Lion", "Lotus", "Lynx", "Mango",
-    "Maple", "Marsh", "Melon", "Mist", "Mole", "Moon", "Moose", "Moss", "Moth", "Mouse", "Mule", "Nest", "Newt",
-    "Night", "Nova", "Oak", "Ocean", "Olive", "Onyx", "Orbit", "Orca", "Otter", "Owl", "Palm", "Panda", "Pearl",
-    "Pecan", "Pie", "Pike", "Pine", "Plum", "Polar", "Pond", "Prism", "Puma", "Quail", "Quill", "Rain", "Raven",
-    "Reed", "Reef", "Rice", "Ridge", "River", "Robin", "Rock", "Roger", "Rose", "Ruby", "Rust", "Sage", "Salt", "Sand",
-    "Seal", "Shark", "Shell", "Silk", "Sky", "Slate", "Sloth", "Snow", "Spark", "Star", "Stone", "Storm", "Sun",
-    "Swan", "Tango", "Teal", "Thorn", "Tide", "Tiger", "Toad", "Topaz", "Trout", "Tulip", "Twig", "Vine", "Viola",
-    "Wasp", "Wave", "Whale", "Wheat", "Wind", "Wolf", "Wren", "Yew", "Zebra", "Zest", "Acorn", "Amber", "Basil",
-    "Blaze", "Wisp", "Yarn", "Yoyo", "Cove", "Dart", "Fawn", "Gnu", "Luffy", "Zoro", "Nami", "Usopp", "Sanji", "Jinbe",
-    "Ace", "Sabo", "Law", "Kid", "Buggy", "Vivi", "Kaido", "Garp", "Coby", "Kuma", "Enel", "Lucci", "Oden", "Momo",
-    "Bepo", "Zeff", "Marco", "Teach", "Wapol", "Kyros", "Pedro", "Moria", "Boa", "Sunny", "Merry", "Pell", "Hody",
-    "Sugar",
+    "ant", "arch", "ash", "aspen", "atom", "axe", "bay", "bean", "bear", "bee", "bell", "berry", "bird", "bison",
+    "blade", "bloom", "boat", "bolt", "brook", "bud", "bunny", "cake", "calm", "camel", "candy", "cargo", "cat",
+    "cave", "cedar", "chalk", "charm", "chess", "chip", "cider", "clay", "cliff", "cloud", "clove", "coast", "cobra",
+    "cocoa", "comet", "coral", "crab", "crane", "creek", "crow", "cub", "cup", "curry", "daisy", "dawn", "deer",
+    "delta", "dew", "dingo", "disco", "dock", "dove", "drum", "duck", "dune", "dusk", "echo", "elk", "elm", "fable",
+    "fern", "fig", "finch", "fire", "fjord", "flame", "flint", "flute", "foam", "fog", "forge", "frog", "gecko", "gem",
+    "ghost", "glade", "glow", "goat", "gold", "goose", "grape", "grove", "gull", "gust", "hare", "harp", "hawk",
+    "hazel", "heron", "hill", "honey", "hood", "iris", "ivy", "jade", "jam", "jazz", "jelly", "jet", "joy", "kale",
+    "kayak", "kelp", "kite", "koala", "lake", "lamp", "lark", "lava", "leaf", "lime", "lion", "lotus", "lynx", "mango",
+    "maple", "marsh", "melon", "mist", "mole", "moon", "moose", "moss", "moth", "mouse", "mule", "nest", "newt",
+    "night", "nova", "oak", "ocean", "olive", "onyx", "orbit", "orca", "otter", "owl", "palm", "panda", "pearl",
+    "pecan", "pie", "pike", "pine", "plum", "polar", "pond", "prism", "puma", "quail", "quill", "rain", "raven",
+    "reed", "reef", "rice", "ridge", "river", "robin", "rock", "roger", "rose", "ruby", "rust", "sage", "salt", "sand",
+    "seal", "shark", "shell", "silk", "sky", "slate", "sloth", "snow", "spark", "star", "stone", "storm", "sun",
+    "swan", "tango", "teal", "thorn", "tide", "tiger", "toad", "topaz", "trout", "tulip", "twig", "vine", "viola",
+    "wasp", "wave", "whale", "wheat", "wind", "wolf", "wren", "yew", "zebra", "zest", "acorn", "amber", "basil",
+    "blaze", "wisp", "yarn", "yoyo", "cove", "dart", "fawn", "gnu", "luffy", "zoro", "nami", "usopp", "sanji", "jinbe",
+    "ace", "sabo", "law", "kid", "buggy", "vivi", "kaido", "garp", "coby", "kuma", "enel", "lucci", "oden", "momo",
+    "bepo", "zeff", "marco", "teach", "wapol", "kyros", "pedro", "moria", "boa", "sunny", "merry", "pell", "hody",
+    "sugar",
 ];
 
 #[cfg(test)]
@@ -30,14 +31,21 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn words_are_unique_short_and_capitalised() {
+    fn words_are_unique_short_and_lowercase() {
         let unique: HashSet<&str> = WORDS.iter().copied().collect();
         assert_eq!(unique.len(), 256);
         for w in WORDS {
             assert!((3..=5).contains(&w.len()), "{w}");
-            let mut chars = w.chars();
-            assert!(chars.next().unwrap().is_ascii_uppercase(), "{w}");
-            assert!(chars.all(|c| c.is_ascii_lowercase()), "{w}");
+            assert!(w.chars().all(|c| c.is_ascii_lowercase()), "{w}");
+        }
+    }
+
+    #[test]
+    fn no_word_ends_another() {
+        for a in WORDS {
+            for b in WORDS {
+                assert!(a == b || !b.ends_with(a), "{a} ends {b}");
+            }
         }
     }
 }

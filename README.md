@@ -5,7 +5,7 @@ Wi-Fi or LAN and they find each other. There's no server, no account and no
 setup.
 
 - People find each other automatically (UDP multicast), then talk over direct TCP connections.
-- Everyone gets a unique name: you choose the start and a word is added (`--nick bob` → `@bobRoger`).
+- Everyone gets a unique name: you choose the start and a word is added (`--nick Bob` → `@bobroger`). Names are all lowercase.
 - Private rooms are end-to-end encrypted, and the people inside decide who joins. A room's key only lets you ask.
 - Direct messages go peer to peer, and every connection is encrypted.
 - Chats are never written to disk. Quitting forgets everything.
@@ -94,12 +94,12 @@ corvo-lan --nick bob        # or choose the start yourself
 After about two seconds you get a name, and you're connected to everyone else running it.
 
 ```
-/create cat 5              # a room for up to 5 people, e.g. #catPieR with key k7m9xq
-/invite                    # copy "/chat #catPieR k7m9xq" to send to someone
-/chat #catPieR k7m9xq      # they paste it to ask to join
-/approve @bobRoger         # someone in the room lets them in (or /deny @bobRoger)
-/chat @bobRoger            # private chat
-/msg @bobRoger hi          # one-off private message
+/create cat 5              # a room for up to 5 people, e.g. #catpie with key k7m9xq
+/invite                    # copy "/chat #catpie k7m9xq" to send to someone
+/chat #catpie k7m9xq      # they paste it to ask to join
+/approve @bobroger         # someone in the room lets them in (or /deny @bobroger)
+/chat @bobroger            # private chat
+/msg @bobroger hi          # one-off private message
 /chat bob                  # the @ or # is optional when only one name matches
 /who                       # who's connected
 /update [yes]              # check for and install a newer version

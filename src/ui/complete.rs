@@ -106,9 +106,9 @@ mod tests {
 
     fn cands() -> Candidates {
         Candidates {
-            nicks: vec!["bobRoger".into(), "bobKite".into(), "carolWolf".into()],
-            rooms: vec!["catPieR".into()],
-            waiting: vec!["daveOak".into()],
+            nicks: vec!["bobroger".into(), "bobkite".into(), "carolwolf".into()],
+            rooms: vec!["catpie".into()],
+            waiting: vec!["daveoak".into()],
         }
     }
 
@@ -120,9 +120,9 @@ mod tests {
     fn names_and_rooms_complete_by_prefix_ignoring_case() {
         assert_eq!(
             complete("hi @BO", &cands()),
-            Some(Completion { start: 3, matches: vec!["@bobRoger".into(), "@bobKite".into()] })
+            Some(Completion { start: 3, matches: vec!["@bobroger".into(), "@bobkite".into()] })
         );
-        assert_eq!(matches("#c"), vec!["#catPieR"]);
+        assert_eq!(matches("#c"), vec!["#catpie"]);
         assert_eq!(matches("@").len(), 3, "a bare sigil lists everyone");
         assert_eq!(complete("@zed", &cands()), None);
         assert_eq!(complete("hello", &cands()), None);
@@ -133,11 +133,11 @@ mod tests {
 
     #[test]
     fn approve_and_deny_complete_who_is_waiting() {
-        assert_eq!(matches("/approve @"), vec!["@daveOak"]);
-        assert_eq!(matches("/deny @d"), vec!["@daveOak"]);
+        assert_eq!(matches("/approve @"), vec!["@daveoak"]);
+        assert_eq!(matches("/deny @d"), vec!["@daveoak"]);
         assert_eq!(matches("/approve @b"), Vec::<String>::new(), "only people who asked");
         assert_eq!(matches("/msg @d"), Vec::<String>::new(), "elsewhere it's everyone online");
-        assert_eq!(matches("/invite #c"), vec!["#catPieR"]);
+        assert_eq!(matches("/invite #c"), vec!["#catpie"]);
         assert_eq!(matches("/inv"), vec!["/invite"]);
     }
 
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn common_prefix_is_char_wise() {
-        assert_eq!(common_prefix(&["@bobRoger".into(), "@bobKite".into()]), "@bob");
+        assert_eq!(common_prefix(&["@bobroger".into(), "@bobkite".into()]), "@bob");
         assert_eq!(common_prefix(&["/q".into()]), "/q");
         assert_eq!(common_prefix(&[]), "");
     }
@@ -171,22 +171,22 @@ mod tests {
     #[test]
     fn candidates_put_room_members_first_and_leave_me_out() {
         let mut s = Store::new();
-        s.apply(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
-        for (i, n) in ["annMoon", "zoeOwl", "carolWolf", "bobRoger"].iter().enumerate() {
+        s.apply(&Event::Assigned { nick: "annmoon".into(), renamed: false }, 0);
+        for (i, n) in ["annmoon", "zoeowl", "carolwolf", "bobroger"].iter().enumerate() {
             s.apply(&Event::PeerJoined { id: PeerId::test(i as u64), nick: n.to_string() }, 0);
         }
         s.apply(
-            &Event::RoomJoined { name: "dogR".into(), key: "k7m9xq".into(), max: 13, members: vec!["zoeOwl".into()] },
+            &Event::RoomJoined { name: "dogR".into(), key: "k7m9xq".into(), max: 13, members: vec!["zoeowl".into()] },
             0,
         );
         s.apply(&Event::RoomJoined { name: "catR".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
         s.switch(Conv::Room("dogR".into()));
-        for (room, nick) in [("dogR", "eveOwl"), ("catR", "daveOak"), ("dogR", "daveOak")] {
+        for (room, nick) in [("dogR", "eveowl"), ("catR", "daveoak"), ("dogR", "daveoak")] {
             s.apply(&Event::JoinRequest { room: room.into(), nick: nick.into(), have: 0, need: 1 }, 0);
         }
         let c = Candidates::from_store(&s);
-        assert_eq!(c.nicks, vec!["zoeOwl", "bobRoger", "carolWolf"]);
-        assert_eq!(c.waiting, vec!["daveOak", "eveOwl"], "everyone waiting in any of my rooms, once");
+        assert_eq!(c.nicks, vec!["zoeowl", "bobroger", "carolwolf"]);
+        assert_eq!(c.waiting, vec!["daveoak", "eveowl"], "everyone waiting in any of my rooms, once");
         assert_eq!(c.rooms, vec!["catR", "dogR"]);
     }
 }

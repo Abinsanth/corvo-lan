@@ -28,7 +28,7 @@ pub struct Sighting {
 /// Validates a datagram. The TCP address uses the UDP source IP, never the payload.
 pub fn parse_announce(bytes: &[u8], src: SocketAddr, me: PeerId) -> Option<Sighting> {
     let a = Announce::from_bytes(bytes).ok()?;
-    if a.v != PROTOCOL_VERSION || a.id == me || a.tcp_port == 0 || !names::is_valid_nick(&a.nick) {
+    if a.v != PROTOCOL_VERSION || a.id == me || a.tcp_port == 0 || !names::is_valid_name(&a.nick) {
         return None;
     }
     Some(Sighting { id: a.id, nick: a.nick, tcp_addr: SocketAddr::new(src.ip(), a.tcp_port) })
@@ -100,14 +100,14 @@ mod tests {
     }
 
     fn bytes(v: u8, id: PeerId, tcp_port: u16) -> Vec<u8> {
-        Announce { v, id, nick: "bobRoger".into(), tcp_port }.to_bytes()
+        Announce { v, id, nick: "bobroger".into(), tcp_port }.to_bytes()
     }
 
     #[test]
     fn valid_announce_uses_source_ip_and_payload_port() {
         let s = parse_announce(&bytes(PROTOCOL_VERSION, OTHER, 5000), src(), ME).unwrap();
         assert_eq!(s.id, OTHER);
-        assert_eq!(s.nick, "bobRoger");
+        assert_eq!(s.nick, "bobroger");
         assert_eq!(s.tcp_addr, "192.168.1.20:5000".parse().unwrap());
     }
 

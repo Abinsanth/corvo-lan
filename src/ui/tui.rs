@@ -422,8 +422,8 @@ mod tests {
 
     fn session() -> Session {
         let mut s = Session::new(false);
-        s.on_event(&Event::Assigned { nick: "annMoon".into(), renamed: false }, 0);
-        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobRoger".into() }, 0);
+        s.on_event(&Event::Assigned { nick: "annmoon".into(), renamed: false }, 0);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobroger".into() }, 0);
         s
     }
 
@@ -432,7 +432,7 @@ mod tests {
         let mut s = session();
         let mut state = TuiState::new(false);
         let now = Instant::now();
-        s.on_line("/chat @bobRoger", None);
+        s.on_line("/chat @bobroger", None);
         state.on_status = true;
         assert_eq!(on_send(&mut s, &mut state, "hello".into(), now), None);
         let last = state.status_lines().last().unwrap();
@@ -471,7 +471,7 @@ mod tests {
         let mut s = session();
         let mut state = TuiState::new(false);
         let now = Instant::now();
-        s.on_line("/chat @bobRoger", None);
+        s.on_line("/chat @bobroger", None);
         state.on_status = false;
         on_send(&mut s, &mut state, "/create cat".into(), now);
         state.step_tab(&mut s, 1);
@@ -480,7 +480,7 @@ mod tests {
         let r = on_send(&mut s, &mut state, "10".into(), now).unwrap();
         assert_eq!(
             r.commands,
-            vec![crate::api::Command::Send { to: Target::Dm("bobRoger".into()), text: "10".into() }]
+            vec![crate::api::Command::Send { to: Target::Dm("bobroger".into()), text: "10".into() }]
         );
     }
 
@@ -500,10 +500,10 @@ mod tests {
         let mut s = session();
         let mut state = TuiState::new(false);
         let now = Instant::now();
-        s.on_event(&Event::RoomCreated { name: "catPieR".into(), key: "k7m9xq".into(), max: 13 }, 0);
+        s.on_event(&Event::RoomCreated { name: "catpie".into(), key: "k7m9xq".into(), max: 13 }, 0);
         state.on_status = false;
         let r = on_send(&mut s, &mut state, "/invite".into(), now).unwrap();
-        assert_eq!(r.copy.as_deref(), Some("/chat #catPieR k7m9xq"));
+        assert_eq!(r.copy.as_deref(), Some("/chat #catpie k7m9xq"));
         assert!(state.flash_text(now).is_some_and(|t| t.starts_with("* invite copied")));
     }
 
@@ -512,20 +512,20 @@ mod tests {
         let mut s = session();
         let mut state = TuiState::new(false);
         let now = Instant::now();
-        let r = on_send(&mut s, &mut state, "/chat @bobRoger".into(), now).unwrap();
+        let r = on_send(&mut s, &mut state, "/chat @bobroger".into(), now).unwrap();
         assert!(r.commands.is_empty());
         assert!(!state.on_status, "opening a chat shows its tab");
         let r = on_send(&mut s, &mut state, "hi\nthere".into(), now).unwrap();
         assert_eq!(
             r.commands,
-            vec![crate::api::Command::Send { to: Target::Dm("bobRoger".into()), text: "hi\nthere".into() }]
+            vec![crate::api::Command::Send { to: Target::Dm("bobroger".into()), text: "hi\nthere".into() }]
         );
         assert_eq!(state.history.prev("").as_deref(), Some("hi\nthere"));
-        let r = on_send(&mut s, &mut state, "/chat @ghostMoon".into(), now).unwrap();
+        let r = on_send(&mut s, &mut state, "/chat @ghostmoon".into(), now).unwrap();
         assert!(r.print.is_empty(), "printed lines were moved into the corvo tab");
-        assert_eq!(state.status_lines().last().unwrap().text, "! @ghostMoon is offline");
-        assert_eq!(state.flash_text(now), Some("! @ghostMoon is offline"));
-        assert_eq!(s.store.current(), Some(&Conv::Dm("bobRoger".into())));
+        assert_eq!(state.status_lines().last().unwrap().text, "! @ghostmoon is offline");
+        assert_eq!(state.flash_text(now), Some("! @ghostmoon is offline"));
+        assert_eq!(s.store.current(), Some(&Conv::Dm("bobroger".into())));
     }
 
     #[test]
@@ -539,18 +539,18 @@ mod tests {
         on_event(
             &mut s,
             &mut state,
-            &Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] },
+            &Event::RoomJoined { name: "catpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] },
             now,
         );
         assert!(!state.on_status, "joining shows the room");
         state.scroll.page_up(100, 10);
         let msg =
-            Event::Message { conv: Conv::Room("catPieR".into()), from: "bobRoger".into(), text: "x".into(), ts: 0 };
+            Event::Message { conv: Conv::Room("catpie".into()), from: "bobroger".into(), text: "x".into(), ts: 0 };
         on_event(&mut s, &mut state, &msg, now);
         assert_eq!(state.scroll.unseen(), 1);
-        on_event(&mut s, &mut state, &Event::RoomLeft { name: "catPieR".into() }, now);
+        on_event(&mut s, &mut state, &Event::RoomLeft { name: "catpie".into() }, now);
         assert!(state.on_status, "leaving the room you're viewing falls back to corvo");
-        let warn = Event::Info("@bobMoon has a different key from the bob you met before (last seen 2026-10-12). Compare fingerprints in /who.".into());
+        let warn = Event::Info("@bobmoon has a different key from the bob you met before (last seen 2026-10-12). Compare fingerprints in /who.".into());
         let later = now + Duration::from_secs(60);
         on_event(&mut s, &mut state, &warn, later);
         assert!(state.flash_text(later).is_some_and(|t| t.contains("different key")), "warnings flash");
@@ -564,12 +564,12 @@ mod tests {
         on_event(
             &mut s,
             &mut state,
-            &Event::RoomJoined { name: "catPieR".into(), key: "k7m9xq".into(), max: 13, members: vec![] },
+            &Event::RoomJoined { name: "catpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] },
             now,
         );
-        let room = Conv::Room("catPieR".into());
+        let room = Conv::Room("catpie".into());
         state.scroll.page_up(100, 10);
-        let msg = Event::Message { conv: room.clone(), from: "bobRoger".into(), text: "x".into(), ts: 0 };
+        let msg = Event::Message { conv: room.clone(), from: "bobroger".into(), text: "x".into(), ts: 0 };
         on_event(&mut s, &mut state, &msg, now);
         assert_eq!(state.scroll.unseen(), 1);
         on_event(&mut s, &mut state, &Event::Sent { conv: room, text: "mine".into(), ts: 0 }, now);
@@ -604,18 +604,18 @@ mod tests {
 
     #[test]
     fn tab_completes_and_the_list_takes_enter_esc_and_arrows() {
-        let mut s = session(); // me: annMoon; online: bobRoger
-        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobKite".into() }, 0);
+        let mut s = session(); // me: annmoon; online: bobroger
+        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobkite".into() }, 0);
         let mut state = TuiState::new(false);
         state.editor.set("@b".into());
         apply_key(&mut s, &mut state, Action::Complete);
-        assert_eq!(state.popup.as_ref().unwrap().matches, vec!["@bobKite", "@bobRoger"]);
+        assert_eq!(state.popup.as_ref().unwrap().matches, vec!["@bobkite", "@bobroger"]);
         apply_key(&mut s, &mut state, Action::Down);
         apply_key(&mut s, &mut state, Action::Up);
         apply_key(&mut s, &mut state, Action::Complete);
         assert_eq!(state.popup.as_ref().unwrap().selected, 1, "Tab moves down the list");
         assert_eq!(apply_key(&mut s, &mut state, Action::Send), KeyOutcome::Stay, "Enter picks, doesn't send");
-        assert_eq!(state.editor.text(), "@bobRoger ");
+        assert_eq!(state.editor.text(), "@bobroger ");
 
         state.editor.set("@b".into());
         apply_key(&mut s, &mut state, Action::Complete);
@@ -625,7 +625,7 @@ mod tests {
 
         apply_key(&mut s, &mut state, Action::Complete);
         apply_key(&mut s, &mut state, Action::Insert('r'));
-        assert_eq!(state.popup.as_ref().unwrap().matches, vec!["@bobRoger"], "typing refreshes the list");
+        assert_eq!(state.popup.as_ref().unwrap().matches, vec!["@bobroger"], "typing refreshes the list");
         apply_key(&mut s, &mut state, Action::Left);
         assert!(state.popup.is_none(), "moving the cursor closes it");
     }
@@ -633,8 +633,8 @@ mod tests {
     #[test]
     fn shift_tab_switches_tabs_even_with_the_list_open() {
         let mut s = session();
-        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobKite".into() }, 0);
-        s.on_line("/chat @bobRoger", None);
+        s.on_event(&Event::PeerJoined { id: PeerId::test(3), nick: "bobkite".into() }, 0);
+        s.on_line("/chat @bobroger", None);
         let mut state = TuiState::new(false);
         state.on_status = true;
         state.editor.set("@b".into());

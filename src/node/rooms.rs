@@ -236,7 +236,7 @@ impl Node {
         if !self.room_slot_free() {
             return;
         }
-        let Some(name) = names::pick_room(base, |n| self.rooms.holds(n)) else {
+        let Some(name) = names::pick_name(base, |n| self.rooms.holds(n)) else {
             self.emit(Event::Error(format!("you're already in every #{base}… room")));
             return;
         };
@@ -245,7 +245,7 @@ impl Node {
     }
 
     pub(super) fn join_room(&mut self, name: &str, key: &str) {
-        if !names::is_valid_room(name) {
+        if !names::is_valid_name(name) {
             self.emit(Event::Error(format!("#{name} isn't a room name")));
             return;
         }
@@ -895,7 +895,7 @@ mod tests {
 
     const DAVE: PeerId = PeerId::test(0x4000_0000_0000_0000);
     const ERIN: PeerId = PeerId::test(0x5000_0000_0000_0000);
-    const NAME: &str = "catPieR";
+    const NAME: &str = "catpie";
     const KEY: &str = "k7m9xq";
     const SECRET: room::Secret = [9; 32];
 
@@ -945,10 +945,10 @@ mod tests {
 
     fn with_peers() -> Harness {
         let mut h = Harness::new();
-        h.connect(BOB, "bobRoger", true);
-        h.connect(CAROL, "carolWolf", true);
-        h.connect(DAVE, "daveOak", true);
-        h.connect(ERIN, "erinOwl", true);
+        h.connect(BOB, "bobroger", true);
+        h.connect(CAROL, "carolwolf", true);
+        h.connect(DAVE, "daveoak", true);
+        h.connect(ERIN, "erinowl", true);
         h.events();
         h
     }
@@ -966,7 +966,7 @@ mod tests {
         h.pump().await;
         let (name, key) = match h.events().as_slice() {
             [Event::RoomCreated { name, key, max: m }] => {
-                assert!(name.starts_with("cat") && names::is_valid_room(name), "{name}");
+                assert!(name.starts_with("cat") && names::is_valid_name(name), "{name}");
                 assert!(room::validate_key(key).is_ok(), "{key}");
                 assert_eq!(*m, max);
                 (name.clone(), key.clone())
@@ -1036,7 +1036,7 @@ mod tests {
         let mut h = with_peers();
         create(&mut h, 13).await;
         create(&mut h, 13).await;
-        h.node.handle_command(Command::JoinRoom { name: "dogPieR".into(), key: KEY.into() });
+        h.node.handle_command(Command::JoinRoom { name: "dogpie".into(), key: KEY.into() });
         h.node.handle_command(Command::CreateRoom { base: "cat".into(), max: 13 });
         assert_eq!(h.events(), vec![Event::Error(format!("you're in {MAX_ROOMS} rooms (the max) — /leave one first"))]);
     }
@@ -1056,13 +1056,13 @@ mod tests {
         h.node.handle_command(Command::JoinRoom { name: NAME.into(), key: "123-k7m9xq".into() });
         h.node.handle_command(Command::LeaveRoom { name: NAME.into() });
         h.node.handle_command(Command::Send { to: Target::Room(NAME.into()), text: "x".into() });
-        h.node.handle_command(Command::Approve { room: NAME.into(), nick: "bobRoger".into() });
+        h.node.handle_command(Command::Approve { room: NAME.into(), nick: "bobroger".into() });
         let errors: Vec<String> =
             h.events().into_iter().map(|e| if let Event::Error(m) = e { m } else { panic!("{e:?}") }).collect();
         assert_eq!(errors[0], "'chat' is reserved");
         assert_eq!(errors[1], "#catPie isn't a room name");
         assert!(errors[2].starts_with("a room key is 6"));
-        assert_eq!(errors[3..], ["you're not in #catPieR"; 3]);
+        assert_eq!(errors[3..], ["you're not in #catpie"; 3]);
         assert!(h.sent(BOB).is_empty());
     }
 
@@ -1077,7 +1077,7 @@ mod tests {
         assert!(h.sent(CAROL).is_empty(), "the reply goes only to the knocker");
         assert_eq!(
             h.events(),
-            vec![Event::JoinRequest { room: made.name.clone(), nick: "bobRoger".into(), have: 0, need: 1 }]
+            vec![Event::JoinRequest { room: made.name.clone(), nick: "bobroger".into(), have: 0, need: 1 }]
         );
     }
 
@@ -1110,13 +1110,13 @@ mod tests {
         knock(&mut h, BOB, &made, 100);
         h.events();
         h.sent(BOB);
-        approve(&mut h, &made, "bobRoger");
+        approve(&mut h, &made, "bobroger");
         assert_eq!(
             h.events(),
             vec![Event::Approved {
                 room: made.name.clone(),
-                nick: "bobRoger".into(),
-                by: "annMoon".into(),
+                nick: "bobroger".into(),
+                by: "annmoon".into(),
                 have: 1,
                 need: 1
             }]
@@ -1140,12 +1140,12 @@ mod tests {
         }
         knock(&mut h, BOB, &made, 100);
         h.events();
-        approve(&mut h, &made, "bobRoger");
+        approve(&mut h, &made, "bobroger");
         assert!(matches!(h.events().as_slice(), [Event::Approved { have: 1, need: 2, .. }]));
         h.pump().await; // Settle: not enough yet
         assert!(!granted(&made, &h.sent(BOB)));
         vote(&mut h, CAROL, &made, BOB, true);
-        assert!(matches!(h.events().as_slice(), [Event::Approved { by, have: 2, need: 2, .. }] if by == "carolWolf"));
+        assert!(matches!(h.events().as_slice(), [Event::Approved { by, have: 2, need: 2, .. }] if by == "carolwolf"));
         h.pump().await; // Settle
         assert!(granted(&made, &h.sent(BOB)), "we approved, so we hand over the secret");
     }
@@ -1170,7 +1170,7 @@ mod tests {
         knock(&mut h, BOB, &made, 100);
         h.events();
         h.sent(BOB);
-        h.node.handle_command(Command::Deny { room: made.name.clone(), nick: "bobRoger".into() });
+        h.node.handle_command(Command::Deny { room: made.name.clone(), nick: "bobroger".into() });
         assert!(refused(&made, &h.sent(BOB), false));
         assert!(
             bodies(&made.keys, &h.sent(CAROL))
@@ -1179,10 +1179,10 @@ mod tests {
         );
         assert_eq!(
             h.events(),
-            vec![request_ended(&made.name, "bobRoger", RequestEnd::Denied { by: "annMoon".into() })]
+            vec![request_ended(&made.name, "bobroger", RequestEnd::Denied { by: "annmoon".into() })]
         );
-        approve(&mut h, &made, "bobRoger");
-        assert_eq!(h.events(), vec![Event::Error(format!("@bobRoger isn't waiting to join #{}", made.name))]);
+        approve(&mut h, &made, "bobroger");
+        assert_eq!(h.events(), vec![Event::Error(format!("@bobroger isn't waiting to join #{}", made.name))]);
     }
 
     #[tokio::test]
@@ -1195,7 +1195,7 @@ mod tests {
         vote(&mut h, CAROL, &made, BOB, false);
         assert_eq!(
             h.events(),
-            vec![request_ended(&made.name, "bobRoger", RequestEnd::Denied { by: "carolWolf".into() })]
+            vec![request_ended(&made.name, "bobroger", RequestEnd::Denied { by: "carolwolf".into() })]
         );
         assert!(h.node.rooms.joined[&made.id].requests.is_empty());
     }
@@ -1207,7 +1207,7 @@ mod tests {
         verify(&mut h, CAROL, &made.name, &made.keys);
         knock(&mut h, BOB, &made, 100);
         knock(&mut h, DAVE, &made, 100);
-        h.node.handle_command(Command::Deny { room: made.name.clone(), nick: "bobRoger".into() });
+        h.node.handle_command(Command::Deny { room: made.name.clone(), nick: "bobroger".into() });
         deliver(&mut h, DAVE, frame_from(DAVE, &made.door, RoomBody::Leave));
         h.events();
         // carol approved each of them at the same moment.
@@ -1217,7 +1217,7 @@ mod tests {
         assert!(h.node.rooms.joined[&made.id].requests.is_empty());
         // A fresh request (a new ask) is welcome again.
         knock(&mut h, BOB, &made, 500);
-        assert!(matches!(h.events().as_slice(), [Event::JoinRequest { nick, .. }] if nick == "bobRoger"));
+        assert!(matches!(h.events().as_slice(), [Event::JoinRequest { nick, .. }] if nick == "bobroger"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1226,7 +1226,7 @@ mod tests {
         let made = create(&mut h, 13).await;
         verify(&mut h, CAROL, &made.name, &made.keys);
         knock(&mut h, BOB, &made, 100);
-        approve(&mut h, &made, "bobRoger");
+        approve(&mut h, &made, "bobroger");
         h.pump().await; // Settle: bob is let in
         h.events();
         vote(&mut h, CAROL, &made, BOB, false);
@@ -1256,14 +1256,14 @@ mod tests {
         h.events();
         h.sent(BOB);
         h.sent(DAVE);
-        approve(&mut h, &made, "bobRoger");
-        approve(&mut h, &made, "daveOak");
+        approve(&mut h, &made, "bobroger");
+        approve(&mut h, &made, "daveoak");
         h.events();
         h.pump().await; // Settle
         h.pump().await; // Settle (nothing left to do)
         assert!(granted(&made, &h.sent(DAVE)), "dave asked first");
         assert!(refused(&made, &h.sent(BOB), true));
-        assert_eq!(h.events(), vec![request_ended(&made.name, "bobRoger", RequestEnd::Full)]);
+        assert_eq!(h.events(), vec![request_ended(&made.name, "bobroger", RequestEnd::Full)]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1271,15 +1271,15 @@ mod tests {
         let mut h = with_peers();
         let made = create(&mut h, 2).await;
         knock(&mut h, BOB, &made, 100);
-        approve(&mut h, &made, "bobRoger");
+        approve(&mut h, &made, "bobroger");
         h.pump().await; // Settle: bob is let in and holds the only slot
         h.events();
         knock(&mut h, DAVE, &made, 300);
         assert!(refused(&made, &h.sent(DAVE), true));
         h.node.on_tick(Instant::now() + REQUEST_STALE);
-        assert_eq!(h.events(), vec![request_ended(&made.name, "bobRoger", RequestEnd::Gone)]);
+        assert_eq!(h.events(), vec![request_ended(&made.name, "bobroger", RequestEnd::Gone)]);
         knock(&mut h, DAVE, &made, 300);
-        assert!(matches!(h.events().as_slice(), [Event::JoinRequest { nick, .. }] if nick == "daveOak"));
+        assert!(matches!(h.events().as_slice(), [Event::JoinRequest { nick, .. }] if nick == "daveoak"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1287,15 +1287,15 @@ mod tests {
         let mut h = with_peers();
         let made = create(&mut h, 13).await;
         knock(&mut h, BOB, &made, 100);
-        approve(&mut h, &made, "bobRoger");
+        approve(&mut h, &made, "bobroger");
         h.pump().await; // Settle
         h.events();
         verify(&mut h, BOB, &made.name, &made.keys);
         assert_eq!(
             h.events(),
             vec![
-                request_ended(&made.name, "bobRoger", RequestEnd::Admitted),
-                Event::MemberJoined { room: made.name.clone(), nick: "bobRoger".into() }
+                request_ended(&made.name, "bobroger", RequestEnd::Admitted),
+                Event::MemberJoined { room: made.name.clone(), nick: "bobroger".into() }
             ]
         );
         assert!(h.node.rooms.joined[&made.id].requests.is_empty());
@@ -1309,10 +1309,10 @@ mod tests {
         knock(&mut h, CAROL, &made, 100);
         h.events();
         deliver(&mut h, BOB, frame_from(BOB, &made.door, RoomBody::Leave));
-        assert_eq!(h.events(), vec![request_ended(&made.name, "bobRoger", RequestEnd::Gone)]);
+        assert_eq!(h.events(), vec![request_ended(&made.name, "bobroger", RequestEnd::Gone)]);
         let conn = h.node.peers[&CAROL].conn;
         h.node.handle_msg(NodeMsg::PeerGone { conn, id: CAROL, reason: crate::api::LeaveReason::Lost });
-        assert!(h.events().contains(&request_ended(&made.name, "carolWolf", RequestEnd::Gone)));
+        assert!(h.events().contains(&request_ended(&made.name, "carolwolf", RequestEnd::Gone)));
     }
 
     #[tokio::test]
@@ -1322,7 +1322,7 @@ mod tests {
         knock(&mut h, BOB, &made, 100);
         h.events();
         h.node.on_tick(Instant::now() + REQUEST_STALE);
-        assert_eq!(h.events(), vec![request_ended(&made.name, "bobRoger", RequestEnd::Gone)]);
+        assert_eq!(h.events(), vec![request_ended(&made.name, "bobroger", RequestEnd::Gone)]);
     }
 
     // ---- newcomers ----
@@ -1356,7 +1356,7 @@ mod tests {
         deliver(&mut h, BOB, frame_from(BOB, &door(), grant.clone()));
         assert_eq!(
             h.events(),
-            vec![Event::RoomJoined { name: NAME.into(), key: KEY.into(), max: 13, members: vec!["bobRoger".into()] }]
+            vec![Event::RoomJoined { name: NAME.into(), key: KEY.into(), max: 13, members: vec!["bobroger".into()] }]
         );
         deliver(&mut h, CAROL, frame_from(CAROL, &door(), grant));
         assert!(h.events().is_empty(), "a second grant changes nothing");
@@ -1367,7 +1367,7 @@ mod tests {
         let RoomBody::Probe { nonce: probe } = &sent[0] else { panic!("{sent:?}") };
         assert!(matches!(&sent[1], RoomBody::Here { echo: None, .. }));
         deliver(&mut h, CAROL, frame_from(CAROL, &keys, here(NAME, Some(probe))));
-        assert_eq!(h.events(), vec![Event::MemberJoined { room: NAME.into(), nick: "carolWolf".into() }]);
+        assert_eq!(h.events(), vec![Event::MemberJoined { room: NAME.into(), nick: "carolwolf".into() }]);
         deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Chat { text: "welcome".into() }));
         assert!(matches!(h.events().as_slice(), [Event::Message { text, .. }] if text == "welcome"));
     }
@@ -1421,7 +1421,7 @@ mod tests {
         deliver(&mut h, CAROL, frame_from(CAROL, &door(), RoomBody::Refuse { full: false }));
         assert_eq!(
             h.events(),
-            vec![Event::JoinEnded { name: NAME.into(), why: JoinEnd::Denied { by: "carolWolf".into() } }]
+            vec![Event::JoinEnded { name: NAME.into(), why: JoinEnd::Denied { by: "carolwolf".into() } }]
         );
         let (nonce, _) = start_join(&mut h).await;
         door_says(&mut h, BOB, &nonce, 2, 13);
@@ -1519,12 +1519,12 @@ mod tests {
         deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, Some("wrong"))));
         assert!(h.events().is_empty(), "a wrong echo proves nothing");
         deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, Some(&challenge))));
-        assert_eq!(h.events(), vec![Event::MemberJoined { room: name.clone(), nick: "bobRoger".into() }]);
+        assert_eq!(h.events(), vec![Event::MemberJoined { room: name.clone(), nick: "bobroger".into() }]);
         deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, None)));
         assert!(h.events().is_empty(), "already a member");
 
         deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Leave));
-        assert_eq!(h.events(), vec![Event::MemberLeft { room: name, nick: "bobRoger".into() }]);
+        assert_eq!(h.events(), vec![Event::MemberLeft { room: name, nick: "bobroger".into() }]);
     }
 
     #[tokio::test]
@@ -1536,7 +1536,7 @@ mod tests {
         let challenge = probe_nonce(&keys, &h.sent(BOB)[0]);
         deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, Some(&challenge))));
         let events = h.events();
-        assert_eq!(events[0], Event::MemberJoined { room: name.clone(), nick: "bobRoger".into() });
+        assert_eq!(events[0], Event::MemberJoined { room: name.clone(), nick: "bobroger".into() });
         assert!(matches!(&events[1], Event::Message { text, .. } if text == "early"), "{events:?}");
         assert_eq!(events.len(), 2);
     }
@@ -1551,7 +1551,7 @@ mod tests {
         let challenge = probe_nonce(&keys, &h.sent(BOB)[0]);
         deliver(&mut h, BOB, frame_from(BOB, &keys, here(&name, Some(&challenge))));
         // ...but older than his proof, so it's dropped once he's verified.
-        assert_eq!(h.events(), vec![Event::MemberJoined { room: name.clone(), nick: "bobRoger".into() }]);
+        assert_eq!(h.events(), vec![Event::MemberJoined { room: name.clone(), nick: "bobroger".into() }]);
         // After verification: old frames are below his floor, new ones go through.
         deliver(&mut h, BOB, frame_at(BOB, &keys, now - 30_000, RoomBody::Chat { text: "older".into() }));
         deliver(&mut h, BOB, frame_from(BOB, &keys, RoomBody::Chat { text: "fresh".into() }));
@@ -1591,7 +1591,7 @@ mod tests {
         assert!(h.sent(CAROL).is_empty());
         assert!(h.events().is_empty());
         h.node.on_tick(t0 + MEMBER_TIMEOUT);
-        assert_eq!(h.events(), vec![Event::MemberLeft { room: name, nick: "bobRoger".into() }]);
+        assert_eq!(h.events(), vec![Event::MemberLeft { room: name, nick: "bobroger".into() }]);
     }
 
     #[tokio::test]
@@ -1613,7 +1613,7 @@ mod tests {
         deliver(
             &mut h,
             BOB,
-            frame_from(BOB, &room::from_secret("dogPieR", &SECRET), RoomBody::Chat { text: "x".into() }),
+            frame_from(BOB, &room::from_secret("dogpie", &SECRET), RoomBody::Chat { text: "x".into() }),
         );
         assert!(h.events().is_empty());
     }
@@ -1628,7 +1628,7 @@ mod tests {
         }
         assert_eq!(
             h.events(),
-            vec![Event::Info("@bobRoger's clock is 10 min off; their room messages are ignored".into())]
+            vec![Event::Info("@bobroger's clock is 10 min off; their room messages are ignored".into())]
         );
     }
 
@@ -1641,7 +1641,7 @@ mod tests {
 
         let conn = h.node.peers[&BOB].conn;
         h.node.handle_msg(NodeMsg::PeerGone { conn, id: BOB, reason: crate::api::LeaveReason::Lost });
-        assert!(h.events().contains(&Event::MemberLeft { room: name.clone(), nick: "bobRoger".into() }));
+        assert!(h.events().contains(&Event::MemberLeft { room: name.clone(), nick: "bobroger".into() }));
 
         h.sent(CAROL);
         h.node.handle_command(Command::LeaveRoom { name: name.clone() });
