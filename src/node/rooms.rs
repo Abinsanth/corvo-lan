@@ -148,7 +148,6 @@ impl Room {
     }
 }
 
-/// A join waiting at the door.
 /// An invitation someone sent us.
 struct Invite {
     from: PeerId,
@@ -157,6 +156,7 @@ struct Invite {
     at: Instant,
 }
 
+/// A join waiting at the door.
 struct PendingJoin {
     attempt: Attempt,
     name: String,
@@ -675,6 +675,9 @@ impl Node {
 
     /// Door traffic for a room we're in: knocks and given-up requests.
     fn on_door_envelope(&mut self, id: RoomId, from: PeerId, env: RoomEnvelope, now: Instant) {
+        // An invited knock gets our approval right away, so it isn't shown as a request to approve.
+        let invited =
+            self.rooms.invited.get(&(id, from)).is_some_and(|at| now.saturating_duration_since(*at) < INVITE_FOR);
         let Some(room) = self.rooms.joined.get_mut(&id) else {
             return;
         };
@@ -694,8 +697,12 @@ impl Node {
                     room.requests.insert(from, request);
                     room.closed.remove(&from);
                     let (name, need) = (room.name.clone(), needed(room.size()));
-                    if let Some(nick) = self.nick_of(from) {
-                        self.emit(Event::JoinRequest { room: name, nick, have: 0, need: small(need) });
+                    match self.nick_of(from) {
+                        Some(nick) if invited => {
+                            self.emit(Event::Info(format!("@{nick} accepted your invite to #{name}")))
+                        }
+                        Some(nick) => self.emit(Event::JoinRequest { room: name, nick, have: 0, need: small(need) }),
+                        None => {}
                     }
                 } else {
                     return;
@@ -2027,5 +2034,34 @@ mod tests {
         invite_from(&mut h, BOB, NAME);
         h.node.on_tick(Instant::now() + INVITE_FOR);
         assert!(invited_rooms(&h).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_accepted_invite_says_so_instead_of_asking_to_approve() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        invite(&mut h, "bobroger", &made.name);
+        h.events();
+        knock(&mut h, BOB, &made, 100);
+        let events = h.events();
+        assert!(
+            events.contains(&Event::Info(format!("@bobroger accepted your invite to #{}", made.name))),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::JoinRequest { .. })),
+            "no /approve prompt: we approve for you"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decline_after_the_invite_expired_is_ignored() {
+        let mut h = with_peers();
+        let made = create(&mut h, 13).await;
+        invite(&mut h, "bobroger", &made.name);
+        h.node.on_tick(Instant::now() + INVITE_FOR);
+        h.events();
+        deliver(&mut h, BOB, Frame::Decline { room: made.name.clone() });
+        assert!(h.events().is_empty());
     }
 }
