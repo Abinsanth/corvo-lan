@@ -128,10 +128,15 @@ pub fn body(text: &str) -> String {
     text.split('\n').map(clean).collect::<Vec<_>>().join("\n  │ ")
 }
 
-/// A peer's message body, bold yellow when it mentions me.
+/// A peer's message body, bold yellow when it mentions me (or marked with
+/// `»` when there's no colour to show it).
 fn their_body(text: &str, me: Option<&str>, s: &Style) -> String {
     let b = body(text);
-    if me.is_some_and(|me| mentions(text, me)) { s.paint("1;33", &b) } else { b }
+    match me.is_some_and(|me| mentions(text, me)) {
+        false => b,
+        true if s.color => s.paint("1;33", &b),
+        true => format!("» {b}"),
+    }
 }
 
 /// "1 mention", "2 mentions".
@@ -589,6 +594,18 @@ mod tests {
         assert!(!event(&m, 0, None, &c).unwrap().contains("1;33"));
         let l = Line { ts: 0, kind: LineKind::Msg { from: "bobRoger".into(), text: "@annmoon look".into() } };
         assert!(line(&Conv::Dm("bobRoger".into()), &l, Some("annMoon"), &c).contains("\x1b[1;33m"));
+    }
+
+    #[test]
+    fn without_colour_a_mention_is_marked() {
+        let m = Event::Message {
+            conv: Conv::Room("catPieR".into()),
+            from: "bobRoger".into(),
+            text: "hey @annMoon".into(),
+            ts: 0,
+        };
+        assert_eq!(event(&m, 0, Some("annMoon"), &P).unwrap(), format!("{} #catPieR @bobRoger: » hey @annMoon", t(0)));
+        assert_eq!(event(&m, 0, Some("carolFox"), &P).unwrap(), format!("{} #catPieR @bobRoger: hey @annMoon", t(0)));
     }
 
     #[test]
