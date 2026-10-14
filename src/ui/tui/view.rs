@@ -1,6 +1,7 @@
 //! Draws the TUI from the shared session and the TUI state. Pure: it only
 //! writes into a ratatui `Frame`, so it's tested with `TestBackend`.
 
+use std::net::Ipv4Addr;
 use std::time::Instant;
 
 use ratatui::Frame;
@@ -391,6 +392,12 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Where we are on the LAN, so two people can tell they're on the same network.
+pub fn lan_label(ip: Option<Ipv4Addr>, port: u16) -> String {
+    let ip = ip.map_or_else(|| "none".into(), |ip| ip.to_string());
+    format!("ip {ip} · port {port}")
+}
+
 fn draw_status_bar(frame: &mut Frame, area: Rect, session: &Session, state: &TuiState, now: Instant) {
     let line = if let Some(flash) = state.flash_text(now) {
         Line::from(Span::styled(flash.to_string(), tone_style(Tone::Bad, state.color)))
@@ -402,10 +409,11 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, session: &Session, state: &Tui
     } else {
         let me = session.store.me().map_or_else(|| "…".into(), display);
         let online = session.store.online().count();
-        Line::from(Span::styled(
-            format!("@{me} · {online} online · Alt+Enter: new line · /help"),
-            tone_style(Tone::Dim, state.color),
-        ))
+        let mut text = format!("@{me} · {online} online · /help");
+        if !state.lan.is_empty() {
+            text = format!("{text} · {}", state.lan);
+        }
+        Line::from(Span::styled(text, tone_style(Tone::Dim, state.color)))
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -638,7 +646,18 @@ mod tests {
         assert_eq!(buf[(x, y)].fg, Color::Red);
         term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
         let bottom = rows(term.backend().buffer()).pop().unwrap();
-        assert!(bottom.contains("@annMoon · 2 online · Alt+Enter: new line · /help"), "{bottom}");
+        assert_eq!(bottom.trim_end(), "@annMoon · 2 online · /help", "nothing to add before the address is known");
+        state.lan = lan_label(Some(Ipv4Addr::new(192, 168, 1, 9)), 54321);
+        term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
+        let bottom = rows(term.backend().buffer()).pop().unwrap();
+        assert_eq!(bottom.trim_end(), "@annMoon · 2 online · /help · ip 192.168.1.9 · port 54321");
+    }
+
+    #[test]
+    fn the_lan_label_says_when_there_is_no_network() {
+        let ip = Some(Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(lan_label(ip, 4000), "ip 10.0.0.7 · port 4000");
+        assert_eq!(lan_label(None, 4000), "ip none · port 4000");
     }
 
     #[test]

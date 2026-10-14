@@ -400,6 +400,8 @@ pub struct TuiState {
     pub popup: Option<Popup>,
     /// The help box is open: it takes every key until q, Q or Esc.
     pub help: bool,
+    /// Our LAN address for the status bar, e.g. "ip 192.168.1.9 · port 54321".
+    pub lan: String,
     status: VecDeque<StatusLine>,
     flash: Option<(String, Instant)>,
     hits: Vec<(Rect, Hit)>,
@@ -416,6 +418,7 @@ impl TuiState {
             view: (0, 0),
             popup: None,
             help: false,
+            lan: String::new(),
             status: VecDeque::new(),
             flash: None,
             hits: Vec::new(),
