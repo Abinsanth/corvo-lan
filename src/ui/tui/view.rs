@@ -398,14 +398,30 @@ fn draw_popup(frame: &mut Frame, input: Rect, state: &mut TuiState) {
     );
 }
 
-/// The help box, centred over everything but the status bar. A short
-/// terminal cuts the text, never the border that says how to close it.
-fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
-    let width = HELP.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 4;
-    let height = HELP.lines().count() as u16 + 2;
+/// What a first look at corvo-lan needs; /help has the rest.
+pub const WELCOME: &str = "\
+Chat with people on your network.
+No account, no server, encrypted.
+
+pick your name
+  Type up to 6 letters. A word is
+  added so names never clash:
+  bob → bobRoger. Enter keeps it.
+
+start talking
+  /chat @name     private chat
+  /create <name>  room for a group
+  /help           every command";
+
+/// A box of `text` centred over everything but the status bar, with
+/// unindented lines in bold. A short terminal cuts the text, never the
+/// border that says how to close it.
+fn draw_box(frame: &mut Frame, area: Rect, text: &str, title: &str, close: &str, color: bool) {
+    let width = text.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 4;
+    let height = text.lines().count() as u16 + 2;
     let [area] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(area);
     let [area] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(area);
-    let lines: Vec<Line> = HELP
+    let lines: Vec<Line> = text
         .lines()
         .map(|l| {
             let style =
@@ -415,8 +431,8 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
         .collect();
     let block = Block::bordered()
         .border_style(tone_style(Tone::Dim, color))
-        .title(" help ")
-        .title_bottom(Line::from(" q close ").right_aligned())
+        .title(format!(" {title} "))
+        .title_bottom(Line::from(format!(" {close} ")).right_aligned())
         .padding(Padding::horizontal(1));
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -514,8 +530,12 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
     draw_input(frame, input_a, session, state);
     draw_popup(frame, input_a, state);
     draw_status_bar(frame, status_a, session, state, now);
+    let above_status = Rect { height: area.height - 1, ..area };
     if state.help {
-        draw_help(frame, Rect { height: area.height - 1, ..area }, state.color);
+        draw_box(frame, above_status, HELP, "help", "q close", state.color);
+    }
+    if state.welcome {
+        draw_box(frame, above_status, WELCOME, "welcome to corvo-lan", "any key", state.color);
     }
 }
 
@@ -875,6 +895,27 @@ mod tests {
         state.help = true;
         let small = render(&s, &mut state, 40, 10);
         assert!(find(&small, "q close").is_some(), "a short terminal still shows how to close it");
+    }
+
+    #[test]
+    fn welcome_is_a_centred_box_over_everything() {
+        let s = session();
+        let mut state = TuiState::new(true);
+        state.welcome = true;
+        let buf = render(&s, &mut state, 80, 24);
+        let all = rows(&buf);
+        let (x, y) = find(&buf, "welcome to corvo-lan").unwrap_or_else(|| panic!("{all:#?}"));
+        for needle in ["bob → bobRoger", "/chat @name", "/create <name>", "/help", "any key"] {
+            assert!(find(&buf, needle).is_some(), "{needle} missing: {all:#?}");
+        }
+        assert!(x > 10 && y > 1, "centred, not in the corner: ({x}, {y})");
+        state.help = true;
+        assert!(find(&render(&s, &mut state, 80, 24), "welcome to corvo-lan").is_some(), "drawn over help");
+        state.welcome = false;
+        assert!(find(&render(&s, &mut state, 80, 24), "welcome to corvo-lan").is_none(), "closed means gone");
+        state.welcome = true;
+        let small = render(&s, &mut state, 40, 10);
+        assert!(find(&small, "any key").is_some(), "a short terminal still shows how to close it");
     }
 
     #[test]

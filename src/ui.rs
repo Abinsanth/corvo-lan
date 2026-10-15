@@ -70,6 +70,8 @@ pub struct Ctx {
     pub lan: String,
     /// The user chose to restart into a newly installed version.
     pub restart: bool,
+    /// Open with the welcome box.
+    pub welcome: bool,
 }
 
 impl Ctx {
@@ -124,7 +126,9 @@ pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<Exit> {
     let updater = Updater::new(notice_tx.clone(), opts.exe);
     updater.check_at_startup(!opts.after_update);
     let session = Session::new(Style::detect().color);
-    let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater, lan, restart: false };
+    // A restart after an update picks up where the user left off.
+    let welcome = !opts.after_update;
+    let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater, lan, restart: false, welcome };
     let result = run_ui(&mut ctx, std::io::stdout().is_terminal(), tui::run).await;
     let _ = task.await;
     result?;
@@ -153,6 +157,7 @@ mod tests {
             updater: Updater::new(notice_tx, None),
             lan: String::new(),
             restart: false,
+            welcome: false,
         };
         (ctx, event_tx, cmd_rx)
     }

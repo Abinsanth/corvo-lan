@@ -161,6 +161,14 @@ enum KeyOutcome {
 
 /// Applies an editing, scrolling or tab key. Sending and quitting are left to the caller.
 fn apply_key(session: &mut Session, state: &mut TuiState, action: Action) -> KeyOutcome {
+    if state.welcome {
+        state.welcome = false;
+        return match action {
+            Action::Quit => KeyOutcome::Quit,
+            Action::Redraw => KeyOutcome::Redraw,
+            _ => KeyOutcome::Stay,
+        };
+    }
     if state.help {
         match action {
             Action::Insert('q' | 'Q') | Action::Esc => state.help = false,
@@ -308,6 +316,17 @@ fn note_input(state: &mut TuiState, ev: &TermEvent) {
     }
 }
 
+/// A click, scroll or paste closes the welcome box; moving the mouse doesn't.
+fn closes_welcome(ev: &TermEvent) -> bool {
+    match ev {
+        TermEvent::Mouse(m) => {
+            matches!(m.kind, MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+        }
+        TermEvent::Paste(_) => true,
+        _ => false,
+    }
+}
+
 /// The terminal window gained or lost focus. Coming back counts as seeing what's open.
 fn on_focus(state: &mut TuiState, focused: bool) {
     state.focused = focused;
@@ -449,6 +468,7 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
     let reader = InputThread::start(tx);
     let mut state = TuiState::new(ctx.session.color());
     state.lan = ctx.lan.clone();
+    state.welcome = ctx.welcome;
     state.on_status = ctx.session.store.current().is_none();
     let mut tick = tokio::time::interval(TICK);
     let mut title = String::new();
@@ -524,6 +544,10 @@ async fn on_terminal_event(
         }
         TermEvent::FocusLost => {
             on_focus(state, false);
+            None
+        }
+        TermEvent::Paste(_) | TermEvent::Mouse(_) if state.welcome => {
+            state.welcome = !closes_welcome(&ev);
             None
         }
         TermEvent::Paste(_) | TermEvent::Mouse(_) if state.help => None,
@@ -994,6 +1018,38 @@ mod tests {
             assert!(!state.help, "{close:?} closes it");
             assert!(state.editor.is_empty(), "{close:?} isn't typed");
         }
+    }
+
+    #[test]
+    fn any_key_closes_the_welcome_box_and_does_nothing_else() {
+        let mut s = session();
+        s.on_event(&Event::NamePreview { nick: "bobroger".into() }, 0);
+        let mut state = TuiState::new(false);
+        let tab = state.current_tab(&s);
+        for key in [Action::Insert('x'), Action::Send, Action::NextTab, Action::Esc, Action::Insert('q')] {
+            state.welcome = true;
+            assert_eq!(apply_key(&mut s, &mut state, key.clone()), KeyOutcome::Stay, "{key:?}");
+            assert!(!state.welcome, "{key:?} closes it");
+            assert!(!state.help, "{key:?} doesn't open help");
+        }
+        assert!(state.editor.is_empty(), "nothing is typed");
+        assert_eq!(state.current_tab(&s), tab, "tabs don't switch");
+        assert!(s.prompt().is_some_and(|p| p.contains("@bobroger")), "Enter didn't answer the name question");
+        state.welcome = true;
+        assert_eq!(apply_key(&mut s, &mut state, Action::Quit), KeyOutcome::Quit, "Ctrl-C still quits");
+    }
+
+    #[test]
+    fn a_click_closes_the_welcome_box_but_moving_the_mouse_doesnt() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseEvent};
+        let mouse = |kind| TermEvent::Mouse(MouseEvent { kind, column: 3, row: 3, modifiers: KeyModifiers::NONE });
+        assert!(closes_welcome(&mouse(MouseEventKind::Down(MouseButton::Left))));
+        assert!(closes_welcome(&mouse(MouseEventKind::Down(MouseButton::Right))));
+        assert!(closes_welcome(&mouse(MouseEventKind::ScrollDown)));
+        assert!(closes_welcome(&TermEvent::Paste("hi".into())));
+        assert!(!closes_welcome(&mouse(MouseEventKind::Moved)));
+        assert!(!closes_welcome(&mouse(MouseEventKind::Up(MouseButton::Left))));
+        assert!(!closes_welcome(&TermEvent::FocusGained));
     }
 
     /// Windows writes some of these through the console API, not as escape codes.
