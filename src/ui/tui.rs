@@ -762,7 +762,7 @@ mod tests {
         let now = Instant::now();
         on_event(&mut s, &mut state, &Event::NamePreview { nick: "bobroger".into() }, now);
         assert!(state.on_status);
-        assert_eq!(last_status(&state), ("you'll be @bobroger — Enter to keep it, or type a name", Tone::Warn));
+        assert_eq!(last_status(&state), ("you'll be @bobroger — Enter to keep, or type a new start", Tone::Warn));
         on_event(&mut s, &mut state, &Event::NamePreview { nick: "luffysunny".into() }, now);
         assert!(last_status(&state).0.contains("@luffysunny"), "each new preview is asked again");
         on_send(&mut s, &mut state, String::new(), now);
