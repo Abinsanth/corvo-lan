@@ -325,6 +325,13 @@ fn swap_in(new: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The running binary's path. Unix resolves symlinks; Windows keeps the plain
+/// path, since `canonicalize` there returns a `\\?\` path that curl and tar
+/// and the error messages would then show.
+pub fn running_exe() -> std::io::Result<PathBuf> {
+    if cfg!(windows) { std::env::current_exe() } else { std::env::current_exe()?.canonicalize() }
+}
+
 /// Deletes the exe a Windows update moved aside; it couldn't go while it ran.
 pub fn remove_old_exe(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(OLD_EXE));

@@ -18,22 +18,29 @@ use self::updates::Updater;
 use crate::api::{Command, Event};
 use crate::discovery;
 use crate::node::NodeHandle;
+use crate::update::Version;
 
 pub struct Options {
     pub check_updates: bool,
 }
 
-/// Output from background work (`/update`), shown in the corvo tab.
+/// Output from background work (`/update`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Notice {
-    pub text: String,
-    pub tone: Tone,
+pub enum Notice {
+    /// A line for the corvo tab.
+    Line { text: String, tone: Tone },
+    /// How far a download got; replaces the previous progress line.
+    Progress(String),
+    /// `version` can be installed: ask whether to.
+    Offer(Version),
+    /// `version` is installed. `forced` restarts at once; otherwise ask.
+    Installed { version: Version, forced: bool },
 }
 
 impl Notice {
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
-        Notice { tone: tone_of_text(&text), text }
+        Notice::Line { tone: tone_of_text(&text), text }
     }
 }
 
@@ -97,7 +104,7 @@ pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<()> {
     let lan = tui::view::lan_label(discovery::lan_ip(), local_addr.port());
     tui::install_panic_hook();
     let (notice_tx, notices) = mpsc::unbounded_channel();
-    let updater = Updater::new(notice_tx.clone());
+    let updater = Updater::new(notice_tx.clone(), crate::update::running_exe().ok());
     if opts.check_updates {
         updater.check_at_startup();
     }
@@ -127,7 +134,7 @@ mod tests {
             events,
             notices,
             notice_tx: notice_tx.clone(),
-            updater: Updater::new(notice_tx),
+            updater: Updater::new(notice_tx, None),
             lan: String::new(),
         };
         (ctx, event_tx, cmd_rx)
@@ -141,7 +148,7 @@ mod tests {
         assert_eq!(cmd_rx.recv().await, Some(Command::Quit));
         assert!(!ctx.act(Reaction::send(Command::ListPeers)).await.unwrap());
         assert_eq!(cmd_rx.recv().await, Some(Command::ListPeers));
-        assert_eq!(Notice::new("! boom").tone, Tone::Bad);
+        assert_eq!(Notice::new("! boom"), Notice::Line { text: "! boom".into(), tone: Tone::Bad });
     }
 
     #[tokio::test]

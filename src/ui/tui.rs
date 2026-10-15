@@ -26,11 +26,11 @@ use ratatui::crossterm::terminal::{
 use tokio::sync::mpsc;
 
 use self::state::{Action, Hit, TuiState, WHEEL_STEP, action_for, goes_to_status};
-use super::Ctx;
 use super::clip;
 use super::complete::Candidates;
 use super::render::{Tone, tone_of, tone_of_text};
 use super::session::{Reaction, Session};
+use super::{Ctx, Notice};
 use crate::api::{Command, Conv, Event};
 use crate::protocol::now_millis;
 
@@ -425,9 +425,15 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
                 }
             },
             Some(notice) = ctx.notices.recv() => {
-                state.push_status(now_millis(), &notice.text, notice.tone);
-                if notice.text.starts_with("! ") {
-                    state.flash(&notice.text, Instant::now());
+                let (text, tone) = match notice {
+                    Notice::Line { text, tone } => (text, tone),
+                    Notice::Progress(text) => (text, Tone::Plain),
+                    Notice::Offer(v) => (format!("* v{v} is available — /update yes to install"), Tone::Plain),
+                    Notice::Installed { version, .. } => (format!("* installed v{version}"), Tone::Plain),
+                };
+                state.push_status(now_millis(), &text, tone);
+                if text.starts_with("! ") {
+                    state.flash(&text, Instant::now());
                 }
             }
             _ = tick.tick() => {}
