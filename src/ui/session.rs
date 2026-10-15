@@ -336,7 +336,7 @@ impl Session {
                 Ok(text) => match shown.or(self.store.current()) {
                     Some(Conv::Room(n)) => Reaction::send(Command::Send { to: Target::Room(n.clone()), text }),
                     Some(Conv::Dm(n)) => Reaction::send(Command::Send { to: Target::Dm(n.clone()), text }),
-                    None => Reaction::say("! no conversation — /chat @nick or /create <name>"),
+                    None => Reaction::say("! open a chat first: /chat @name"),
                 },
                 Err(e) => Reaction::say(format!("! {e}")),
             },
@@ -441,11 +441,11 @@ impl Session {
                     Some(nick) => Conv::Dm(nick),
                     None => match self.store.current() {
                         Some(conv) => conv.clone(),
-                        None => return Reaction::say("! no chat to close here"),
+                        None => return Reaction::say("! nothing to close here"),
                     },
                 };
                 match &conv {
-                    Conv::Room(_) => Reaction::say("! use /leave for rooms"),
+                    Conv::Room(_) => Reaction::say("! rooms use /leave"),
                     Conv::Dm(nick) if self.store.get(&conv).is_none() => {
                         Reaction::say(format!("! no chat with @{nick}"))
                     }
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn plain_text_goes_to_the_current_conversation() {
         let mut s = session();
-        assert_eq!(typed(&mut s, "hello").print, vec!["! no conversation — /chat @nick or /create <name>"]);
+        assert_eq!(typed(&mut s, "hello").print, vec!["! open a chat first: /chat @name"]);
         assert_eq!(typed(&mut s, "/chat @bobroger"), Reaction::default());
         assert_eq!(s.store.current(), Some(&Conv::Dm("bobroger".into())));
         assert_eq!(typed(&mut s, "hello"), send(Target::Dm("bobroger".into()), "hello"));
@@ -686,7 +686,7 @@ mod tests {
         let question = s.prompt();
         assert!(!s.cancel_prompt(), "Esc can't drop it");
         assert_eq!(typed(&mut s, "Bob Smith"), Reaction::say("! name must be 1–6 letters or digits"));
-        assert_eq!(typed(&mut s, "CHAT"), Reaction::say("! 'chat' is reserved"));
+        assert_eq!(typed(&mut s, "CHAT"), Reaction::say("! \"chat\" is taken by a command"));
         assert_eq!(typed(&mut s, "/who"), Reaction::say("! pick your name first — Enter keeps @bobroger"));
         assert_eq!(
             typed(&mut s, "@Luffy"),
@@ -743,7 +743,7 @@ mod tests {
         assert!(first.starts_with("cat") && crate::names::is_valid_name(&first), "{first}");
         assert_eq!(s.prompt(), Some(format!("new room #{first} — Enter to keep it, or type another name")));
 
-        assert_eq!(typed(&mut s, "chat").print, vec!["! 'chat' is reserved"]);
+        assert_eq!(typed(&mut s, "chat").print, vec!["! \"chat\" is taken by a command"]);
         assert_eq!(typed(&mut s, "a b").print, vec!["! name must be 1–6 letters or digits"]);
         assert_eq!(room_preview(&s), first, "a bad name keeps the old preview");
 
@@ -766,7 +766,7 @@ mod tests {
             assert_eq!(typed(&mut s, &format!("/create cat {bad}")).print, vec!["! a room holds 2–13 people"]);
             assert_eq!(s.prompt(), None);
         }
-        assert_eq!(typed(&mut s, "/create chat").print, vec!["! 'chat' is reserved"]);
+        assert_eq!(typed(&mut s, "/create chat").print, vec!["! \"chat\" is taken by a command"]);
         assert_eq!(s.prompt(), None);
     }
 
@@ -831,7 +831,7 @@ mod tests {
             typed(&mut s, "/invite @carolwolf"),
             Reaction::say("! /invite works in a room tab, or name the room: /invite @nick #room")
         );
-        assert_eq!(typed(&mut s, "/invite").print, vec!["! usage: /invite @nick [#room]"]);
+        assert_eq!(typed(&mut s, "/invite").print, vec!["! try: /invite @name"]);
     }
 
     #[test]
@@ -1175,9 +1175,9 @@ mod tests {
         typed(&mut s, "/chat @bobroger");
         assert_eq!(typed(&mut s, "/close").print, vec!["* closed @bobroger"]);
         assert!(s.store.get(&Conv::Dm("bobroger".into())).is_none());
-        assert_eq!(typed(&mut s, "/close").print, vec!["! no chat to close here"]);
+        assert_eq!(typed(&mut s, "/close").print, vec!["! nothing to close here"]);
         s.on_event(&Event::RoomJoined { name: "catpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] }, 0);
-        assert_eq!(typed(&mut s, "/close").print, vec!["! use /leave for rooms"]);
+        assert_eq!(typed(&mut s, "/close").print, vec!["! rooms use /leave"]);
         assert_eq!(typed(&mut s, "/close @ghostmoon").print, vec!["! no chat with @ghostmoon"]);
     }
 

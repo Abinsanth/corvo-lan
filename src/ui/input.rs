@@ -102,7 +102,7 @@ pub fn parse_line(line: &str) -> Input {
                     None => Input::MsgGuess { to: to.to_string(), text },
                 }
             }
-            _ => Input::Error("usage: /msg @nick <text>".into()),
+            _ => Input::Error("try: /msg @name hello".into()),
         },
         "chat" | "c" => match words.as_slice() {
             [target] if target.starts_with('@') => Input::ChatDm(lower(&target[1..])),
@@ -112,12 +112,12 @@ pub fn parse_line(line: &str) -> Input {
             }
             [target] => Input::ChatGuess(target.to_string()),
             [_, _] => Input::Error(SIGIL_HINT.into()),
-            _ => Input::Error("usage: /chat @nick | /chat #room [key]".into()),
+            _ => Input::Error("try: /chat @name or /chat #room key".into()),
         },
         "create" => match words.as_slice() {
             [base] => Input::Create { base: lower(base), max: None },
             [base, max] => Input::Create { base: lower(base), max: Some(max.to_string()) },
-            _ => Input::Error("usage: /create <name> [people]".into()),
+            _ => Input::Error("try: /create team".into()),
         },
         "approve" | "deny" => {
             let (nick, room) = match words.as_slice() {
@@ -126,7 +126,7 @@ pub fn parse_line(line: &str) -> Input {
                     Some(room) => (nick.strip_prefix('@'), Some(lower(room))),
                     None => return Input::Error(SIGIL_HINT.into()),
                 },
-                _ => return Input::Error(format!("usage: /{name} @nick [#room]")),
+                _ => return Input::Error(format!("try: /{name} @name")),
             };
             let Some(nick) = nick else {
                 return Input::Error(SIGIL_HINT.into());
@@ -139,42 +139,42 @@ pub fn parse_line(line: &str) -> Input {
             [nick, room] if nick.starts_with('@') && room.starts_with('#') => {
                 Input::Invite { nick: lower(&nick[1..]), room: Some(lower(&room[1..])) }
             }
-            _ => Input::Error("usage: /invite @nick [#room]".into()),
+            _ => Input::Error("try: /invite @name".into()),
         },
         "kick" => match words.as_slice() {
             [nick] if nick.starts_with('@') => Input::Kick { nick: lower(&nick[1..]), room: None },
             [nick, room] if nick.starts_with('@') && room.starts_with('#') => {
                 Input::Kick { nick: lower(&nick[1..]), room: Some(lower(&room[1..])) }
             }
-            _ => Input::Error("usage: /kick @nick [#room]".into()),
+            _ => Input::Error("try: /kick @name".into()),
         },
         "accept" | "decline" => {
             let room = match words.as_slice() {
                 [] => None,
                 [room] if room.starts_with('#') => Some(lower(&room[1..])),
-                _ => return Input::Error(format!("usage: /{name} [#room]")),
+                _ => return Input::Error(format!("try: /{name} or /{name} #room")),
             };
             if name == "accept" { Input::Accept(room) } else { Input::Decline(room) }
         }
         "leave" => match words.as_slice() {
             [] => Input::Leave(None),
             [room] if room.starts_with('#') => Input::Leave(Some(lower(&room[1..]))),
-            _ => Input::Error("usage: /leave [#room]".into()),
+            _ => Input::Error("try: /leave or /leave #room".into()),
         },
         "update" => match words.as_slice() {
             [] => Input::Update { confirm: false },
             ["yes" | "y"] => Input::Update { confirm: true },
-            _ => Input::Error("usage: /update [yes]".into()),
+            _ => Input::Error("try: /update or /update yes".into()),
         },
         "close" => match words.as_slice() {
             [] => Input::Close(None),
             [nick] if nick.starts_with('@') => Input::Close(Some(lower(&nick[1..]))),
             [room] if room.starts_with('#') => Input::Error("use /leave for rooms".into()),
-            _ => Input::Error("usage: /close [@nick]".into()),
+            _ => Input::Error("try: /close or /close @name".into()),
         },
         "clear" => match words.as_slice() {
             [] => Input::Clear,
-            _ => Input::Error("usage: /clear".into()),
+            _ => Input::Error("try: /clear".into()),
         },
         "rooms" => Input::Rooms,
         "chats" => Input::Chats,
@@ -257,8 +257,8 @@ mod tests {
         assert_eq!(parse_line("/m @bobroger hi"), Input::Msg { to: "bobroger".into(), text: "hi".into() });
         assert_eq!(parse_line("/msg bob hi"), Input::MsgGuess { to: "bob".into(), text: "hi".into() });
         assert_eq!(parse_line("/msg #catpie hi"), err(SIGIL_HINT));
-        assert_eq!(parse_line("/msg @bobroger"), err("usage: /msg @nick <text>"));
-        assert_eq!(parse_line("/m"), err("usage: /msg @nick <text>"));
+        assert_eq!(parse_line("/msg @bobroger"), err("try: /msg @name hello"));
+        assert_eq!(parse_line("/m"), err("try: /msg @name hello"));
     }
 
     #[test]
@@ -273,18 +273,18 @@ mod tests {
         assert_eq!(parse_line("/chat bob"), Input::ChatGuess("bob".into()));
         assert_eq!(parse_line("/chat bob key"), err(SIGIL_HINT));
         assert_eq!(parse_line("/chat @bob key"), err(SIGIL_HINT));
-        assert_eq!(parse_line("/c"), err("usage: /chat @nick | /chat #room [key]"));
+        assert_eq!(parse_line("/c"), err("try: /chat @name or /chat #room key"));
     }
 
     #[test]
     fn room_commands() {
         assert_eq!(parse_line("/create cat"), Input::Create { base: "cat".into(), max: None });
         assert_eq!(parse_line("/create cat 5"), Input::Create { base: "cat".into(), max: Some("5".into()) });
-        assert_eq!(parse_line("/create"), err("usage: /create <name> [people]"));
-        assert_eq!(parse_line("/create cat 5 6"), err("usage: /create <name> [people]"));
+        assert_eq!(parse_line("/create"), err("try: /create team"));
+        assert_eq!(parse_line("/create cat 5 6"), err("try: /create team"));
         assert_eq!(parse_line("/leave"), Input::Leave(None));
         assert_eq!(parse_line("/leave #catpie"), Input::Leave(Some("catpie".into())));
-        assert_eq!(parse_line("/leave catpie"), err("usage: /leave [#room]"));
+        assert_eq!(parse_line("/leave catpie"), err("try: /leave or /leave #room"));
         assert_eq!(parse_line("/rooms"), Input::Rooms);
     }
 
@@ -317,12 +317,12 @@ mod tests {
             parse_line("/invite @BobRoger #CatPie"),
             Input::Invite { nick: "bobroger".into(), room: Some("catpie".into()) }
         );
-        assert_eq!(parse_line("/invite"), err("usage: /invite @nick [#room]"));
-        assert_eq!(parse_line("/invite #catpie"), err("usage: /invite @nick [#room]"));
+        assert_eq!(parse_line("/invite"), err("try: /invite @name"));
+        assert_eq!(parse_line("/invite #catpie"), err("try: /invite @name"));
         assert_eq!(parse_line("/accept"), Input::Accept(None));
         assert_eq!(parse_line("/accept #CatPie"), Input::Accept(Some("catpie".into())));
         assert_eq!(parse_line("/decline #catpie"), Input::Decline(Some("catpie".into())));
-        assert_eq!(parse_line("/decline catpie"), err("usage: /decline [#room]"));
+        assert_eq!(parse_line("/decline catpie"), err("try: /decline or /decline #room"));
     }
 
     #[test]
@@ -337,8 +337,8 @@ mod tests {
         assert_eq!(parse_line("/deny @bobroger #catpie"), Input::Deny { nick: bob(), room: Some("catpie".into()) });
         assert_eq!(parse_line("/deny bob"), err(SIGIL_HINT));
         assert_eq!(parse_line("/approve @bob catpie"), err(SIGIL_HINT));
-        assert_eq!(parse_line("/approve"), err("usage: /approve @nick [#room]"));
-        assert_eq!(parse_line("/deny"), err("usage: /deny @nick [#room]"));
+        assert_eq!(parse_line("/approve"), err("try: /approve @name"));
+        assert_eq!(parse_line("/deny"), err("try: /deny @name"));
     }
 
     #[test]
@@ -380,8 +380,8 @@ mod tests {
             parse_line("/kick @bobroger #CatPie"),
             Input::Kick { nick: "bobroger".into(), room: Some("catpie".into()) }
         );
-        assert_eq!(parse_line("/kick"), err("usage: /kick @nick [#room]"));
-        assert_eq!(parse_line("/kick bob"), err("usage: /kick @nick [#room]"));
+        assert_eq!(parse_line("/kick"), err("try: /kick @name"));
+        assert_eq!(parse_line("/kick bob"), err("try: /kick @name"));
         assert!(COMMANDS.contains(&"kick"));
     }
 
@@ -399,10 +399,10 @@ mod tests {
         assert_eq!(parse_line("/update yes"), Input::Update { confirm: true });
         assert_eq!(parse_line("/update y"), Input::Update { confirm: true });
         assert_eq!(parse_line("/clear"), Input::Clear);
-        assert_eq!(parse_line("/clear all"), err("usage: /clear"));
+        assert_eq!(parse_line("/clear all"), err("try: /clear"));
         assert!(COMMANDS.contains(&"clear"));
-        assert_eq!(parse_line("/update now"), err("usage: /update [yes]"));
-        assert_eq!(parse_line("/update yes please"), err("usage: /update [yes]"));
+        assert_eq!(parse_line("/update now"), err("try: /update or /update yes"));
+        assert_eq!(parse_line("/update yes please"), err("try: /update or /update yes"));
     }
 
     #[test]
@@ -413,6 +413,6 @@ mod tests {
         assert_eq!(parse_line("/close"), Input::Close(None));
         assert_eq!(parse_line("/close @bobroger"), Input::Close(Some("bobroger".into())));
         assert_eq!(parse_line("/close #catpie"), err("use /leave for rooms"));
-        assert_eq!(parse_line("/close bob"), err("usage: /close [@nick]"));
+        assert_eq!(parse_line("/close bob"), err("try: /close or /close @name"));
     }
 }

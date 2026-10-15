@@ -882,8 +882,8 @@ mod tests {
         let mut s = session();
         let mut state = TuiState::new(false);
         let now = Instant::now();
-        on_event(&mut s, &mut state, &Event::Error("no room #x with that key".into()), now);
-        assert_eq!(state.status_lines().last().unwrap().text, "! no room #x with that key");
+        on_event(&mut s, &mut state, &Event::Error("no #x with that key".into()), now);
+        assert_eq!(state.status_lines().last().unwrap().text, "! no #x with that key");
         assert!(state.flash_text(now).is_some());
         on_event(
             &mut s,
@@ -899,10 +899,10 @@ mod tests {
         assert_eq!(state.scroll.unseen(), 1);
         on_event(&mut s, &mut state, &Event::RoomLeft { name: "catpie".into() }, now);
         assert!(state.on_status, "leaving the room you're viewing falls back to corvo");
-        let warn = Event::Info("@bobmoon has a different key from the bob you met before (last seen 2026-10-12). Compare fingerprints in /who.".into());
+        let warn = Event::Info("@bobmoon may not be the bob you met before".into());
         let later = now + Duration::from_secs(60);
         on_event(&mut s, &mut state, &warn, later);
-        assert!(state.flash_text(later).is_some_and(|t| t.contains("different key")), "warnings flash");
+        assert!(state.flash_text(later).is_some_and(|t| t.contains("may not be")), "warnings flash");
     }
 
     #[test]

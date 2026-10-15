@@ -750,12 +750,12 @@ mod tests {
     fn corvo_tab_shows_status_lines_in_their_tone() {
         let s = session();
         let mut state = TuiState::new(true);
-        state.push_status(0, "! no room #x with that key", Tone::Bad);
-        state.push_status(0, "* 2 peer(s) online:\n  @bobroger", Tone::Plain);
+        state.push_status(0, "! no #x with that key", Tone::Bad);
+        state.push_status(0, "* 2 people online:\n  @bobroger", Tone::Plain);
         let buf = render(&s, &mut state, 80, 20);
-        let (x, y) = find(&buf, "! no room").unwrap();
+        let (x, y) = find(&buf, "! no #x").unwrap();
         assert_eq!(buf[(x, y)].fg, Color::Red);
-        let (px, py) = find(&buf, "* 2 peer(s) online:").unwrap();
+        let (px, py) = find(&buf, "* 2 people online:").unwrap();
         let (bx, by) = find(&buf, "@bobRoger").unwrap();
         assert_eq!((bx, by), (px + 2, py + 1));
     }
