@@ -100,8 +100,8 @@ async fn run(action: UpdateAction, out: &UnboundedSender<Notice>) {
         Err(e) => return say(format!("! {e}")),
     };
     let current = update::current();
-    let latest = match (action, newer.first()) {
-        (UpdateAction::Install, Some(latest)) => latest.version,
+    let release = match (action, newer.first()) {
+        (UpdateAction::Install, Some(latest)) => latest,
         _ => {
             for line in format_check(current, &newer) {
                 say(line);
@@ -113,8 +113,9 @@ async fn run(action: UpdateAction, out: &UnboundedSender<Notice>) {
         Ok(path) => path,
         Err(e) => return say(format!("! can't find the running corvo-lan: {e}")),
     };
+    let latest = release.version;
     say(format!("* downloading v{latest}…"));
-    match update::install(latest, &target).await {
+    match update::install(release, &target, |_, _| {}).await {
         Ok(()) => say(format!("* installed v{latest}. Restart corvo-lan to use it.")),
         Err(e) => say(format!("! {e}")),
     }
@@ -136,6 +137,7 @@ mod tests {
             version: Version::parse(v).unwrap(),
             date: date.into(),
             summary: summary.iter().map(|s| s.to_string()).collect(),
+            assets: vec![],
         }
     }
 

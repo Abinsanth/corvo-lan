@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -26,6 +27,10 @@ const BIN_NAME: &str = "corvo-lan";
 const TMP_PREFIX: &str = ".corvo-lan-update-";
 /// Most PR titles shown per release.
 const SUMMARY_LINES: usize = 3;
+/// A newest release this many days old is installed at startup without asking.
+pub const FORCE_AFTER_DAYS: i64 = 22;
+/// How often a download reports how far it got.
+const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 
 /// `major.minor.patch`, compared numerically (0.10.0 is newer than 0.9.0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -59,6 +64,15 @@ pub struct Release {
     pub date: String,
     /// PR titles from the generated release notes.
     pub summary: Vec<String>,
+    /// The downloadable files.
+    pub assets: Vec<Asset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Asset {
+    pub name: String,
+    /// Bytes.
+    pub size: u64,
 }
 
 /// The fields we use from `GET /repos/{REPO}/releases`.
@@ -71,6 +85,8 @@ struct ApiRelease {
     prerelease: bool,
     published_at: Option<String>,
     body: Option<String>,
+    #[serde(default)]
+    assets: Vec<Asset>,
 }
 
 /// Published releases with a `v<major>.<minor>.<patch>` tag, newest first.
@@ -84,6 +100,7 @@ pub fn parse_releases(json: &str) -> Result<Vec<Release>, String> {
                 version: Version::parse(&r.tag_name)?,
                 date: r.published_at.as_deref().and_then(|d| d.get(..10)).unwrap_or_default().to_string(),
                 summary: summarise(r.body.as_deref().unwrap_or_default()),
+                assets: r.assets,
             })
         })
         .collect();
@@ -100,6 +117,38 @@ fn summarise(notes: &str) -> Vec<String> {
         .filter(|l| !l.is_empty())
         .take(SUMMARY_LINES)
         .collect()
+}
+
+/// Days since 1970-01-01 for a `YYYY-MM-DD` date; `None` if it isn't one.
+pub fn day_number(date: &str) -> Option<i64> {
+    let mut parts = date.split('-');
+    let mut next = || parts.next()?.parse::<i64>().ok();
+    let (y, m, d) = (next()?, next()?, next()?);
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Days from the civil calendar, counting years from March so leap days come last.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// Today's day number, from the system clock (UTC).
+pub fn today() -> i64 {
+    (crate::protocol::now_millis() / 86_400_000) as i64
+}
+
+/// How many days `release` has been out, if GitHub gave its date.
+pub fn days_out(release: &Release, today: i64) -> Option<i64> {
+    day_number(&release.date).map(|day| today - day)
+}
+
+/// Whether a start on an older version installs `latest` without asking.
+pub fn must_update(latest: &Release, today: i64) -> bool {
+    days_out(latest, today).is_some_and(|days| days >= FORCE_AFTER_DAYS)
 }
 
 /// The releases newer than `current`, newest first.
@@ -152,17 +201,30 @@ pub async fn check_with(urls: &Urls, current: Version) -> Result<Vec<Release>, S
     Ok(newer_than(current, parse_releases(&json)?))
 }
 
-/// Replaces `target` with `version`'s build for this system.
-pub async fn install(version: Version, target: &Path) -> Result<(), String> {
+/// Replaces `target` with `release`'s build for this system, reporting
+/// `progress(bytes so far, total if known)` while it downloads.
+pub async fn install(
+    release: &Release,
+    target: &Path,
+    progress: impl Fn(u64, Option<u64>) + Sync,
+) -> Result<(), String> {
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
     let asset = asset_name(os, arch).ok_or_else(|| format!("no release build for {os}/{arch}; build from source"))?;
-    install_with(&Urls::default(), version, &asset, target).await
+    let size = release.assets.iter().find(|a| a.name == asset).map(|a| a.size);
+    install_with(&Urls::default(), release.version, &asset, size, target, progress).await
 }
 
 /// Downloads into a temp dir beside `target` (so the final rename is atomic and
 /// on one filesystem), verifies, unpacks, then swaps the new binary in. Any
 /// failure leaves `target` as it was.
-pub async fn install_with(urls: &Urls, version: Version, asset: &str, target: &Path) -> Result<(), String> {
+pub async fn install_with(
+    urls: &Urls,
+    version: Version,
+    asset: &str,
+    size: Option<u64>,
+    target: &Path,
+    progress: impl Fn(u64, Option<u64>) + Sync,
+) -> Result<(), String> {
     let dir = target.parent().ok_or_else(|| cant_replace(target, "it has no parent directory"))?;
     sweep_leftovers(dir);
     let tmp = dir.join(format!("{TMP_PREFIX}{}", std::process::id()));
@@ -170,18 +232,26 @@ pub async fn install_with(urls: &Urls, version: Version, asset: &str, target: &P
         let reason = if e.kind() == ErrorKind::PermissionDenied { "permission denied".into() } else { e.to_string() };
         return Err(cant_replace(target, &reason));
     }
-    let result = install_in(&tmp, urls, version, asset, target).await;
+    let result = install_in(&tmp, urls, version, asset, size, target, &progress).await;
     let _ = std::fs::remove_dir_all(&tmp);
     result
 }
 
-async fn install_in(tmp: &Path, urls: &Urls, version: Version, asset: &str, target: &Path) -> Result<(), String> {
+async fn install_in(
+    tmp: &Path,
+    urls: &Urls,
+    version: Version,
+    asset: &str,
+    size: Option<u64>,
+    target: &Path,
+    progress: &(impl Fn(u64, Option<u64>) + Sync),
+) -> Result<(), String> {
     let url = format!("{}/v{version}/{asset}", urls.download);
     let archive = tmp.join(asset);
     let sums = tmp.join(format!("{asset}.sha256"));
-    for (out, url) in [(&archive, url.clone()), (&sums, format!("{url}.sha256"))] {
-        download(&url, out).await.map_err(|e| format!("couldn't download v{version}: {e}"))?;
-    }
+    let failed = |e: String| format!("couldn't download v{version}: {e}");
+    download_watched(&url, &archive, size, progress).await.map_err(failed)?;
+    download(&format!("{url}.sha256"), &sums).await.map_err(failed)?;
 
     let expected = std::fs::read_to_string(&sums).unwrap_or_default();
     let expected = expected.split_whitespace().next().unwrap_or_default();
@@ -265,6 +335,30 @@ async fn download(url: &str, out: &Path) -> Result<(), String> {
     curl(args.into_iter().chain([OsStr::new(url)])).await.map(|_| ())
 }
 
+/// `download`, reporting the file's size as it grows.
+async fn download_watched(
+    url: &str,
+    out: &Path,
+    size: Option<u64>,
+    progress: &(impl Fn(u64, Option<u64>) + Sync),
+) -> Result<(), String> {
+    let len = || std::fs::metadata(out).map_or(0, |m| m.len());
+    let fetch = download(url, out);
+    tokio::pin!(fetch);
+    let mut tick = tokio::time::interval(PROGRESS_EVERY);
+    loop {
+        tokio::select! {
+            result = &mut fetch => {
+                if result.is_ok() {
+                    progress(size.unwrap_or_else(len), size);
+                }
+                return result;
+            }
+            _ = tick.tick() => progress(len(), size),
+        }
+    }
+}
+
 /// Removes temp dirs left by updates that were quit or crashed mid-download.
 fn sweep_leftovers(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -329,12 +423,13 @@ mod tests {
     use super::*;
 
     fn rel(v: &str) -> Release {
-        Release { version: Version::parse(v).unwrap(), date: "2026-01-01".into(), summary: vec![] }
+        Release { version: Version::parse(v).unwrap(), date: "2026-01-01".into(), summary: vec![], assets: vec![] }
     }
 
     const API: &str = r###"[
       {"tag_name": "v0.2.1", "draft": false, "prerelease": false, "published_at": "2026-10-20T09:00:00Z",
-       "body": "## What's Changed\n* Fix long names wrapping by @Abinsanth in https://github.com/Abinsanth/corvo-lan/pull/12\n\n**Full Changelog**: x"},
+       "body": "## What's Changed\n* Fix long names wrapping by @Abinsanth in https://github.com/Abinsanth/corvo-lan/pull/12\n\n**Full Changelog**: x",
+       "assets": [{"name": "a.tar.gz", "size": 1234, "url": "ignored"}]},
       {"tag_name": "v0.10.0", "draft": false, "prerelease": false, "published_at": "2026-12-01T09:00:00Z",
        "body": "* TUI by @a in u\n* Room expiry by @a in u\n* Update command by @a in u\n* Fourth by @a in u"},
       {"tag_name": "v0.9.0", "draft": true, "prerelease": false, "published_at": null, "body": ""},
@@ -368,6 +463,37 @@ mod tests {
         assert_eq!(releases[0].date, "2026-12-01");
         assert_eq!(releases[0].summary, vec!["TUI", "Room expiry", "Update command"]);
         assert_eq!(releases[1].summary, vec!["Fix long names wrapping"]);
+    }
+
+    #[test]
+    fn assets_and_sizes_are_parsed() {
+        let releases = parse_releases(API).unwrap();
+        assert_eq!(releases[1].assets, vec![Asset { name: "a.tar.gz".into(), size: 1234 }]);
+        assert!(releases[0].assets.is_empty(), "no assets listed");
+    }
+
+    #[test]
+    fn day_numbers_count_days() {
+        assert_eq!(day_number("1970-01-01"), Some(0));
+        assert_eq!(day_number("1970-01-02"), Some(1));
+        let gap = |a: &str, b: &str| day_number(a).unwrap() - day_number(b).unwrap();
+        assert_eq!(gap("2026-10-15", "2026-09-23"), 22);
+        assert_eq!(gap("2024-03-01", "2024-02-28"), 2, "leap year");
+        assert_eq!(gap("2027-01-01", "2026-12-31"), 1);
+        for bad in ["", "2026-10", "2026-13-01", "2026-00-10", "2026-10-32", "x-y-z", "2026-10-15-1"] {
+            assert_eq!(day_number(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_newest_release_out_22_days_forces() {
+        let day = day_number("2026-10-15").unwrap();
+        let dated = |date: &str| Release { date: date.into(), ..rel("0.6.0") };
+        assert!(must_update(&dated("2026-09-23"), day));
+        assert_eq!(days_out(&dated("2026-09-23"), day), Some(22));
+        assert!(!must_update(&dated("2026-09-24"), day));
+        assert!(!must_update(&dated(""), day), "no date, no force");
+        assert!(today() > day_number("2026-01-01").unwrap());
     }
 
     #[test]
@@ -492,7 +618,7 @@ mod tests {
         let bin = scratch("ok-bin");
         let urls = fake_release(&root, "0.3.0", ASSET, "new");
         let target = old_binary(&bin);
-        install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
+        install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "#!/bin/sh\necho new\n");
         #[cfg(unix)]
         assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
@@ -502,13 +628,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_reports_progress_up_to_the_size() {
+        let root = scratch("progress-release");
+        let bin = scratch("progress-bin");
+        let urls = fake_release(&root, "0.3.0", ASSET, "new");
+        let size = std::fs::metadata(root.join("v0.3.0").join(ASSET)).unwrap().len();
+        let target = old_binary(&bin);
+        let calls = std::sync::Mutex::new(Vec::new());
+        install_with(&urls, Version(0, 3, 0), ASSET, Some(size), &target, |d, t| calls.lock().unwrap().push((d, t)))
+            .await
+            .unwrap();
+        let calls = calls.into_inner().unwrap();
+        assert_eq!(calls.last(), Some(&(size, Some(size))));
+        assert!(calls.iter().all(|(d, _)| *d <= size), "{calls:?}");
+    }
+
+    #[tokio::test]
     async fn checksum_mismatch_leaves_target_unchanged() {
         let root = scratch("bad-release");
         let bin = scratch("bad-bin");
         let urls = fake_release(&root, "0.3.0", ASSET, "new");
         std::fs::write(root.join(format!("v0.3.0/{ASSET}.sha256")), format!("{}  {ASSET}\n", "0".repeat(64))).unwrap();
         let target = old_binary(&bin);
-        let err = install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap_err();
+        let err = install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap_err();
         assert_eq!(err, "download didn't match its checksum; nothing changed");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
         assert!(leftovers(&bin).is_empty());
@@ -520,7 +662,7 @@ mod tests {
         let bin = scratch("missing-bin");
         let urls = Urls { api: String::new(), download: file_url(&root) };
         let target = old_binary(&bin);
-        let err = install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap_err();
+        let err = install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap_err();
         assert!(err.starts_with("couldn't download v0.3.0"), "{err}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
         assert!(leftovers(&bin).is_empty());
@@ -534,7 +676,7 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
         // The download URL is unreachable on purpose: we must fail before trying it.
         let urls = Urls { api: String::new(), download: "file:///nonexistent".into() };
-        let err = install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap_err();
+        let err = install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap_err();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(err.starts_with(&format!("can't replace {}: permission denied", target.display())), "{err}");
         assert!(err.ends_with(&format!("Reinstall with: {}", reinstall_hint())), "{err}");
@@ -553,7 +695,7 @@ mod tests {
         std::fs::write(stale.join("junk"), "x").unwrap();
         std::fs::write(bin.join(".corvo-lan-update-2"), "x").unwrap();
         std::fs::write(bin.join(format!(".corvo-lan-update-{}", std::process::id())), "x").unwrap();
-        install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
+        install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap();
         let expected: Vec<String> = if cfg!(windows) { vec![OLD_EXE.into()] } else { vec![] };
         assert_eq!(leftovers(&bin), expected);
     }
@@ -564,8 +706,8 @@ mod tests {
         let bin = scratch("twice-bin");
         let urls = fake_release(&root, "0.3.0", ASSET, "new");
         let target = old_binary(&bin);
-        install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
-        install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap();
+        install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap();
+        install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap();
         let expected: Vec<String> = if cfg!(windows) { vec![OLD_EXE.into()] } else { vec![] };
         assert_eq!(leftovers(&bin), expected);
     }
@@ -625,7 +767,7 @@ mod tests {
         let target = old_binary(&bin);
         std::fs::write(bin.join(OLD_EXE), "running").unwrap();
         let _held = std::fs::OpenOptions::new().read(true).share_mode(0).open(bin.join(OLD_EXE)).unwrap();
-        let err = install_with(&urls, Version(0, 3, 0), ASSET, &target).await.unwrap_err();
+        let err = install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap_err();
         assert!(err.starts_with("can't replace"), "{err}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
     }
