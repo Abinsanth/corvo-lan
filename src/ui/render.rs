@@ -85,7 +85,7 @@ pub enum Tone {
 }
 
 /// Info texts that are warnings. The node doesn't label them, so match wording.
-const WARN_MARKERS: &[&str] = &["sending too fast", "clock is", "already running", "different key"];
+const WARN_MARKERS: &[&str] = &["sending too fast", "clock is", "already running", "may not be the"];
 
 pub fn tone_of(event: &Event) -> Tone {
     match event {
@@ -139,6 +139,11 @@ pub fn body(text: &str) -> String {
 /// "1 mention", "2 mentions".
 pub fn mention_count(n: u32) -> String {
     format!("{n} mention{}", if n == 1 { "" } else { "s" })
+}
+
+/// "1 person", "2 people".
+fn people(n: usize) -> String {
+    if n == 1 { "1 person".into() } else { format!("{n} people") }
 }
 
 /// One of ANSI 31–36, the same for a name on every run (FNV-1a).
@@ -234,10 +239,10 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
         }
         Event::Removed { room } => s.tone(Tone::Bad, &format!("* you were removed from {}", s.room(room))),
         Event::Peers { you, nick, peers } if peers.is_empty() => {
-            format!("* no peers connected — you are {}, fingerprint {}", s.nick(nick), you.fingerprint())
+            format!("* nobody else online yet — you're {}, fingerprint {}", s.nick(nick), you.fingerprint())
         }
         Event::Peers { you, nick, peers } => {
-            let mut out = format!("* {} peer(s) online:", peers.len());
+            let mut out = format!("* {} online:", people(peers.len() + 1));
             out.push_str(&format!("\n  {} {}", pad(&format!("you {}", s.nick(nick)), 16), you.fingerprint()));
             for p in peers {
                 out.push_str(&format!("\n  {} {}  {}", pad(&s.nick(&p.nick), 16), p.id.fingerprint(), p.addr));
@@ -260,7 +265,7 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
         }
         Event::JoinEnded { name, why } => {
             let text = match why {
-                JoinEnd::NoRoom => format!("! no room {} with that key", s.room(name)),
+                JoinEnd::NoRoom => format!("! no {} with that key", s.room(name)),
                 JoinEnd::Full => format!("! {} is full", s.room(name)),
                 JoinEnd::Denied { by } => format!("! {} didn't let you into {}", s.nick(by), s.room(name)),
                 JoinEnd::TimedOut => format!("! nobody let you into {} — try again later", s.room(name)),
@@ -421,11 +426,11 @@ mod tests {
         let text = event(&peers, 0, &P).unwrap();
         let you = format!("\n  {:<16} 7f3a 9c0d 12e4 5b68", "you @annMoon");
         let bob = format!("\n  {:<16} a1b2 c3d4 e5f6 0718  10.0.0.2:5000", "@bobRoger");
-        assert_eq!(text, format!("* 1 peer(s) online:{you}{bob}"));
+        assert_eq!(text, format!("* 2 people online:{you}{bob}"));
         let alone = Event::Peers { you: PeerId::test(0x7f3a_9c0d_12e4_5b68), nick: "annmoon".into(), peers: vec![] };
         assert_eq!(
             event(&alone, 0, &P).unwrap(),
-            "* no peers connected — you are @annMoon, fingerprint 7f3a 9c0d 12e4 5b68"
+            "* nobody else online yet — you're @annMoon, fingerprint 7f3a 9c0d 12e4 5b68"
         );
     }
 
@@ -530,7 +535,7 @@ mod tests {
             "* waiting to be let into #catPie — its 1 member must approve (/leave #catPie to stop)"
         );
         let ended = |why| line(Event::JoinEnded { name: name(), why }).unwrap();
-        assert_eq!(ended(JoinEnd::NoRoom), "! no room #catPie with that key");
+        assert_eq!(ended(JoinEnd::NoRoom), "! no #catPie with that key");
         assert_eq!(ended(JoinEnd::Full), "! #catPie is full");
         assert_eq!(ended(JoinEnd::Denied { by: "bobroger".into() }), "! @bobRoger didn't let you into #catPie");
         assert_eq!(ended(JoinEnd::TimedOut), "! nobody let you into #catPie — try again later");
@@ -564,16 +569,13 @@ mod tests {
         assert_eq!(tone_of(&Event::MemberLeft { room: "r".into(), nick: nick() }), Tone::Bad);
         assert_eq!(tone_of(&Event::RoomLeft { name: "r".into() }), Tone::Bad);
         assert_eq!(tone_of(&Event::Error("x".into())), Tone::Bad);
-        assert_eq!(tone_of(&Event::Info("@bob is sending too fast; dropping messages".into())), Tone::Warn);
-        assert_eq!(
-            tone_of(&Event::Info("@bob's clock is 9 min off; their room messages are ignored".into())),
-            Tone::Warn
-        );
-        assert_eq!(tone_of(&Event::Info("looking for peers…".into())), Tone::Plain);
+        assert_eq!(tone_of(&Event::Info("@bob is sending too fast — skipping some".into())), Tone::Warn);
+        assert_eq!(tone_of(&Event::Info("@bob's clock is 9 min off — room messages hidden".into())), Tone::Warn);
+        assert_eq!(tone_of(&Event::Info("looking for people nearby…".into())), Tone::Plain);
         assert_eq!(tone_of(&Event::Peers { you: PeerId::test(1), nick: "annmoon".into(), peers: vec![] }), Tone::Plain);
-        let changed = "@bobmoon has a different key from the bob you met before (last seen 2026-10-12). Compare fingerprints in /who.";
+        let changed = "@bobmoon may not be the bob you met before";
         assert_eq!(tone_of(&Event::Info(changed.into())), Tone::Warn);
-        assert_eq!(tone_of(&Event::Info("first time meeting @bobroger (7f3a 9c0d 12e4 5b68)".into())), Tone::Plain);
+        assert_eq!(tone_of(&Event::Info("@bobroger is new — /chat @bobroger to say hi".into())), Tone::Plain);
     }
 
     #[test]

@@ -402,6 +402,8 @@ pub struct TuiState {
     pub popup: Option<Popup>,
     /// The help box is open: it takes every key until q, Q or Esc.
     pub help: bool,
+    /// The welcome box is open: the next key or click only closes it.
+    pub welcome: bool,
     /// Our LAN address for the status bar, e.g. "ip 192.168.1.9 · port 54321".
     pub lan: String,
     /// The terminal window has focus. Assumed until the terminal says otherwise.
@@ -429,6 +431,7 @@ impl TuiState {
             view: (0, 0),
             popup: None,
             help: false,
+            welcome: false,
             lan: String::new(),
             focused: true,
             away: 0,

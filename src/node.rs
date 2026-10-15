@@ -296,9 +296,8 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
         let tx = msg_tx.clone();
         node.background.push(tokio::spawn(async move {
             if let Err(e) = discovery::run(id, nick_rx, port, tx).await {
-                let _ = events.send(Event::Info(format!(
-                    "LAN discovery unavailable ({e}); use --peer <ip:port> to connect manually"
-                )));
+                warn!("LAN discovery unavailable: {e}");
+                let _ = events.send(Event::Info("can't search this network — try --peer IP:PORT".into()));
             }
         }));
     }
@@ -314,7 +313,7 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
         }
     }));
 
-    node.emit(Event::Info("looking for peers…".into()));
+    node.emit(Event::Info("looking for people nearby…".into()));
     if node.ask_name {
         node.preview_name(node.base.clone());
     }
@@ -412,7 +411,7 @@ impl Node {
     fn check_text(&self, text: &str) -> bool {
         let escaped = serde_json::to_string(text).expect("strings always serialize");
         if escaped.len() - 2 > MAX_TEXT_LEN {
-            self.emit(Event::Error(format!("message too long (max {MAX_TEXT_LEN} bytes)")));
+            self.emit(Event::Error("message too long — split it up".into()));
             return false;
         }
         true
@@ -422,7 +421,7 @@ impl Node {
         if self.naming.is_some()
             && !matches!(cmd, Command::ListPeers | Command::Quit | Command::PreviewName { .. } | Command::ConfirmName)
         {
-            self.emit(Event::Error("still picking your name, try again in a moment".into()));
+            self.emit(Event::Error("pick your name first — Enter keeps it".into()));
             return;
         }
         match cmd {
@@ -517,7 +516,10 @@ impl Node {
                     b.next_try = now + b.delay;
                     b.delay = (b.delay * 2).min(BACKOFF_MAX);
                 }
-                None => self.emit(Event::Error(format!("could not connect to {addr}: {error}"))),
+                None => {
+                    warn!("could not connect to {addr}: {error}");
+                    self.emit(Event::Error(format!("couldn't reach {addr}")))
+                }
             },
             NodeMsg::NameWaitOver => self.on_name_wait_over(),
             NodeMsg::Derived { job, attempt, keys } => self.on_derived(job, attempt, keys),
@@ -596,9 +598,6 @@ impl Node {
         self.emit(Event::Assigned { nick, renamed });
 
         if let Some(listener) = self.listener.take() {
-            if let Ok(addr) = listener.local_addr() {
-                self.emit(Event::Info(format!("listening on TCP port {}", addr.port())));
-            }
             let me = self.me();
             let tx = self.msg_tx.clone();
             self.background.push(tokio::spawn(async move {
@@ -677,14 +676,12 @@ impl Node {
         match self.known.judge(id, nick, &online) {
             Judgement::Known => {}
             Judgement::FirstMeeting => {
-                self.emit(Event::Info(format!("first time meeting @{nick} ({})", id.fingerprint())));
+                self.emit(Event::Info(format!("@{nick} is new — /chat @{nick} to say hi")));
             }
             Judgement::KeyChanged { last_seen } => {
                 let base = names::base_of(nick).unwrap_or(nick);
-                self.emit(Event::Info(format!(
-                    "@{nick} has a different key from the {base} you met before (last seen {}). Compare fingerprints in /who.",
-                    day(last_seen)
-                )));
+                debug!("@{nick}: new key, last seen {}", day(last_seen));
+                self.emit(Event::Info(format!("@{nick} may not be the {base} you met before")));
             }
         }
         self.known.record(id, nick, now_millis());
@@ -714,7 +711,7 @@ impl Node {
         if !peer.limit.allow(Instant::now()) {
             if !std::mem::replace(&mut peer.limit.warned, true) {
                 let nick = peer.nick.clone();
-                self.emit(Event::Info(format!("@{nick} is sending too fast; dropping messages")));
+                self.emit(Event::Info(format!("@{nick} is sending too fast — skipping some")));
             }
             return;
         }
@@ -1006,7 +1003,7 @@ pub(super) mod tests {
         let mut h = Harness::new();
         h.node.naming = Some(HashSet::new());
         h.node.handle_command(dm("bobroger", "hi"));
-        assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("still picking")));
+        assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("pick your name first")));
     }
 
     #[test]
@@ -1109,10 +1106,13 @@ pub(super) mod tests {
         h.node.handle_command(Command::PreviewName { base: "Bob".into() });
         assert_eq!(
             h.events(),
-            vec![Event::Error("'chat' is reserved".into()), Event::Error("name must be 1–6 letters or digits".into()),]
+            vec![
+                Event::Error("\"chat\" is taken by a command".into()),
+                Event::Error("name must be 1–6 letters or digits".into()),
+            ]
         );
         h.node.handle_command(dm("bobroger", "hi"));
-        assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("still picking")));
+        assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("pick your name first")));
     }
 
     #[tokio::test]
@@ -1374,12 +1374,11 @@ pub(super) mod tests {
     fn meeting_a_new_key_says_so_once() {
         let mut h = Harness::new();
         assert!(h.connect_stranger(BOB, "bobroger"));
-        let fp = BOB.fingerprint();
         assert_eq!(
             h.events(),
             vec![
                 Event::PeerJoined { id: BOB, nick: "bobroger".into() },
-                Event::Info(format!("first time meeting @bobroger ({fp})")),
+                Event::Info("@bobroger is new — /chat @bobroger to say hi".into()),
             ]
         );
         h.node.handle_msg(NodeMsg::PeerGone { conn: 1, id: BOB, reason: LeaveReason::Quit });
@@ -1395,8 +1394,7 @@ pub(super) mod tests {
         assert!(h.connect_stranger(CAROL, "bobmoon"));
         let events = h.events();
         let Some(Event::Info(text)) = events.get(1) else { panic!("{events:?}") };
-        assert!(text.starts_with("@bobmoon has a different key from the bob you met before (last seen "), "{text}");
-        assert!(text.ends_with("). Compare fingerprints in /who."), "{text}");
+        assert_eq!(text, "@bobmoon may not be the bob you met before");
     }
 
     #[test]

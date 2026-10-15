@@ -342,10 +342,10 @@ async fn who_lists_connected_peers_and_our_fingerprint() {
 }
 
 #[tokio::test]
-async fn meeting_someone_new_shows_their_fingerprint() {
+async fn meeting_someone_new_says_hi() {
     let mut alice = spawn_node("alice", &[]).await;
     let bob = spawn_node("bob", &[alice.node.local_addr]).await;
-    let expected = format!("first time meeting @{} ({})", bob.nick, bob.node.id.fingerprint());
+    let expected = format!("@{0} is new — /chat @{0} to say hi", bob.nick);
     wait_for(&mut alice.node, "first meeting", |e| matches!(e, Event::Info(t) if *t == expected)).await;
 }
 
@@ -354,7 +354,7 @@ async fn unreachable_manual_peer_is_reported() {
     // Bind then drop a listener to get a port that refuses connections.
     let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     let mut alice = spawn_node("alice", &[addr]).await;
-    wait_for(&mut alice.node, "connect error", |e| matches!(e, Event::Error(msg) if msg.contains("could not connect")))
+    wait_for(&mut alice.node, "connect error", |e| matches!(e, Event::Error(msg) if msg.contains("couldn't reach")))
         .await;
 }
 

@@ -29,7 +29,7 @@ fn check_base(base: &str, max_len: usize) -> Result<(), String> {
         return Err(format!("name must be 1–{max_len} letters or digits"));
     }
     if RESERVED.contains(&base) {
-        return Err(format!("'{base}' is reserved"));
+        return Err(format!("\"{base}\" is taken by a command"));
     }
     Ok(())
 }
@@ -129,7 +129,7 @@ mod tests {
         assert!(validate_base("bob smith").is_err());
         assert!(validate_base("bob#").is_err());
         assert!(validate_base("élan").is_err());
-        assert_eq!(validate_base("chat"), Err("'chat' is reserved".into()));
+        assert_eq!(validate_base("chat"), Err("\"chat\" is taken by a command".into()));
         assert!(validate_base("exit").is_err());
         for cmd in ["approve", "deny", "invite", "accept", "decline", "kick"] {
             assert!(validate_base(cmd).is_err(), "{cmd}");
