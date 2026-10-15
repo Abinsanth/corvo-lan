@@ -20,7 +20,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::Print;
 use ratatui::crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
     supports_keyboard_enhancement,
 };
 use tokio::sync::mpsc;
@@ -43,6 +43,11 @@ const TICK: Duration = Duration::from_millis(250);
 const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
 
+/// xterm's title stack: save the window title on entry and put it back on exit.
+/// Terminals without one ignore both.
+const SAVE_TITLE: &str = "\x1b[22;0t";
+const RESTORE_TITLE: &str = "\x1b[23;0t";
+
 /// Best-effort and idempotent: puts the terminal back the way line mode expects.
 fn restore_terminal() {
     let _ = execute!(
@@ -51,7 +56,8 @@ fn restore_terminal() {
         DisableBracketedPaste,
         DisableMouseCapture,
         DisableFocusChange,
-        LeaveAlternateScreen
+        LeaveAlternateScreen,
+        Print(RESTORE_TITLE)
     );
     let _ = disable_raw_mode();
 }
@@ -77,7 +83,14 @@ impl TerminalGuard {
     fn enter() -> std::io::Result<Self> {
         enable_raw_mode()?;
         let guard = TerminalGuard;
-        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
+        execute!(
+            stdout(),
+            Print(SAVE_TITLE),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            EnableFocusChange
+        )?;
         if supports_keyboard_enhancement().unwrap_or(false) {
             execute!(stdout(), PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))?;
         }
@@ -233,9 +246,12 @@ fn ring_bell() {
     let _ = execute!(stdout(), Print('\x07'));
 }
 
-/// The terminal window gained or lost focus.
+/// The terminal window gained or lost focus. Coming back counts as seeing what's open.
 fn on_focus(state: &mut TuiState, focused: bool) {
     state.focused = focused;
+    if focused {
+        state.away = 0;
+    }
 }
 
 /// Puts a new question in the corvo tab and shows it, so it's in plain view
@@ -333,6 +349,13 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
             state.scroll.note_new();
         }
     }
+    if let Event::Message { conv, .. } = event
+        && !state.focused
+        && !state.on_status
+        && session.store.current() == Some(conv)
+    {
+        state.away += 1;
+    }
     follow_current(state, before, session);
     if matches!(event, Event::NamePreview { .. })
         && let Some(question) = session.prompt()
@@ -368,9 +391,15 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
     state.lan = ctx.lan.clone();
     state.on_status = ctx.session.store.current().is_none();
     let mut tick = tokio::time::interval(TICK);
+    let mut title = String::new();
 
     loop {
         let now = Instant::now();
+        let want = view::window_title(&ctx.session, &state);
+        if want != title {
+            let _ = execute!(stdout(), SetTitle(&want));
+            title = want;
+        }
         terminal.draw(|f| view::draw(f, &ctx.session, &mut state, now))?;
         tokio::select! {
             ev = input.recv() => {
@@ -544,6 +573,23 @@ mod tests {
         on_focus(&mut state, true);
         state.on_status = true;
         assert!(rings(&mut s, &mut state, &room("@annmoon look")), "a mention while on the corvo tab");
+    }
+
+    #[test]
+    fn messages_in_view_count_while_the_window_is_away() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_send(&mut s, &mut state, "/chat @bobroger".into(), now);
+        let dm = Event::Message { conv: Conv::Dm("bobroger".into()), from: "bobroger".into(), text: "x".into(), ts: 0 };
+        on_event(&mut s, &mut state, &dm, now);
+        assert_eq!(state.away, 0, "seen as it arrived");
+        on_focus(&mut state, false);
+        on_event(&mut s, &mut state, &dm, now);
+        on_event(&mut s, &mut state, &dm, now);
+        assert_eq!(view::window_title(&s, &state), "(2) corvo-lan");
+        on_focus(&mut state, true);
+        assert_eq!(view::window_title(&s, &state), "corvo-lan", "coming back counts as seeing them");
     }
 
     #[test]

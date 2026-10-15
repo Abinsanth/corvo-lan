@@ -411,6 +411,9 @@ pub struct TuiState {
     pub bell: bool,
     /// The terminal window has focus. Assumed until the terminal says otherwise.
     pub focused: bool,
+    /// Messages that arrived in the open conversation while the window was in
+    /// the background; the store counts those as read.
+    pub away: u32,
     status: VecDeque<StatusLine>,
     flash: Option<(String, Instant)>,
     hits: Vec<(Rect, Hit)>,
@@ -431,6 +434,7 @@ impl TuiState {
             lan: String::new(),
             bell: false,
             focused: true,
+            away: 0,
             status: VecDeque::new(),
             flash: None,
             hits: Vec::new(),

@@ -412,6 +412,19 @@ pub fn lan_label(ip: Option<Ipv4Addr>, port: u16) -> String {
     format!("ip {ip} · port {port}")
 }
 
+/// The window title, with the unread count first so a shortened title still
+/// shows it: "corvo-lan", "(3) corvo-lan", "(3 @1) corvo-lan".
+pub fn window_title(session: &Session, state: &TuiState) -> String {
+    let convs = session.store.conversations();
+    let unread = convs.iter().map(|c| c.unread).sum::<u32>() + state.away;
+    let mentioned = convs.iter().map(|c| c.mentions).sum::<u32>();
+    match (unread, mentioned) {
+        (0, _) => "corvo-lan".to_string(),
+        (u, 0) => format!("({u}) corvo-lan"),
+        (u, m) => format!("({u} @{m}) corvo-lan"),
+    }
+}
+
 fn draw_status_bar(frame: &mut Frame, area: Rect, session: &Session, state: &TuiState, now: Instant) {
     let line = if let Some(flash) = state.flash_text(now) {
         Line::from(Span::styled(flash.to_string(), tone_style(Tone::Bad, state.color)))
@@ -700,6 +713,28 @@ mod tests {
         term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
         let bottom = rows(term.backend().buffer()).pop().unwrap();
         assert!(bottom.starts_with("🔔  @annMoon"), "{bottom}");
+    }
+
+    #[test]
+    fn the_window_title_counts_unread_and_mentions() {
+        let mut s = session(); // annmoon, looking at #catpie
+        let mut state = TuiState::new(false);
+        assert_eq!(window_title(&s, &state), "corvo-lan");
+        let dm = |text: &str| Event::Message {
+            conv: Conv::Dm("bobroger".into()),
+            from: "bobroger".into(),
+            text: text.into(),
+            ts: 0,
+        };
+        s.on_event(&dm("psst"), 0);
+        assert_eq!(window_title(&s, &state), "(1) corvo-lan");
+        s.on_event(&dm("@annmoon look"), 0);
+        assert_eq!(window_title(&s, &state), "(2 @1) corvo-lan");
+        state.away = 3;
+        assert_eq!(window_title(&s, &state), "(5 @1) corvo-lan", "plus what came in while away");
+        s.on_line("/chat @bobroger", None);
+        state.away = 0;
+        assert_eq!(window_title(&s, &state), "corvo-lan");
     }
 
     #[test]
