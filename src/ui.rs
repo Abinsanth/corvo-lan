@@ -54,6 +54,8 @@ pub struct Ctx {
     pub updater: Updater,
     /// Our LAN address for the status bar.
     pub lan: String,
+    /// The user chose to restart into a newly installed version.
+    pub restart: bool,
 }
 
 impl Ctx {
@@ -64,7 +66,8 @@ impl Ctx {
     /// Carries out a reaction's commands and update; says whether to quit.
     /// The caller shows `reaction.print` first.
     pub async fn act(&mut self, reaction: Reaction) -> anyhow::Result<bool> {
-        if reaction.quit {
+        if reaction.quit || reaction.restart {
+            self.restart |= reaction.restart;
             let _ = self.commands.send(Command::Quit).await;
             return Ok(true);
         }
@@ -109,7 +112,7 @@ pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<()> {
         updater.check_at_startup();
     }
     let session = Session::new(Style::detect().color);
-    let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater, lan };
+    let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater, lan, restart: false };
     let result = run_ui(&mut ctx, std::io::stdout().is_terminal(), tui::run).await;
     let _ = task.await;
     result
@@ -136,8 +139,17 @@ mod tests {
             notice_tx: notice_tx.clone(),
             updater: Updater::new(notice_tx, None),
             lan: String::new(),
+            restart: false,
         };
         (ctx, event_tx, cmd_rx)
+    }
+
+    #[tokio::test]
+    async fn a_restart_quits_and_is_remembered() {
+        let (mut ctx, _event_tx, mut cmd_rx) = ctx();
+        assert!(ctx.act(Reaction { restart: true, ..Default::default() }).await.unwrap());
+        assert!(ctx.restart);
+        assert_eq!(cmd_rx.recv().await, Some(Command::Quit));
     }
 
     #[tokio::test]

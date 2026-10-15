@@ -239,6 +239,47 @@ fn apply_key(session: &mut Session, state: &mut TuiState, action: Action) -> Key
     KeyOutcome::Stay
 }
 
+/// Ctrl-L: clears the open tab, like `/clear` (the caller repaints).
+fn on_redraw(session: &Session, state: &mut TuiState) {
+    state.clear_view(session, now_millis());
+}
+
+/// Output from the updater. Returns true to restart into a new version now.
+fn on_notice(session: &mut Session, state: &mut TuiState, notice: Notice, now: Instant) -> bool {
+    match notice {
+        Notice::Line { text, tone } => {
+            state.push_status(now_millis(), &text, tone);
+            if text.starts_with("! ") {
+                state.flash(&text, now);
+            }
+        }
+        Notice::Progress(text) => state.push_progress(now_millis(), &text),
+        Notice::Offer(version) => update_question(session.offer_update(version), session, state, now),
+        Notice::Installed { version, forced: true } => {
+            say(state, &format!("* installed v{version} — restarting"), now);
+            return true;
+        }
+        Notice::Installed { version, forced: false } => {
+            update_question(session.offer_restart(version), session, state, now)
+        }
+    }
+    false
+}
+
+/// Shows the question just asked, or `instead` if another was already open.
+/// Unlike `ask`, it stays on the current tab: these come unasked.
+fn update_question(instead: Option<String>, session: &Session, state: &mut TuiState, now: Instant) {
+    match instead {
+        Some(line) => say(state, &line, now),
+        None => {
+            if let Some(question) = session.prompt() {
+                state.push_status(now_millis(), &question, Tone::Warn);
+                state.flash(&question, now);
+            }
+        }
+    }
+}
+
 /// Shows `text` in the corvo tab, flashing it if it's an error.
 fn say(state: &mut TuiState, text: &str, now: Instant) {
     let tone = tone_of_text(text);
@@ -308,7 +349,7 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     if !text.trim().is_empty() {
         state.history.push(&text);
     }
-    if state.on_status && !text.starts_with('/') && !asking {
+    if state.on_status && !text.trim().is_empty() && !text.starts_with('/') && !session.takes(&text) {
         say(state, "! this is the corvo tab — switch to a chat (Shift-Tab) to send messages", now);
         return None;
     }
@@ -319,6 +360,9 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     if reaction.help {
         state.popup = None;
         state.help = true;
+    }
+    if reaction.clear {
+        state.clear_view(session, now_millis());
     }
     let complained = reaction.print.iter().any(|l| l.starts_with("! "));
     for line in std::mem::take(&mut reaction.print) {
@@ -425,15 +469,10 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
                 }
             },
             Some(notice) = ctx.notices.recv() => {
-                let (text, tone) = match notice {
-                    Notice::Line { text, tone } => (text, tone),
-                    Notice::Progress(text) => (text, Tone::Plain),
-                    Notice::Offer(v) => (format!("* v{v} is available — /update yes to install"), Tone::Plain),
-                    Notice::Installed { version, .. } => (format!("* installed v{version}"), Tone::Plain),
-                };
-                state.push_status(now_millis(), &text, tone);
-                if text.starts_with("! ") {
-                    state.flash(&text, Instant::now());
+                if on_notice(&mut ctx.session, &mut state, notice, Instant::now()) {
+                    ctx.restart = true;
+                    let _ = ctx.commands.send(Command::Quit).await;
+                    break;
                 }
             }
             _ = tick.tick() => {}
@@ -457,6 +496,7 @@ async fn on_terminal_event(
             Some(KeyOutcome::Send(text)) => on_send(&mut ctx.session, state, text, now),
             Some(KeyOutcome::Quit) => Some(Reaction { quit: true, ..Default::default() }),
             Some(KeyOutcome::Redraw) => {
+                on_redraw(&ctx.session, state);
                 // A fresh terminal has an empty back buffer, so the next draw repaints
                 // everything on the cleared screen; if it can't be built, keep the old one.
                 if let Ok(fresh) = open_terminal() {
@@ -542,6 +582,74 @@ mod tests {
         note_input(&mut state, &TermEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
         assert!(state.focused);
         assert_eq!(state.away, 0);
+    }
+
+    const V: crate::update::Version = crate::update::Version(0, 6, 0);
+
+    #[test]
+    fn an_offer_is_asked_without_switching_tabs() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_send(&mut s, &mut state, "/chat @bobroger".into(), now);
+        assert!(!on_notice(&mut s, &mut state, Notice::Offer(V), now));
+        assert!(!state.on_status, "still on the chat");
+        assert_eq!(last_status(&state), ("v0.6.0 is available — install it now? (y/n)", Tone::Warn));
+        assert!(state.flash_text(now).is_some());
+        assert!(s.prompt().is_some());
+        on_notice(&mut s, &mut state, Notice::Offer(V), now);
+        assert_eq!(last_status(&state).0, "* v0.6.0 is available — /update yes to install", "already asking");
+    }
+
+    #[test]
+    fn forced_installed_restarts_at_once() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        assert!(on_notice(&mut s, &mut state, Notice::Installed { version: V, forced: true }, now));
+        assert_eq!(last_status(&state).0, "* installed v0.6.0 — restarting");
+        assert!(!on_notice(&mut s, &mut state, Notice::Installed { version: V, forced: false }, now));
+        assert_eq!(last_status(&state).0, "v0.6.0 is installed — restart now? You'll leave your rooms. (y/n)");
+        assert!(on_send(&mut s, &mut state, "y".into(), now).unwrap().restart);
+    }
+
+    #[test]
+    fn updater_lines_and_progress_reach_the_corvo_tab() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_notice(&mut s, &mut state, Notice::Progress("* downloading v0.6.0  10%".into()), now);
+        on_notice(&mut s, &mut state, Notice::Progress("* downloading v0.6.0  90%".into()), now);
+        assert_eq!(state.status_lines().count(), 1);
+        on_notice(&mut s, &mut state, Notice::new("! couldn't reach GitHub (offline?)"), now);
+        assert_eq!(last_status(&state), ("! couldn't reach GitHub (offline?)", Tone::Bad));
+        assert!(state.flash_text(now).is_some());
+    }
+
+    #[test]
+    fn an_open_update_question_does_not_let_chat_through_on_corvo() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_notice(&mut s, &mut state, Notice::Offer(V), now);
+        assert_eq!(on_send(&mut s, &mut state, "hello".into(), now), None);
+        assert!(last_status(&state).0.starts_with("! this is the corvo tab"));
+        assert_eq!(on_send(&mut s, &mut state, String::new(), now), Some(Reaction::default()), "Enter is harmless");
+        let r = on_send(&mut s, &mut state, "y".into(), now).unwrap();
+        assert_eq!(r.update, Some(crate::ui::updates::UpdateAction::Install));
+    }
+
+    #[test]
+    fn clear_sets_a_mark_on_the_open_tab() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_send(&mut s, &mut state, "/clear".into(), now);
+        assert!(state.cleared_at(None).is_some(), "the corvo tab");
+        on_send(&mut s, &mut state, "/chat @bobroger".into(), now);
+        assert_eq!(apply_key(&mut s, &mut state, Action::Redraw), KeyOutcome::Redraw);
+        on_redraw(&s, &mut state);
+        assert!(state.cleared_at(Some(&Conv::Dm("bobroger".into()))).is_some(), "Ctrl-L clears too");
     }
 
     #[test]

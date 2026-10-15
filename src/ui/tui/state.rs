@@ -2,7 +2,7 @@
 //! scroll position, the corvo (status) tab, the error flash and click targets.
 //! Pure, so it's tested without a terminal.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -410,6 +410,10 @@ pub struct TuiState {
     /// the background; the store counts those as read.
     pub away: u32,
     status: VecDeque<StatusLine>,
+    /// The last status line is a download's progress, which the next one replaces.
+    progress_last: bool,
+    /// Where each tab was `/clear`ed (unix millis); `None` is the corvo tab.
+    cleared: HashMap<Option<Conv>, u64>,
     flash: Option<(String, Instant)>,
     hits: Vec<(Rect, Hit)>,
 }
@@ -429,6 +433,8 @@ impl TuiState {
             focused: true,
             away: 0,
             status: VecDeque::new(),
+            progress_last: false,
+            cleared: HashMap::new(),
             flash: None,
             hits: Vec::new(),
         }
@@ -510,10 +516,36 @@ impl TuiState {
     }
 
     pub fn push_status(&mut self, ts: u64, text: &str, tone: Tone) {
+        self.progress_last = false;
         self.status.push_back(StatusLine { ts, text: text.to_string(), tone });
         if self.status.len() > STATUS_LEN {
             self.status.pop_front();
         }
+    }
+
+    /// A download's progress: replaces the previous progress line while it's the last line.
+    pub fn push_progress(&mut self, ts: u64, text: &str) {
+        if self.progress_last
+            && let Some(last) = self.status.back_mut()
+        {
+            (last.ts, last.text) = (ts, text.to_string());
+            return;
+        }
+        self.push_status(ts, text, Tone::Plain);
+        self.progress_last = true;
+    }
+
+    /// Like a terminal's `clear`: the open tab shows empty from `now_ms` on.
+    /// Nothing is deleted; scrolling up shows what came before.
+    pub fn clear_view(&mut self, session: &Session, now_ms: u64) {
+        let tab = if self.on_status { None } else { session.store.current().cloned() };
+        self.cleared.insert(tab, now_ms);
+        self.scroll.to_bottom();
+    }
+
+    /// When `tab` (`None`: corvo) was last cleared.
+    pub fn cleared_at(&self, tab: Option<&Conv>) -> Option<u64> {
+        self.cleared.get(&tab.cloned()).copied()
     }
 
     pub fn status_lines(&self) -> impl Iterator<Item = &StatusLine> {
@@ -694,6 +726,32 @@ mod tests {
             0,
         );
         s
+    }
+
+    #[test]
+    fn progress_replaces_only_progress() {
+        let mut t = TuiState::new(false);
+        t.push_progress(0, "* downloading v0.6.0  0%");
+        t.push_progress(1, "* downloading v0.6.0  52%");
+        let texts = |t: &TuiState| t.status_lines().map(|l| l.text.clone()).collect::<Vec<_>>();
+        assert_eq!(texts(&t), vec!["* downloading v0.6.0  52%"]);
+        t.push_status(2, "* something else", Tone::Plain);
+        t.push_progress(3, "* downloading v0.6.0  60%");
+        assert_eq!(texts(&t).len(), 3, "a progress line after other news starts a new line");
+    }
+
+    #[test]
+    fn clear_marks_the_open_tab() {
+        let mut s = session_with_tabs();
+        let mut t = TuiState::new(false);
+        t.scroll.page_up(100, 10);
+        t.clear_view(&s, 5);
+        assert_eq!(t.cleared_at(None), Some(5), "the corvo tab");
+        assert!(!t.scroll.is_scrolled(), "back to the latest");
+        t.select_tab(&mut s, 1);
+        t.clear_view(&s, 7);
+        assert_eq!(t.cleared_at(Some(&Conv::Room("catpie".into()))), Some(7));
+        assert_eq!(t.cleared_at(Some(&Conv::Dm("bobroger".into()))), None);
     }
 
     fn bobs() -> Candidates {

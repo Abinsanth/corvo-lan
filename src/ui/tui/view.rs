@@ -94,9 +94,16 @@ fn message_rows(
     out
 }
 
-fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) -> Vec<Line<'static>> {
+/// A conversation's rows, and how many of them come from lines up to `mark` (a `/clear`).
+fn conversation_rows(
+    session: &Session,
+    conv: &Conv,
+    width: usize,
+    color: bool,
+    mark: Option<u64>,
+) -> (Vec<Line<'static>>, usize) {
     let Some(c) = session.store.get(conv) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let me = session.store.me().unwrap_or("you").to_string();
     let nick_of = |kind: &LineKind| match kind {
@@ -111,7 +118,7 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
     // DM tabs get a column after the time: ← theirs; ours · waiting, ✓ delivered, ✗ not.
     let marks = matches!(conv, Conv::Dm(_));
     let mark_w = if marks { 2 } else { 0 };
-    let mut out = Vec::new();
+    let (mut out, mut before) = (Vec::new(), 0);
     for l in &c.lines {
         let time = Span::styled(format!("{} ", hhmm(l.ts)), dim);
         match &l.kind {
@@ -149,18 +156,26 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
                 out.extend(message_rows(prefix, TIME_WIDTH + mark_w + sender_w + 1, text, body_style, width));
             }
         }
+        if mark.is_some_and(|m| l.ts <= m) {
+            before = out.len();
+        }
     }
-    out
+    (out, before)
 }
 
-fn status_rows(state: &TuiState, width: usize) -> Vec<Line<'static>> {
+/// The corvo tab's rows, and how many come from lines up to its `/clear`.
+fn status_rows(state: &TuiState, width: usize) -> (Vec<Line<'static>>, usize) {
     let dim = tone_style(Tone::Dim, state.color);
-    let mut out = Vec::new();
+    let mark = state.cleared_at(None);
+    let (mut out, mut before) = (Vec::new(), 0);
     for l in state.status_lines() {
         let prefix = vec![Span::styled(format!("{} ", hhmm(l.ts)), dim)];
         out.extend(message_rows(prefix, TIME_WIDTH, &l.text, tone_style(l.tone, state.color), width));
+        if mark.is_some_and(|m| l.ts <= m) {
+            before = out.len();
+        }
     }
-    out
+    (out, before)
 }
 
 fn tab_label(tab: &Tab, session: &Session) -> (String, bool) {
@@ -474,11 +489,16 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
     draw_tabs(frame, tabs_a, session, state);
 
     let width = msgs_a.width as usize;
-    let rows = match (state.on_status, session.store.current()) {
-        (false, Some(conv)) => conversation_rows(session, conv, width, state.color),
+    let (mut rows, before) = match (state.on_status, session.store.current()) {
+        (false, Some(conv)) => conversation_rows(session, conv, width, state.color, state.cleared_at(Some(conv))),
         _ => status_rows(state, width),
     };
     let height = msgs_a.height as usize;
+    if before > 0 {
+        // After a /clear, what came before sits just above the view, as in a terminal.
+        let pad = height.saturating_sub(rows.len() - before);
+        rows.extend(std::iter::repeat_n(Line::default(), pad));
+    }
     let top = state.scroll.top(rows.len(), height);
     state.view = (rows.len(), height);
     let visible: Vec<Line> = rows.into_iter().skip(top).take(height).collect();
@@ -673,6 +693,37 @@ mod tests {
         assert_eq!(buf[(x, y)].fg, Color::Red);
         let (x, y) = find(&buf, "message not delivered").unwrap();
         assert_eq!(buf[(x, y)].fg, Color::Red);
+    }
+
+    #[test]
+    fn clear_pushes_old_lines_above_the_view() {
+        let mut s = session();
+        s.on_line("/chat @bobroger", None);
+        let bob = || Conv::Dm("bobroger".into());
+        let msg = |text: &str, ts| Event::Message { conv: bob(), from: "bobroger".into(), text: text.into(), ts };
+        for (i, text) in ["old one", "old two", "old three"].into_iter().enumerate() {
+            s.on_event(&msg(text, i as u64 + 1), 0);
+        }
+        let mut state = TuiState::new(false);
+        state.on_status = false;
+        state.clear_view(&s, 10);
+        s.on_event(&msg("new one", 11), 0);
+        let all = rows(&render(&s, &mut state, 80, 20));
+        assert!(all[1].contains("new one"), "new lines start at the top: {all:#?}");
+        assert!(!all.iter().any(|r| r.contains("old")), "{all:#?}");
+        let (total, height) = state.view;
+        state.scroll.page_up(total, height);
+        let all = rows(&render(&s, &mut state, 80, 20));
+        assert!(all.iter().any(|r| r.contains("old three")), "still there above: {all:#?}");
+
+        state.clear_view(&s, 20);
+        state.clear_view(&s, 21);
+        assert!(!rows(&render(&s, &mut state, 80, 20)).iter().any(|r| r.contains("new one")), "cleared twice");
+        state.on_status = true;
+        state.clear_view(&s, 22);
+        state.push_status(23, "* after", Tone::Plain);
+        let all = rows(&render(&s, &mut state, 80, 20));
+        assert!(all[1].contains("* after"), "the corvo tab clears too: {all:#?}");
     }
 
     #[test]
