@@ -28,6 +28,9 @@ struct Args {
     /// After an update's restart: come back as this name if it's still free
     #[arg(long, hide = true, value_name = "NAME")]
     resume_as: Option<String>,
+    /// Set by an update's restart, so a start never forces two updates in a row
+    #[arg(long, hide = true)]
+    after_update: bool,
 }
 
 #[tokio::main]
@@ -78,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         ask_name,
     })
     .await?;
-    let exit = ui::run(handle, ui::Options { exe: exe.clone() }).await?;
+    let exit = ui::run(handle, ui::Options { exe: exe.clone(), after_update: args.after_update }).await?;
     if let (ui::Exit::Restart { name }, Some(exe)) = (exit, exe) {
         // The new version takes the identity lock, so let go of it first.
         drop(identity);

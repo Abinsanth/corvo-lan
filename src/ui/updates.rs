@@ -50,10 +50,12 @@ pub fn format_check(current: Version, newer: &[Release]) -> Vec<String> {
 }
 
 /// The startup check's move for `newer` (newest first), on day `today`.
-pub fn startup_step(newer: &[Release], today: i64) -> Option<Step> {
+/// `may_force` is false right after an update's restart, so a release that
+/// still looks old once installed can't restart us in a loop.
+pub fn startup_step(newer: &[Release], today: i64, may_force: bool) -> Option<Step> {
     let latest = newer.first()?;
     Some(match update::days_out(latest, today) {
-        Some(days) if update::must_update(latest, today) => Step::Force { version: latest.version, days },
+        Some(days) if may_force && update::must_update(latest, today) => Step::Force { version: latest.version, days },
         _ => Step::Offer(latest.version),
     })
 }
@@ -95,15 +97,16 @@ impl Updater {
         });
     }
 
-    /// One check right away: offers a newer version, or installs one that's
-    /// been out `FORCE_AFTER_DAYS`. Says nothing if GitHub can't be reached.
-    pub fn check_at_startup(&self) {
+    /// One check right away: offers a newer version, or (if `may_force`)
+    /// installs one that's been out `FORCE_AFTER_DAYS`. Says nothing if GitHub
+    /// can't be reached.
+    pub fn check_at_startup(&self, may_force: bool) {
         let (out, busy, exe) = (self.out.clone(), self.busy.clone(), self.exe.clone());
         tokio::spawn(async move {
             let Ok(newer) = update::check().await else {
                 return;
             };
-            match startup_step(&newer, update::today()) {
+            match startup_step(&newer, update::today(), may_force) {
                 None => {}
                 Some(Step::Offer(version)) => {
                     let _ = out.send(Notice::Offer(version));
@@ -231,14 +234,23 @@ mod tests {
     #[test]
     fn startup_steps() {
         let today = update::day_number("2026-10-15").unwrap();
-        assert_eq!(startup_step(&[], today), None);
+        assert_eq!(startup_step(&[], today, true), None);
         let out_since = |date| rel("0.6.0", date, &[]);
-        assert_eq!(startup_step(&[out_since("2026-09-24")], today), Some(Step::Offer(Version(0, 6, 0))));
+        assert_eq!(startup_step(&[out_since("2026-09-24")], today, true), Some(Step::Offer(Version(0, 6, 0))));
         assert_eq!(
-            startup_step(&[out_since("2026-09-23"), rel("0.5.1", "2026-01-01", &[])], today),
+            startup_step(&[out_since("2026-09-23"), rel("0.5.1", "2026-01-01", &[])], today, true),
             Some(Step::Force { version: Version(0, 6, 0), days: 22 })
         );
-        assert_eq!(startup_step(&[out_since("")], today), Some(Step::Offer(Version(0, 6, 0))), "no date: just ask");
+        assert_eq!(
+            startup_step(&[out_since("")], today, true),
+            Some(Step::Offer(Version(0, 6, 0))),
+            "no date: just ask"
+        );
+        assert_eq!(
+            startup_step(&[out_since("2026-09-23")], today, false),
+            Some(Step::Offer(Version(0, 6, 0))),
+            "never forced straight after an update's restart, so a bad release can't loop"
+        );
     }
 
     #[test]

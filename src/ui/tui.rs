@@ -254,7 +254,11 @@ fn on_notice(session: &mut Session, state: &mut TuiState, notice: Notice, now: I
             }
         }
         Notice::Progress(text) => state.push_progress(now_millis(), &text),
-        Notice::Offer(version) => update_question(session.offer_update(version), session, state, now),
+        Notice::Offer(version) => {
+            if session.offer_update(version) {
+                update_question(None, session, state, now);
+            }
+        }
         Notice::Installed { version, forced: true } => {
             say(state, &format!("* installed v{version} — restarting"), now);
             return true;
@@ -264,6 +268,13 @@ fn on_notice(session: &mut Session, state: &mut TuiState, notice: Notice, now: I
         }
     }
     false
+}
+
+/// Asks a waiting install question once the open one is answered.
+fn ask_pending(session: &mut Session, state: &mut TuiState, now: Instant) {
+    if session.ask_pending() {
+        update_question(None, session, state, now);
+    }
 }
 
 /// Shows the question just asked, or `instead` if another was already open.
@@ -444,6 +455,7 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
 
     loop {
         let now = Instant::now();
+        ask_pending(&mut ctx.session, &mut state, now);
         let want = view::window_title(&ctx.session, &state);
         if want != title {
             let _ = execute!(stdout(), SetTitle(&want));
@@ -597,8 +609,24 @@ mod tests {
         assert_eq!(last_status(&state), ("v0.6.0 is available — install it now? (y/n)", Tone::Warn));
         assert!(state.flash_text(now).is_some());
         assert!(s.prompt().is_some());
+        let lines = state.status_lines().count();
         on_notice(&mut s, &mut state, Notice::Offer(V), now);
-        assert_eq!(last_status(&state).0, "* v0.6.0 is available — /update yes to install", "already asking");
+        assert_eq!(state.status_lines().count(), lines, "already asking: nothing to show");
+    }
+
+    #[test]
+    fn a_queued_offer_is_asked_once_the_name_is_picked() {
+        let mut s = Session::new(false);
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_event(&mut s, &mut state, &Event::NamePreview { nick: "annmoon".into() }, now);
+        on_notice(&mut s, &mut state, Notice::Offer(V), now);
+        assert!(s.prompt().is_some_and(|p| p.contains("you'll be @annmoon")));
+        ask_pending(&mut s, &mut state, now);
+        assert!(s.prompt().is_some_and(|p| p.contains("you'll be")), "not while the name is open");
+        on_event(&mut s, &mut state, &Event::Assigned { nick: "annmoon".into(), renamed: false }, now);
+        ask_pending(&mut s, &mut state, now);
+        assert_eq!(last_status(&state), ("v0.6.0 is available — install it now? (y/n)", Tone::Warn));
     }
 
     #[test]

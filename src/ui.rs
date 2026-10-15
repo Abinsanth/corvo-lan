@@ -24,6 +24,8 @@ use crate::update::Version;
 pub struct Options {
     /// This binary, captured at startup: an update replaces it, and a restart runs it.
     pub exe: Option<PathBuf>,
+    /// We were just restarted by an update: don't force another one.
+    pub after_update: bool,
 }
 
 /// How the UI ended.
@@ -120,7 +122,7 @@ pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<Exit> {
     tui::install_panic_hook();
     let (notice_tx, notices) = mpsc::unbounded_channel();
     let updater = Updater::new(notice_tx.clone(), opts.exe);
-    updater.check_at_startup();
+    updater.check_at_startup(!opts.after_update);
     let session = Session::new(Style::detect().color);
     let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater, lan, restart: false };
     let result = run_ui(&mut ctx, std::io::stdout().is_terminal(), tui::run).await;

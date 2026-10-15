@@ -16,8 +16,10 @@ use crate::room::to_hex;
 pub const REPO: &str = "Abinsanth/corvo-lan";
 pub const INSTALL_URL: &str = "https://raw.githubusercontent.com/Abinsanth/corvo-lan/release/install.sh";
 pub const INSTALL_PS1_URL: &str = "https://raw.githubusercontent.com/Abinsanth/corvo-lan/release/install.ps1";
-/// Where a Windows update moves the running exe, which can be renamed but not replaced.
-pub const OLD_EXE: &str = "corvo-lan.old.exe";
+/// Where a Windows update moves the running exe, which can be renamed but not
+/// replaced: `corvo-lan.old-<n>.exe`, a fresh `n` each time, since the one an
+/// earlier update set aside may still be running (an update's restart waits on it).
+const OLD_EXE_PREFIX: &str = "corvo-lan.old";
 /// The binary inside a release archive.
 #[cfg(windows)]
 const BIN_NAME: &str = "corvo-lan.exe";
@@ -304,8 +306,7 @@ fn swap_in(new: &Path, target: &Path) -> std::io::Result<()> {
     if !new.is_file() {
         return Err(std::io::Error::new(ErrorKind::NotFound, "the new version is missing"));
     }
-    let old = target.with_file_name(OLD_EXE);
-    let _ = std::fs::remove_file(&old);
+    let old = aside_path(target.parent().unwrap_or(Path::new(".")));
     std::fs::rename(target, &old)?;
     if let Err(e) = std::fs::rename(new, target) {
         return match std::fs::rename(&old, target) {
@@ -327,18 +328,19 @@ pub fn running_exe() -> std::io::Result<PathBuf> {
     if cfg!(windows) { std::env::current_exe() } else { std::env::current_exe()?.canonicalize() }
 }
 
-/// The arguments to restart with: ours, minus any `--resume-as`, plus
-/// `--resume-as <name>` when we have a name to keep.
+/// The arguments to restart with: ours, minus any earlier restart's, plus
+/// `--after-update` and `--resume-as <name>` when we have a name to keep.
 pub fn restart_args(args: impl IntoIterator<Item = OsString>, name: Option<&str>) -> Vec<OsString> {
     let mut out = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--resume-as" {
             args.next();
-        } else if !arg.to_string_lossy().starts_with("--resume-as=") {
+        } else if arg != "--after-update" && !arg.to_string_lossy().starts_with("--resume-as=") {
             out.push(arg);
         }
     }
+    out.push(OsString::from("--after-update"));
     if let Some(name) = name {
         out.extend([OsString::from("--resume-as"), OsString::from(name)]);
     }
@@ -361,9 +363,34 @@ pub fn relaunch(exe: &Path, args: Vec<OsString>) -> std::io::Result<()> {
     }
 }
 
-/// Deletes the exe a Windows update moved aside; it couldn't go while it ran.
+/// The first `corvo-lan.old-<n>.exe` in `dir` that's free, or can be freed.
+#[cfg(any(windows, test))]
+fn aside_path(dir: &Path) -> PathBuf {
+    (0..)
+        .map(|n| dir.join(format!("{OLD_EXE_PREFIX}-{n}.exe")))
+        .find(|path| {
+            let _ = std::fs::remove_file(path);
+            !path.exists()
+        })
+        .expect("some name is free")
+}
+
+/// An exe a Windows update set aside, including the older `corvo-lan.old.exe`.
+fn is_old_exe(name: &str) -> bool {
+    name.starts_with(OLD_EXE_PREFIX) && name.ends_with(".exe")
+}
+
+/// Deletes the exes Windows updates moved aside. One still running (it waits on
+/// the restarted app) can't go yet; a later start removes it.
 pub fn remove_old_exe(dir: &Path) {
-    let _ = std::fs::remove_file(dir.join(OLD_EXE));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if is_old_exe(&entry.file_name().to_string_lossy()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 async fn download(url: &str, out: &Path) -> Result<(), String> {
@@ -405,7 +432,7 @@ fn sweep_leftovers(dir: &Path) {
             let path = entry.path();
             let _ = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
         }
-        if entry.file_name() == OLD_EXE {
+        if is_old_exe(&entry.file_name().to_string_lossy()) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -571,10 +598,14 @@ mod tests {
         let old = os(&["--peer", "1.2.3.4:5", "--resume-as", "oldname", "--debug"]);
         assert_eq!(
             restart_args(old.clone(), Some("annmoon")),
-            os(&["--peer", "1.2.3.4:5", "--debug", "--resume-as", "annmoon"])
+            os(&["--peer", "1.2.3.4:5", "--debug", "--after-update", "--resume-as", "annmoon"])
         );
-        assert_eq!(restart_args(os(&["--resume-as=x", "--debug"]), None), os(&["--debug"]));
-        assert_eq!(restart_args(os(&["--nick", "ann"]), None), os(&["--nick", "ann"]), "nothing added");
+        assert_eq!(restart_args(os(&["--resume-as=x", "--debug"]), None), os(&["--debug", "--after-update"]));
+        assert_eq!(
+            restart_args(os(&["--nick", "ann", "--after-update"]), None),
+            os(&["--nick", "ann", "--after-update"]),
+            "marked once, however many restarts"
+        );
     }
 
     #[cfg(unix)]
@@ -662,7 +693,7 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
         // Windows can't delete the exe it just moved aside; the next start does.
-        let expected: Vec<String> = if cfg!(windows) { vec![OLD_EXE.into()] } else { vec![] };
+        let expected: Vec<String> = if cfg!(windows) { vec!["corvo-lan.old-0.exe".into()] } else { vec![] };
         assert_eq!(leftovers(&bin), expected);
     }
 
@@ -735,7 +766,7 @@ mod tests {
         std::fs::write(bin.join(".corvo-lan-update-2"), "x").unwrap();
         std::fs::write(bin.join(format!(".corvo-lan-update-{}", std::process::id())), "x").unwrap();
         install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap();
-        let expected: Vec<String> = if cfg!(windows) { vec![OLD_EXE.into()] } else { vec![] };
+        let expected: Vec<String> = if cfg!(windows) { vec!["corvo-lan.old-0.exe".into()] } else { vec![] };
         assert_eq!(leftovers(&bin), expected);
     }
 
@@ -747,7 +778,7 @@ mod tests {
         let target = old_binary(&bin);
         install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap();
         install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap();
-        let expected: Vec<String> = if cfg!(windows) { vec![OLD_EXE.into()] } else { vec![] };
+        let expected: Vec<String> = if cfg!(windows) { vec!["corvo-lan.old-0.exe".into()] } else { vec![] };
         assert_eq!(leftovers(&bin), expected);
     }
 
@@ -773,16 +804,26 @@ mod tests {
         let _held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&new).unwrap();
         assert!(swap_in(&new, &target).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
-        assert!(!bin.join(OLD_EXE).exists());
+        assert!(!bin.join("corvo-lan.old-0.exe").exists());
     }
 
     #[test]
-    fn the_old_exe_is_removed_at_startup() {
+    fn old_exes_are_removed_at_startup() {
         let bin = scratch("old-exe");
-        std::fs::write(bin.join(OLD_EXE), "old").unwrap();
+        for name in ["corvo-lan.old.exe", "corvo-lan.old-0.exe", "corvo-lan.old-7.exe", "notes.txt"] {
+            std::fs::write(bin.join(name), "x").unwrap();
+        }
         remove_old_exe(&bin);
-        assert!(!bin.join(OLD_EXE).exists());
-        remove_old_exe(&bin); // nothing there: no panic
+        assert_eq!(leftovers(&bin), vec!["notes.txt"]);
+        remove_old_exe(&bin); // nothing left to remove: no panic
+    }
+
+    #[test]
+    fn a_free_name_is_found_for_setting_the_old_exe_aside() {
+        let bin = scratch("aside");
+        assert_eq!(aside_path(&bin), bin.join("corvo-lan.old-0.exe"));
+        std::fs::create_dir(bin.join("corvo-lan.old-0.exe")).unwrap(); // can't be removed as a file
+        assert_eq!(aside_path(&bin), bin.join("corvo-lan.old-1.exe"));
     }
 
     #[test]
@@ -794,21 +835,22 @@ mod tests {
         }
     }
 
-    /// Updating again before restarting: the old exe is still running, so it
-    /// can't be replaced. Nothing may change.
+    /// Updating again while an exe set aside earlier still runs (after an
+    /// update's restart, the old one waits on the new): the next name is used.
     #[cfg(windows)]
     #[tokio::test]
-    async fn a_locked_old_exe_fails_cleanly() {
+    async fn a_running_old_exe_does_not_block_the_next_update() {
         use std::os::windows::fs::OpenOptionsExt;
         let root = scratch("locked-release");
         let bin = scratch("locked-bin");
         let urls = fake_release(&root, "0.3.0", ASSET, "new");
         let target = old_binary(&bin);
-        std::fs::write(bin.join(OLD_EXE), "running").unwrap();
-        let _held = std::fs::OpenOptions::new().read(true).share_mode(0).open(bin.join(OLD_EXE)).unwrap();
-        let err = install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap_err();
-        assert!(err.starts_with("can't replace"), "{err}");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        let running = bin.join("corvo-lan.old-0.exe");
+        std::fs::write(&running, "running").unwrap();
+        let _held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&running).unwrap();
+        install_with(&urls, Version(0, 3, 0), ASSET, None, &target, |_, _| {}).await.unwrap();
+        assert!(std::fs::read_to_string(&target).unwrap().contains("new"));
+        assert!(bin.join("corvo-lan.old-1.exe").exists());
     }
 
     #[test]

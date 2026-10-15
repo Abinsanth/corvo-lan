@@ -68,6 +68,8 @@ pub struct Session {
     style: Style,
     /// The question the next line answers, if any.
     asking: Option<Asking>,
+    /// A newer version to ask about once the open question is answered.
+    pending: Option<Version>,
 }
 
 /// A question the input is waiting on.
@@ -97,7 +99,7 @@ fn yes_no(line: &str) -> Option<bool> {
 
 impl Session {
     pub fn new(color: bool) -> Self {
-        Session { store: Store::new(), color, style: Style::plain(), asking: None }
+        Session { store: Store::new(), color, style: Style::plain(), asking: None, pending: None }
     }
 
     pub fn color(&self) -> bool {
@@ -108,7 +110,13 @@ impl Session {
     pub fn on_event(&mut self, event: &Event, now: u64) -> Option<String> {
         self.store.apply(event, now);
         match event {
-            Event::NamePreview { nick } => self.asking = Some(Asking::Name { preview: nick.clone(), confirmed: false }),
+            Event::NamePreview { nick } => {
+                // The name comes first; an install question already asked waits its turn.
+                if let Some(Asking::Install { version }) = self.asking {
+                    self.pending = Some(version);
+                }
+                self.asking = Some(Asking::Name { preview: nick.clone(), confirmed: false })
+            }
             Event::Assigned { .. } if matches!(self.asking, Some(Asking::Name { .. })) => self.asking = None,
             _ => {}
         }
@@ -177,14 +185,23 @@ impl Session {
         }
     }
 
-    /// Asks whether to install `version`. If another question is open, returns
-    /// a line to show instead.
-    pub fn offer_update(&mut self, version: Version) -> Option<String> {
+    /// Asks whether to install `version`; says whether it's asked now. With
+    /// another question open, it waits for `ask_pending` instead.
+    pub fn offer_update(&mut self, version: Version) -> bool {
+        self.pending = Some(version);
+        self.ask_pending()
+    }
+
+    /// Asks the waiting install question if nothing else is being asked; says whether it did.
+    pub fn ask_pending(&mut self) -> bool {
         if self.asking.is_some() {
-            return Some(format!("* v{version} is available — /update yes to install"));
+            return false;
         }
+        let Some(version) = self.pending.take() else {
+            return false;
+        };
         self.asking = Some(Asking::Install { version });
-        None
+        true
     }
 
     /// Asks whether to restart into the installed `version`. If another
@@ -399,6 +416,7 @@ impl Session {
                 _ => Reaction::say("! you're not in a room here — /leave #room"),
             },
             Input::Update { confirm } => {
+                self.pending = None;
                 if matches!(self.asking, Some(Asking::Install { .. })) {
                     self.asking = None;
                 }
@@ -1017,7 +1035,7 @@ mod tests {
     #[test]
     fn the_update_question_takes_y_yes_n_no() {
         let mut s = session();
-        assert_eq!(s.offer_update(V), None);
+        assert!(s.offer_update(V));
         assert_eq!(s.prompt().as_deref(), Some("v0.6.0 is available — install it now? (y/n)"));
         assert!(s.takes("Y") && s.takes(" no ") && !s.takes("hello"));
         assert_eq!(typed(&mut s, "Y").update, Some(UpdateAction::Install));
@@ -1044,13 +1062,39 @@ mod tests {
     }
 
     #[test]
-    fn an_offer_during_another_question_is_a_line() {
-        let mut s = session();
-        typed(&mut s, "/create cat");
+    fn an_offer_during_another_question_waits_its_turn() {
+        let mut s = Session::new(false);
+        s.on_event(&Event::NamePreview { nick: "annmoon".into() }, 0);
         let asked = s.prompt();
-        assert_eq!(s.offer_update(V).as_deref(), Some("* v0.6.0 is available — /update yes to install"));
-        assert_eq!(s.prompt(), asked, "the create question stays");
-        assert!(s.takes("anything"), "the create question takes any answer");
+        assert!(!s.offer_update(V), "not asked yet");
+        assert_eq!(s.prompt(), asked, "the name question stays");
+        assert!(!s.ask_pending(), "still busy");
+        s.on_event(&Event::Assigned { nick: "annmoon".into(), renamed: false }, 0);
+        assert!(s.ask_pending());
+        assert_eq!(s.prompt().as_deref(), Some("v0.6.0 is available — install it now? (y/n)"));
+        assert!(!s.ask_pending(), "asked once");
+
+        typed(&mut s, "n");
+        typed(&mut s, "/create cat");
+        assert!(!s.offer_update(V));
+        assert!(s.cancel_prompt());
+        assert!(s.ask_pending(), "Esc on the create question lets it through");
+        s.cancel_prompt();
+        typed(&mut s, "/create cat");
+        s.offer_update(V);
+        typed(&mut s, "/update");
+        s.cancel_prompt();
+        assert!(!s.ask_pending(), "/update asks for itself, so the queued one goes");
+    }
+
+    #[test]
+    fn the_name_question_puts_an_earlier_offer_back_in_line() {
+        let mut s = Session::new(false);
+        assert!(s.offer_update(V), "asked before the name preview arrived");
+        s.on_event(&Event::NamePreview { nick: "annmoon".into() }, 0);
+        assert!(s.prompt().is_some_and(|p| p.contains("you'll be @annmoon")));
+        s.on_event(&Event::Assigned { nick: "annmoon".into(), renamed: false }, 0);
+        assert!(s.ask_pending(), "the offer comes back");
     }
 
     #[test]

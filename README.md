@@ -182,7 +182,7 @@ asking, so nobody stays on an old one. While it downloads, a progress bar
 shows how far it got; afterwards corvo-lan offers to restart into the new
 version in the same window, keeping your name if it's still free (restarting
 leaves your rooms). On Windows the old version is set aside as
-`corvo-lan.old.exe` and deleted the next time corvo-lan starts; `/update` there
+`corvo-lan.old-<n>.exe` and deleted once it's no longer running; `/update` there
 needs Windows 10 version 1803 or newer, which has the built-in curl and tar.
 The check sends GitHub only your IP address and the app version, and if GitHub
 can't be reached corvo-lan just starts as usual. Nothing else ever leaves your
