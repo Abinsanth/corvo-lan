@@ -6,6 +6,7 @@ use super::updates::UpdateAction;
 use crate::api::{Command, Conv, Event, Target};
 use crate::convo::Store;
 use crate::node::{MAX_MEMBERS, MIN_MEMBERS};
+use crate::update::Version;
 
 pub const MAX_MESSAGE_LINES: usize = 50;
 
@@ -24,6 +25,7 @@ chat
 
 info
   /rooms /chats /who   lists
+  /clear               clear the screen
   /update              check for updates
   /quit                exit (/q, Ctrl-C)
 
@@ -40,6 +42,10 @@ pub struct Reaction {
     /// Open the help box.
     pub help: bool,
     pub update: Option<UpdateAction>,
+    /// Clear the open tab's view.
+    pub clear: bool,
+    /// Quit and start the newly installed version.
+    pub restart: bool,
     /// Text for the clipboard.
     pub copy: Option<String>,
 }
@@ -74,6 +80,19 @@ enum Asking {
     RoomName { preview: String, max: Option<u8> },
     /// `/create`, step 2: how many people.
     HeadCount { name: String },
+    /// A newer version is out: install it? Only y/yes/n/no answer it.
+    Install { version: Version },
+    /// A newer version is installed: restart into it? Only y/yes/n/no answer it.
+    Restart { version: Version },
+}
+
+/// `y`/`yes` → true, `n`/`no` → false, in any case; anything else isn't an answer.
+fn yes_no(line: &str) -> Option<bool> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 impl Session {
@@ -108,13 +127,22 @@ impl Session {
             let (preview, confirmed) = (preview.clone(), *confirmed);
             return self.answer_name(preview, confirmed, line.trim());
         }
+        if let Some(Asking::Install { .. } | Asking::Restart { .. }) = &self.asking {
+            if let Some(yes) = yes_no(line) {
+                let asking = self.asking.take().expect("matched above");
+                return self.answer_update(asking, yes);
+            }
+            return self.on_input(parse_line(line), shown);
+        }
         if let Some(asking) = self.asking.take()
             && !line.trim_start().starts_with('/')
         {
             return match asking {
                 Asking::RoomName { preview, max } => self.answer_room_name(preview, max, line.trim()),
                 Asking::HeadCount { name } => self.answer_head_count(name, line.trim()),
-                Asking::Name { .. } => unreachable!("answered above"),
+                Asking::Name { .. } | Asking::Install { .. } | Asking::Restart { .. } => {
+                    unreachable!("answered above")
+                }
             };
         }
         self.on_input(parse_line(line), shown)
@@ -133,7 +161,52 @@ impl Session {
             Asking::HeadCount { name } => format!(
                 "how many people in #{name}? {MIN_MEMBERS}–{MAX_MEMBERS}, Enter for {MAX_MEMBERS}, Esc to cancel"
             ),
+            Asking::Install { version } => format!("v{version} is available — install it now? (y/n)"),
+            Asking::Restart { version } => {
+                format!("v{version} is installed — restart now? You'll leave your rooms. (y/n)")
+            }
         })
+    }
+
+    /// Whether `line` answers the open question (rather than being a message or command).
+    pub fn takes(&self, line: &str) -> bool {
+        match &self.asking {
+            None => false,
+            Some(Asking::Install { .. } | Asking::Restart { .. }) => yes_no(line).is_some(),
+            Some(_) => true,
+        }
+    }
+
+    /// Asks whether to install `version`. If another question is open, returns
+    /// a line to show instead.
+    pub fn offer_update(&mut self, version: Version) -> Option<String> {
+        if self.asking.is_some() {
+            return Some(format!("* v{version} is available — /update yes to install"));
+        }
+        self.asking = Some(Asking::Install { version });
+        None
+    }
+
+    /// Asks whether to restart into the installed `version`. If another
+    /// question is open, returns a line to show instead.
+    pub fn offer_restart(&mut self, version: Version) -> Option<String> {
+        if self.asking.is_some() {
+            return Some(format!("* v{version} starts next time you open corvo-lan"));
+        }
+        self.asking = Some(Asking::Restart { version });
+        None
+    }
+
+    fn answer_update(&mut self, asking: Asking, yes: bool) -> Reaction {
+        match (asking, yes) {
+            (Asking::Install { .. }, true) => Reaction { update: Some(UpdateAction::Install), ..Default::default() },
+            (Asking::Install { .. }, false) => Reaction::say("* ok — /update yes installs it later"),
+            (Asking::Restart { .. }, true) => Reaction { restart: true, ..Default::default() },
+            (Asking::Restart { version }, false) => {
+                Reaction::say(format!("* v{version} starts next time you open corvo-lan"))
+            }
+            _ => Reaction::default(),
+        }
     }
 
     /// Drops the question; says whether there was one. The name question can't be dropped.
@@ -325,10 +398,16 @@ impl Session {
                 Some(Conv::Room(n)) => Reaction::send(Command::LeaveRoom { name: n.clone() }),
                 _ => Reaction::say("! you're not in a room here — /leave #room"),
             },
-            Input::Update { confirm } => Reaction {
-                update: Some(if confirm { UpdateAction::Install } else { UpdateAction::Check }),
-                ..Default::default()
-            },
+            Input::Update { confirm } => {
+                if matches!(self.asking, Some(Asking::Install { .. })) {
+                    self.asking = None;
+                }
+                Reaction {
+                    update: Some(if confirm { UpdateAction::Install } else { UpdateAction::Check }),
+                    ..Default::default()
+                }
+            }
+            Input::Clear => Reaction { clear: true, ..Default::default() },
             Input::Close(target) => {
                 let conv = match target {
                     Some(nick) => Conv::Dm(nick),
@@ -929,7 +1008,81 @@ mod tests {
         assert_eq!(check.update, Some(UpdateAction::Check));
         assert!(check.commands.is_empty() && check.print.is_empty());
         assert_eq!(typed(&mut s, "/update yes").update, Some(UpdateAction::Install));
+        assert_eq!(typed(&mut s, "/update y").update, Some(UpdateAction::Install));
         assert!(HELP.contains("/update"));
+    }
+
+    const V: Version = Version(0, 6, 0);
+
+    #[test]
+    fn the_update_question_takes_y_yes_n_no() {
+        let mut s = session();
+        assert_eq!(s.offer_update(V), None);
+        assert_eq!(s.prompt().as_deref(), Some("v0.6.0 is available — install it now? (y/n)"));
+        assert!(s.takes("Y") && s.takes(" no ") && !s.takes("hello"));
+        assert_eq!(typed(&mut s, "Y").update, Some(UpdateAction::Install));
+        assert_eq!(s.prompt(), None);
+        s.offer_update(V);
+        assert_eq!(typed(&mut s, " no ").print, vec!["* ok — /update yes installs it later"]);
+        assert_eq!(s.prompt(), None);
+        s.offer_update(V);
+        assert_eq!(typed(&mut s, "yes").update, Some(UpdateAction::Install));
+        s.offer_update(V);
+        typed(&mut s, "/update");
+        assert_eq!(s.prompt(), None, "/update asks again itself");
+    }
+
+    #[test]
+    fn other_text_passes_through_an_update_question() {
+        let mut s = session();
+        typed(&mut s, "/chat @bobroger");
+        s.offer_update(V);
+        assert_eq!(typed(&mut s, "hello"), send(Target::Dm("bobroger".into()), "hello"));
+        assert!(s.prompt().is_some(), "the question stays");
+        assert_eq!(typed(&mut s, "/who").commands, vec![Command::ListPeers]);
+        assert!(s.prompt().is_some());
+    }
+
+    #[test]
+    fn an_offer_during_another_question_is_a_line() {
+        let mut s = session();
+        typed(&mut s, "/create cat");
+        let asked = s.prompt();
+        assert_eq!(s.offer_update(V).as_deref(), Some("* v0.6.0 is available — /update yes to install"));
+        assert_eq!(s.prompt(), asked, "the create question stays");
+        assert!(s.takes("anything"), "the create question takes any answer");
+    }
+
+    #[test]
+    fn the_restart_question() {
+        let mut s = session();
+        assert_eq!(s.offer_restart(V), None);
+        assert_eq!(s.prompt().as_deref(), Some("v0.6.0 is installed — restart now? You'll leave your rooms. (y/n)"));
+        assert!(typed(&mut s, "y").restart);
+        s.offer_restart(V);
+        assert_eq!(typed(&mut s, "n").print, vec!["* v0.6.0 starts next time you open corvo-lan"]);
+        s.offer_update(V);
+        assert_eq!(
+            s.offer_restart(V).as_deref(),
+            Some("* v0.6.0 starts next time you open corvo-lan"),
+            "no restart question while another is open"
+        );
+    }
+
+    #[test]
+    fn esc_drops_an_update_question() {
+        let mut s = session();
+        assert!(!s.takes("y"), "nothing asked");
+        s.offer_update(V);
+        assert!(s.cancel_prompt());
+        assert_eq!(s.prompt(), None);
+    }
+
+    #[test]
+    fn clear_asks_the_ui_to_clear() {
+        let mut s = session();
+        assert_eq!(typed(&mut s, "/clear"), Reaction { clear: true, ..Default::default() });
+        assert!(HELP.contains("  /clear               clear the screen"));
     }
 
     #[test]
