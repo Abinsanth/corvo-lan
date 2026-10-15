@@ -423,7 +423,8 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, session: &Session, state: &Tui
     } else {
         let me = session.store.me().map_or_else(|| "…".into(), display);
         let online = session.store.online().count();
-        let mut text = format!("@{me} · {online} online · /help");
+        let bell = if state.bell { "🔔" } else { "🔕" };
+        let mut text = format!("{bell} @{me} · {online} online · /help");
         if !state.lan.is_empty() {
             text = format!("{text} · {}", state.lan);
         }
@@ -689,11 +690,16 @@ mod tests {
         assert_eq!(buf[(x, y)].fg, Color::Red);
         term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
         let bottom = rows(term.backend().buffer()).pop().unwrap();
-        assert_eq!(bottom.trim_end(), "@annMoon · 2 online · /help", "nothing to add before the address is known");
+        // The bell is two cells wide; the cell it covers reads as a space here.
+        assert_eq!(bottom.trim_end(), "🔕  @annMoon · 2 online · /help", "nothing to add before the address is known");
         state.lan = lan_label(Some(Ipv4Addr::new(192, 168, 1, 9)), 54321);
         term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
         let bottom = rows(term.backend().buffer()).pop().unwrap();
-        assert_eq!(bottom.trim_end(), "@annMoon · 2 online · /help · ip 192.168.1.9 · port 54321");
+        assert_eq!(bottom.trim_end(), "🔕  @annMoon · 2 online · /help · ip 192.168.1.9 · port 54321");
+        state.bell = true;
+        term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
+        let bottom = rows(term.backend().buffer()).pop().unwrap();
+        assert!(bottom.starts_with("🔔  @annMoon"), "{bottom}");
     }
 
     #[test]

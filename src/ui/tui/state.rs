@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Position, Rect};
 
 use crate::api::{Conv, Event};
+use crate::convo::mentions;
 use crate::ui::complete::{Candidates, common_prefix, complete};
 use crate::ui::render::Tone;
 use crate::ui::session::Session;
@@ -18,6 +19,8 @@ pub const HISTORY_LEN: usize = 100;
 pub const STATUS_LEN: usize = 500;
 pub const FLASH_FOR: Duration = Duration::from_secs(5);
 pub const WHEEL_STEP: usize = 3;
+/// The bell rings at most once in this long, however many messages arrive.
+pub const BELL_GAP: Duration = Duration::from_secs(1);
 
 /// The multi-line input box. `cursor` is a byte index on a char boundary.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -404,9 +407,14 @@ pub struct TuiState {
     pub help: bool,
     /// Our LAN address for the status bar, e.g. "ip 192.168.1.9 · port 54321".
     pub lan: String,
+    /// Ring the terminal bell for DMs and mentions (`/bell`). Off at every start.
+    pub bell: bool,
+    /// The terminal window has focus. Assumed until the terminal says otherwise.
+    pub focused: bool,
     status: VecDeque<StatusLine>,
     flash: Option<(String, Instant)>,
     hits: Vec<(Rect, Hit)>,
+    last_ring: Option<Instant>,
 }
 
 impl TuiState {
@@ -421,9 +429,12 @@ impl TuiState {
             popup: None,
             help: false,
             lan: String::new(),
+            bell: false,
+            focused: true,
             status: VecDeque::new(),
             flash: None,
             hits: Vec::new(),
+            last_ring: None,
         }
     }
 
@@ -521,6 +532,32 @@ impl TuiState {
         self.flash.as_ref().filter(|(_, at)| now.saturating_duration_since(*at) < FLASH_FOR).map(|(t, _)| t.as_str())
     }
 
+    /// A DM, or a message that mentions us, arriving where we aren't looking:
+    /// another tab, the corvo tab, or a window in the background.
+    pub fn worth_a_ring(&self, session: &Session, event: &Event) -> bool {
+        let Event::Message { conv, text, .. } = event else {
+            return false;
+        };
+        let for_me = matches!(conv, Conv::Dm(_)) || session.store.me().is_some_and(|me| mentions(text, me));
+        let watching = self.focused && !self.on_status && session.store.current() == Some(conv);
+        for_me && !watching
+    }
+
+    /// Whether to ring now: the bell is on and hasn't rung within `BELL_GAP`.
+    pub fn ring(&mut self, now: Instant) -> bool {
+        if !self.bell || self.last_ring.is_some_and(|t| now.saturating_duration_since(t) < BELL_GAP) {
+            return false;
+        }
+        self.last_ring = Some(now);
+        true
+    }
+
+    /// Flips the bell; returns what to tell the user.
+    pub fn toggle_bell(&mut self) -> &'static str {
+        self.bell = !self.bell;
+        if self.bell { "* bell on — rings for DMs and mentions of you" } else { "* bell off" }
+    }
+
     pub fn clear_hits(&mut self) {
         self.hits.clear();
     }
@@ -540,6 +577,19 @@ mod tests {
     use crate::api::PeerId;
     use crate::ui::complete::Candidates;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    #[test]
+    fn the_bell_rings_at_most_once_a_gap() {
+        let mut t = TuiState::new(false);
+        let t0 = Instant::now();
+        assert!(!t.ring(t0), "off at start");
+        assert_eq!(t.toggle_bell(), "* bell on — rings for DMs and mentions of you");
+        assert!(t.ring(t0));
+        assert!(!t.ring(t0 + BELL_GAP / 2), "a burst rings once");
+        assert!(t.ring(t0 + BELL_GAP));
+        assert_eq!(t.toggle_bell(), "* bell off");
+        assert!(!t.ring(t0 + BELL_GAP * 3));
+    }
 
     fn ed(text: &str) -> Editor {
         let mut e = Editor::default();

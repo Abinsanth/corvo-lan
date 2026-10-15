@@ -54,6 +54,8 @@ pub enum Input {
     Update {
         confirm: bool,
     },
+    /// Turn the bell on or off.
+    Bell,
     /// Close the current or named DM.
     Close(Option<String>),
     Who,
@@ -69,7 +71,7 @@ const SIGIL_HINT: &str = "use @name for people or #name for rooms";
 /// typo hints read it, so keep it in step with the match below.
 pub const COMMANDS: &[&str] = &[
     "msg", "m", "chat", "c", "create", "invite", "accept", "decline", "approve", "deny", "kick", "leave", "close",
-    "rooms", "chats", "who", "update", "help", "h", "?", "quit", "q",
+    "rooms", "chats", "who", "update", "bell", "help", "h", "?", "quit", "q",
 ];
 
 /// Names that were dropped, and the command that replaced each.
@@ -163,6 +165,10 @@ pub fn parse_line(line: &str) -> Input {
             [] => Input::Update { confirm: false },
             ["yes"] => Input::Update { confirm: true },
             _ => Input::Error("usage: /update [yes]".into()),
+        },
+        "bell" => match words.as_slice() {
+            [] => Input::Bell,
+            _ => Input::Error("usage: /bell".into()),
         },
         "close" => match words.as_slice() {
             [] => Input::Close(None),
@@ -377,6 +383,13 @@ mod tests {
         assert_eq!(parse_line("/kick"), err("usage: /kick @nick [#room]"));
         assert_eq!(parse_line("/kick bob"), err("usage: /kick @nick [#room]"));
         assert!(COMMANDS.contains(&"kick"));
+    }
+
+    #[test]
+    fn bell_parses() {
+        assert_eq!(parse_line("/bell"), Input::Bell);
+        assert_eq!(parse_line("/bell on"), err("usage: /bell"));
+        assert!(COMMANDS.contains(&"bell"));
     }
 
     #[test]

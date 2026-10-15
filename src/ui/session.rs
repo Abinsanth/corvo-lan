@@ -24,6 +24,7 @@ chat
 
 info
   /rooms /chats /who   lists
+  /bell                ring for DMs and mentions
   /update              check for updates
   /quit                exit (/q, Ctrl-C)
 
@@ -39,6 +40,8 @@ pub struct Reaction {
     pub quit: bool,
     /// Open the help box.
     pub help: bool,
+    /// Turn the bell on or off.
+    pub bell: bool,
     pub update: Option<UpdateAction>,
     /// Text for the clipboard.
     pub copy: Option<String>,
@@ -230,6 +233,7 @@ impl Session {
             Input::Empty => Reaction::default(),
             Input::Error(e) => Reaction::say(format!("! {e}")),
             Input::Help => Reaction { help: true, ..Default::default() },
+            Input::Bell => Reaction { bell: true, ..Default::default() },
             Input::Quit => Reaction { quit: true, ..Default::default() },
             Input::Who => Reaction::send(Command::ListPeers),
             Input::Text(text) => match tidy_message(&text) {
@@ -497,6 +501,13 @@ mod tests {
 
     fn send(to: Target, text: &str) -> Reaction {
         Reaction::send(Command::Send { to, text: text.into() })
+    }
+
+    #[test]
+    fn bell_asks_the_ui_to_toggle_it() {
+        let mut s = session();
+        assert_eq!(typed(&mut s, "/bell"), Reaction { bell: true, ..Default::default() });
+        assert!(HELP.contains("  /bell                ring for DMs and mentions"));
     }
 
     #[test]
