@@ -6,30 +6,32 @@ use super::updates::UpdateAction;
 use crate::api::{Command, Conv, Event, Target};
 use crate::convo::Store;
 use crate::node::{MAX_MEMBERS, MIN_MEMBERS};
+use crate::update::Version;
 
 pub const MAX_MESSAGE_LINES: usize = 50;
 
+/// Shown in the help box; lines without indent are headings.
 pub const HELP: &str = "\
-commands:
-  <text>                 send to the current tab
-  /msg @nick <text>      one-off private message (also /m)
-  /chat @nick            open a private chat (also /c; the @ is optional)
-  /chat #room <key>      ask to join a room (just /chat #room once you're in)
-  /create <name> [n]     create a private room for n people, 2–13 (asks if you leave it out)
-  /approve @nick [#room] let someone who asked into a room; /deny @nick turns them away
-  /invite @nick [#room]  invite someone to a room (your invite counts as your approval)
-  /accept  /decline      answer an invitation (add #room if you have several)
-  /leave [#room]         leave the current or named room
-  /close [@nick]         close the current or named private chat
-  /rooms  /chats  /who   list rooms, chats, connected people
-  /update [yes]          check for a newer version; yes installs it
-  /help                  this list (also /h, /?)
-  /quit                  leave (also /q, Ctrl-C)
-  //text                 send a message starting with '/'
-keys:
-  Enter send · Alt+Enter or Shift+Enter new line · Tab complete @names, #rooms, /commands
-  Shift-Tab, Alt-←/→ or Alt-1..9 switch tabs · PgUp/PgDn or mouse wheel scroll
-  Esc close the list / clear input / back to latest · click a name to chat";
+chat
+  /chat @nick          private chat (/c)
+  /chat #room <key>    join a room
+  /msg @nick <text>    one-off message (/m)
+  /create <name>       new private room
+  /invite @nick        bring someone in
+  /kick @nick          vote someone out
+  /accept  /decline    answer an invite
+  /approve /deny       answer a join request
+  /leave   /close      leave a room / chat
+
+info
+  /rooms /chats /who   lists
+  /clear               clear the screen
+  /update              check for updates
+  /quit                exit (/q, Ctrl-C)
+
+keys
+  Shift-Tab  switch tabs    Tab  complete
+  Alt+Enter  new line       PgUp/PgDn  scroll";
 
 /// What the UI loop should do after an input line.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -37,7 +39,13 @@ pub struct Reaction {
     pub commands: Vec<Command>,
     pub print: Vec<String>,
     pub quit: bool,
+    /// Open the help box.
+    pub help: bool,
     pub update: Option<UpdateAction>,
+    /// Clear the open tab's view.
+    pub clear: bool,
+    /// Quit and start the newly installed version.
+    pub restart: bool,
     /// Text for the clipboard.
     pub copy: Option<String>,
 }
@@ -60,6 +68,8 @@ pub struct Session {
     style: Style,
     /// The question the next line answers, if any.
     asking: Option<Asking>,
+    /// A newer version to ask about once the open question is answered.
+    pending: Option<Version>,
 }
 
 /// A question the input is waiting on.
@@ -72,11 +82,24 @@ enum Asking {
     RoomName { preview: String, max: Option<u8> },
     /// `/create`, step 2: how many people.
     HeadCount { name: String },
+    /// A newer version is out: install it? Only y/yes/n/no answer it.
+    Install { version: Version },
+    /// A newer version is installed: restart into it? Only y/yes/n/no answer it.
+    Restart { version: Version },
+}
+
+/// `y`/`yes` → true, `n`/`no` → false, in any case; anything else isn't an answer.
+fn yes_no(line: &str) -> Option<bool> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 impl Session {
     pub fn new(color: bool) -> Self {
-        Session { store: Store::new(), color, style: Style::plain(), asking: None }
+        Session { store: Store::new(), color, style: Style::plain(), asking: None, pending: None }
     }
 
     pub fn color(&self) -> bool {
@@ -87,7 +110,13 @@ impl Session {
     pub fn on_event(&mut self, event: &Event, now: u64) -> Option<String> {
         self.store.apply(event, now);
         match event {
-            Event::NamePreview { nick } => self.asking = Some(Asking::Name { preview: nick.clone(), confirmed: false }),
+            Event::NamePreview { nick } => {
+                // The name comes first; an install question already asked waits its turn.
+                if let Some(Asking::Install { version }) = self.asking {
+                    self.pending = Some(version);
+                }
+                self.asking = Some(Asking::Name { preview: nick.clone(), confirmed: false })
+            }
             Event::Assigned { .. } if matches!(self.asking, Some(Asking::Name { .. })) => self.asking = None,
             _ => {}
         }
@@ -106,13 +135,22 @@ impl Session {
             let (preview, confirmed) = (preview.clone(), *confirmed);
             return self.answer_name(preview, confirmed, line.trim());
         }
+        if let Some(Asking::Install { .. } | Asking::Restart { .. }) = &self.asking {
+            if let Some(yes) = yes_no(line) {
+                let asking = self.asking.take().expect("matched above");
+                return self.answer_update(asking, yes);
+            }
+            return self.on_input(parse_line(line), shown);
+        }
         if let Some(asking) = self.asking.take()
             && !line.trim_start().starts_with('/')
         {
             return match asking {
                 Asking::RoomName { preview, max } => self.answer_room_name(preview, max, line.trim()),
                 Asking::HeadCount { name } => self.answer_head_count(name, line.trim()),
-                Asking::Name { .. } => unreachable!("answered above"),
+                Asking::Name { .. } | Asking::Install { .. } | Asking::Restart { .. } => {
+                    unreachable!("answered above")
+                }
             };
         }
         self.on_input(parse_line(line), shown)
@@ -131,7 +169,61 @@ impl Session {
             Asking::HeadCount { name } => format!(
                 "how many people in #{name}? {MIN_MEMBERS}–{MAX_MEMBERS}, Enter for {MAX_MEMBERS}, Esc to cancel"
             ),
+            Asking::Install { version } => format!("v{version} is available — install it now? (y/n)"),
+            Asking::Restart { version } => {
+                format!("v{version} is installed — restart now? You'll leave your rooms. (y/n)")
+            }
         })
+    }
+
+    /// Whether `line` answers the open question (rather than being a message or command).
+    pub fn takes(&self, line: &str) -> bool {
+        match &self.asking {
+            None => false,
+            Some(Asking::Install { .. } | Asking::Restart { .. }) => yes_no(line).is_some(),
+            Some(_) => true,
+        }
+    }
+
+    /// Asks whether to install `version`; says whether it's asked now. With
+    /// another question open, it waits for `ask_pending` instead.
+    pub fn offer_update(&mut self, version: Version) -> bool {
+        self.pending = Some(version);
+        self.ask_pending()
+    }
+
+    /// Asks the waiting install question if nothing else is being asked; says whether it did.
+    pub fn ask_pending(&mut self) -> bool {
+        if self.asking.is_some() {
+            return false;
+        }
+        let Some(version) = self.pending.take() else {
+            return false;
+        };
+        self.asking = Some(Asking::Install { version });
+        true
+    }
+
+    /// Asks whether to restart into the installed `version`. If another
+    /// question is open, returns a line to show instead.
+    pub fn offer_restart(&mut self, version: Version) -> Option<String> {
+        if self.asking.is_some() {
+            return Some(format!("* v{version} starts next time you open corvo-lan"));
+        }
+        self.asking = Some(Asking::Restart { version });
+        None
+    }
+
+    fn answer_update(&mut self, asking: Asking, yes: bool) -> Reaction {
+        match (asking, yes) {
+            (Asking::Install { .. }, true) => Reaction { update: Some(UpdateAction::Install), ..Default::default() },
+            (Asking::Install { .. }, false) => Reaction::say("* ok — /update yes installs it later"),
+            (Asking::Restart { .. }, true) => Reaction { restart: true, ..Default::default() },
+            (Asking::Restart { version }, false) => {
+                Reaction::say(format!("* v{version} starts next time you open corvo-lan"))
+            }
+            _ => Reaction::default(),
+        }
     }
 
     /// Drops the question; says whether there was one. The name question can't be dropped.
@@ -227,7 +319,7 @@ impl Session {
         match input {
             Input::Empty => Reaction::default(),
             Input::Error(e) => Reaction::say(format!("! {e}")),
-            Input::Help => Reaction::say(HELP),
+            Input::Help => Reaction { help: true, ..Default::default() },
             Input::Quit => Reaction { quit: true, ..Default::default() },
             Input::Who => Reaction::send(Command::ListPeers),
             Input::Text(text) => match tidy_message(&text) {
@@ -290,6 +382,15 @@ impl Session {
                 };
                 Reaction::send(Command::Invite { nick, room })
             }
+            Input::Kick { nick, room } => {
+                let Some(room) = room.or_else(|| match self.store.current() {
+                    Some(Conv::Room(name)) => Some(name.clone()),
+                    _ => None,
+                }) else {
+                    return Reaction::say("! /kick works in a room tab, or name the room: /kick @nick #room");
+                };
+                Reaction::send(Command::Kick { room, nick })
+            }
             Input::Accept(room) => match self.invited_room(room, "accept") {
                 Ok(room) => Reaction::send(Command::Accept { room }),
                 Err(e) => Reaction::say(format!("! {e}")),
@@ -314,10 +415,17 @@ impl Session {
                 Some(Conv::Room(n)) => Reaction::send(Command::LeaveRoom { name: n.clone() }),
                 _ => Reaction::say("! you're not in a room here — /leave #room"),
             },
-            Input::Update { confirm } => Reaction {
-                update: Some(if confirm { UpdateAction::Install } else { UpdateAction::Check }),
-                ..Default::default()
-            },
+            Input::Update { confirm } => {
+                self.pending = None;
+                if matches!(self.asking, Some(Asking::Install { .. })) {
+                    self.asking = None;
+                }
+                Reaction {
+                    update: Some(if confirm { UpdateAction::Install } else { UpdateAction::Check }),
+                    ..Default::default()
+                }
+            }
+            Input::Clear => Reaction { clear: true, ..Default::default() },
             Input::Close(target) => {
                 let conv = match target {
                     Some(nick) => Conv::Dm(nick),
@@ -567,7 +675,7 @@ mod tests {
         let mut s = naming("bobroger");
         let question = s.prompt();
         assert!(!s.cancel_prompt(), "Esc can't drop it");
-        assert_eq!(typed(&mut s, "Bob Smith"), Reaction::say("! name must be 1–9 letters or digits"));
+        assert_eq!(typed(&mut s, "Bob Smith"), Reaction::say("! name must be 1–6 letters or digits"));
         assert_eq!(typed(&mut s, "CHAT"), Reaction::say("! 'chat' is reserved"));
         assert_eq!(typed(&mut s, "/who"), Reaction::say("! pick your name first — Enter keeps @bobroger"));
         assert_eq!(
@@ -596,7 +704,7 @@ mod tests {
         assert_eq!(s.prompt(), Some(format!("new room #{first} — Enter to keep it, or type another name")));
 
         assert_eq!(typed(&mut s, "chat").print, vec!["! 'chat' is reserved"]);
-        assert_eq!(typed(&mut s, "a b").print, vec!["! name must be 1–9 letters or digits"]);
+        assert_eq!(typed(&mut s, "a b").print, vec!["! name must be 1–6 letters or digits"]);
         assert_eq!(room_preview(&s), first, "a bad name keeps the old preview");
 
         assert_eq!(typed(&mut s, "Dog"), Reaction::default());
@@ -684,6 +792,21 @@ mod tests {
             Reaction::say("! /invite works in a room tab, or name the room: /invite @nick #room")
         );
         assert_eq!(typed(&mut s, "/invite").print, vec!["! usage: /invite @nick [#room]"]);
+    }
+
+    #[test]
+    fn kick_goes_to_the_current_or_named_room() {
+        let mut s = bob_waits_in(&["catpie"]);
+        s.store.switch(Conv::Room("catpie".into()));
+        let kick = |room: &str| Reaction::send(Command::Kick { room: room.into(), nick: "carolwolf".into() });
+        assert_eq!(typed(&mut s, "/kick @CarolWolf"), kick("catpie"));
+        typed(&mut s, "/chat @bobroger");
+        assert_eq!(typed(&mut s, "/kick @carolwolf #dogpie"), kick("dogpie"), "the node checks the room");
+        assert_eq!(
+            typed(&mut s, "/kick @carolwolf"),
+            Reaction::say("! /kick works in a room tab, or name the room: /kick @nick #room")
+        );
+        assert!(HELP.contains("/kick @nick"));
     }
 
     #[test]
@@ -830,10 +953,14 @@ mod tests {
     #[test]
     fn help_lists_the_tui_commands_and_keys() {
         let mut s = session();
-        assert_eq!(typed(&mut s, "/help").print, vec![HELP]);
+        for cmd in ["/help", "/h", "/?"] {
+            let r = typed(&mut s, cmd);
+            assert!(r.help, "{cmd} opens the help box");
+            assert!(r.print.is_empty(), "{cmd} prints nothing to the corvo tab");
+        }
         assert!(HELP.contains("/close") && HELP.contains("Shift-Tab") && HELP.contains("/quit"));
         assert!(!HELP.contains("/line") && !HELP.contains("/his") && !HELP.contains("/tui"));
-        assert!(HELP.contains("/create <name> [n]") && HELP.contains("/approve @nick") && HELP.contains("/deny"));
+        assert!(HELP.contains("/create <name>") && HELP.contains("/approve") && HELP.contains("/deny"));
     }
 
     #[test]
@@ -868,9 +995,9 @@ mod tests {
         assert_eq!(s.store.current(), Some(&Conv::Dm("carolwolf".into())));
         assert_eq!(
             typed(&mut s, "/chat carol").print,
-            vec!["! \"carol\" matches @carolwolf, #carolpie — be more specific"]
+            vec!["! \"carol\" matches @carolWolf, #carolPie — be more specific"]
         );
-        assert_eq!(typed(&mut s, "/chat bob").print, vec!["! \"bob\" matches @bobkite, @bobroger — be more specific"]);
+        assert_eq!(typed(&mut s, "/chat bob").print, vec!["! \"bob\" matches @bobKite, @bobRoger — be more specific"]);
         assert_eq!(
             typed(&mut s, "/chat ann").print,
             vec!["! no one or no room called \"ann\" — use @name for people or #name for rooms"],
@@ -888,7 +1015,7 @@ mod tests {
         }
         assert_eq!(
             typed(&mut s, "/chat zed").print,
-            vec!["! \"zed\" matches @zed0owl, @zed1owl, @zed2owl, @zed3owl, @zed4owl, … — be more specific"]
+            vec!["! \"zed\" matches @zed0Owl, @zed1Owl, @zed2Owl, @zed3Owl, @zed4Owl, … — be more specific"]
         );
     }
 
@@ -899,7 +1026,107 @@ mod tests {
         assert_eq!(check.update, Some(UpdateAction::Check));
         assert!(check.commands.is_empty() && check.print.is_empty());
         assert_eq!(typed(&mut s, "/update yes").update, Some(UpdateAction::Install));
-        assert!(HELP.contains("/update [yes]"));
+        assert_eq!(typed(&mut s, "/update y").update, Some(UpdateAction::Install));
+        assert!(HELP.contains("/update"));
+    }
+
+    const V: Version = Version(0, 6, 0);
+
+    #[test]
+    fn the_update_question_takes_y_yes_n_no() {
+        let mut s = session();
+        assert!(s.offer_update(V));
+        assert_eq!(s.prompt().as_deref(), Some("v0.6.0 is available — install it now? (y/n)"));
+        assert!(s.takes("Y") && s.takes(" no ") && !s.takes("hello"));
+        assert_eq!(typed(&mut s, "Y").update, Some(UpdateAction::Install));
+        assert_eq!(s.prompt(), None);
+        s.offer_update(V);
+        assert_eq!(typed(&mut s, " no ").print, vec!["* ok — /update yes installs it later"]);
+        assert_eq!(s.prompt(), None);
+        s.offer_update(V);
+        assert_eq!(typed(&mut s, "yes").update, Some(UpdateAction::Install));
+        s.offer_update(V);
+        typed(&mut s, "/update");
+        assert_eq!(s.prompt(), None, "/update asks again itself");
+    }
+
+    #[test]
+    fn other_text_passes_through_an_update_question() {
+        let mut s = session();
+        typed(&mut s, "/chat @bobroger");
+        s.offer_update(V);
+        assert_eq!(typed(&mut s, "hello"), send(Target::Dm("bobroger".into()), "hello"));
+        assert!(s.prompt().is_some(), "the question stays");
+        assert_eq!(typed(&mut s, "/who").commands, vec![Command::ListPeers]);
+        assert!(s.prompt().is_some());
+    }
+
+    #[test]
+    fn an_offer_during_another_question_waits_its_turn() {
+        let mut s = Session::new(false);
+        s.on_event(&Event::NamePreview { nick: "annmoon".into() }, 0);
+        let asked = s.prompt();
+        assert!(!s.offer_update(V), "not asked yet");
+        assert_eq!(s.prompt(), asked, "the name question stays");
+        assert!(!s.ask_pending(), "still busy");
+        s.on_event(&Event::Assigned { nick: "annmoon".into(), renamed: false }, 0);
+        assert!(s.ask_pending());
+        assert_eq!(s.prompt().as_deref(), Some("v0.6.0 is available — install it now? (y/n)"));
+        assert!(!s.ask_pending(), "asked once");
+
+        typed(&mut s, "n");
+        typed(&mut s, "/create cat");
+        assert!(!s.offer_update(V));
+        assert!(s.cancel_prompt());
+        assert!(s.ask_pending(), "Esc on the create question lets it through");
+        s.cancel_prompt();
+        typed(&mut s, "/create cat");
+        s.offer_update(V);
+        typed(&mut s, "/update");
+        s.cancel_prompt();
+        assert!(!s.ask_pending(), "/update asks for itself, so the queued one goes");
+    }
+
+    #[test]
+    fn the_name_question_puts_an_earlier_offer_back_in_line() {
+        let mut s = Session::new(false);
+        assert!(s.offer_update(V), "asked before the name preview arrived");
+        s.on_event(&Event::NamePreview { nick: "annmoon".into() }, 0);
+        assert!(s.prompt().is_some_and(|p| p.contains("you'll be @annmoon")));
+        s.on_event(&Event::Assigned { nick: "annmoon".into(), renamed: false }, 0);
+        assert!(s.ask_pending(), "the offer comes back");
+    }
+
+    #[test]
+    fn the_restart_question() {
+        let mut s = session();
+        assert_eq!(s.offer_restart(V), None);
+        assert_eq!(s.prompt().as_deref(), Some("v0.6.0 is installed — restart now? You'll leave your rooms. (y/n)"));
+        assert!(typed(&mut s, "y").restart);
+        s.offer_restart(V);
+        assert_eq!(typed(&mut s, "n").print, vec!["* v0.6.0 starts next time you open corvo-lan"]);
+        s.offer_update(V);
+        assert_eq!(
+            s.offer_restart(V).as_deref(),
+            Some("* v0.6.0 starts next time you open corvo-lan"),
+            "no restart question while another is open"
+        );
+    }
+
+    #[test]
+    fn esc_drops_an_update_question() {
+        let mut s = session();
+        assert!(!s.takes("y"), "nothing asked");
+        s.offer_update(V);
+        assert!(s.cancel_prompt());
+        assert_eq!(s.prompt(), None);
+    }
+
+    #[test]
+    fn clear_asks_the_ui_to_clear() {
+        let mut s = session();
+        assert_eq!(typed(&mut s, "/clear"), Reaction { clear: true, ..Default::default() });
+        assert!(HELP.contains("  /clear               clear the screen"));
     }
 
     #[test]

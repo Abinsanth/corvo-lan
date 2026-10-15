@@ -99,13 +99,15 @@ Then you're connected to everyone else running it. With `--nick` it skips the qu
 /invite @bobroger          # invite someone; they /accept (your invite counts as your approval)
 /chat #catpie k7m9xq       # or ask to join with a room's key (click it in the sidebar to copy)
 /approve @bobroger         # someone in the room lets them in (or /deny @bobroger)
+/kick @bobroger            # vote someone out of the room
 /chat @bobroger            # private chat
 /msg @bobroger hi          # one-off private message
 /chat bob                  # the @ or # is optional when only one name matches
 /who                       # who's connected
 /update [yes]              # check for and install a newer version
+/clear                     # clear the screen, like in a terminal (also Ctrl-L)
 /close [@nick]             # close a private chat (TUI)
-/help  /h                  # all commands
+/help  /h                  # show commands (q or Esc closes it)
 /quit  /q                  # leave
 ```
 
@@ -114,8 +116,16 @@ people in the room and everyone online on the right. `Shift-Tab`,
 `Alt-←`/`Alt-→` or `Alt-1..9` switch tabs, `Tab` completes `@names`, `#rooms`
 and `/commands`, `Alt+Enter` (or `Shift+Enter` where your terminal supports it)
 adds a new line, `PgUp`/`PgDn` or the mouse wheel scroll, and clicking a name
-opens a private chat. Command output and errors appear in the `corvo` tab. To
-select text, hold Shift (Option on macOS) while dragging.
+opens a private chat. Command output and errors appear in the `corvo` tab. The
+bottom line shows your `ip` and `port`: on most home and office networks,
+people on the same LAN share the first three numbers of the ip. To select
+text, hold Shift (Option on macOS) while dragging.
+
+In a private chat, each line has a mark after the time: `←` for messages you
+received, and for yours `·` while it's on its way, `✓` once the other app has
+it, or `✗` if it didn't arrive within 5 seconds (say they closed the lid).
+Nothing is resent, so press ↑ to bring it back and send it again. The window
+title shows how many messages you haven't read.
 
 ### Rooms
 
@@ -147,6 +157,13 @@ How many approvals a newcomer needs depends on how many people are in the room
 One `/deny` turns the request away. If two people are let in for the last
 place, whoever asked first gets it.
 
+`/kick @name` votes someone out. It takes as many votes as letting someone in
+(the table above). Someone kicked can ask to join again; someone kicked twice
+can't get back into that room.
+
+Whenever someone leaves a room, drops off or is kicked, the people still in it
+switch to a new encryption key on their own, so whoever left can't read on.
+
 ### Encryption
 
 Everything between machines is encrypted, and each machine has its own key,
@@ -157,19 +174,25 @@ with a different key, corvo-lan warns you.
 
 ### Updating
 
-Type `/update` to see newer versions, then `/update yes` to install the
-newest one; restart corvo-lan to use it. On Windows the old version is set
-aside as `corvo-lan.old.exe` and deleted the next time corvo-lan starts; `/update` there needs Windows 10
-version 1803 or newer, which has the built-in curl and tar. At
-startup corvo-lan makes one request to GitHub to see whether a newer version
-exists. That request sends only your IP address and the app version; turn it
-off with `--no-update-check` or `CORVO_LAN_NO_UPDATE_CHECK=1`. Nothing else
-ever leaves your network.
+At startup corvo-lan asks GitHub once whether a newer version exists. If one
+does, the `corvo` tab asks `install it now? (y/n)`; `/update` lists what's new
+and asks the same, and `/update yes` (or `/update y`) installs straight away.
+A version that's been out for 22 days or more is installed at startup without
+asking, so nobody stays on an old one. While it downloads, a progress bar
+shows how far it got; afterwards corvo-lan offers to restart into the new
+version in the same window, keeping your name if it's still free (restarting
+leaves your rooms). On Windows the old version is set aside as
+`corvo-lan.old-<n>.exe` and deleted once it's no longer running; `/update` there
+needs Windows 10 version 1803 or newer, which has the built-in curl and tar.
+The check sends GitHub only your IP address and the app version, and if GitHub
+can't be reached corvo-lan just starts as usual. Nothing else ever leaves your
+network.
 
 ### If peers don't find each other
 
 Discovery uses multicast on `239.255.42.99:4299`. Some networks (guest Wi-Fi,
-corporate networks, some routers) block it. In that case, connect directly:
+corporate networks, some routers) block it. In that case, connect directly
+using the ip and port shown on the other person's bottom line:
 
 ```bash
 corvo-lan --port 5000                      # on one machine

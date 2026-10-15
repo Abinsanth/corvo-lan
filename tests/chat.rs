@@ -29,6 +29,7 @@ async fn spawn_node_with_word(base: &str, peers: &[SocketAddr], word: Option<&st
         manual_peers: peers.to_vec(),
         name_wait: Duration::ZERO,
         fixed_word: word.map(String::from),
+        prefer: None,
         ask_name: false,
     })
     .await
@@ -170,6 +171,17 @@ async fn dm_reaches_its_target() {
 }
 
 #[tokio::test]
+async fn a_dm_is_confirmed_delivered() {
+    let (mut alice, mut bob) = pair().await;
+    say(&bob, Target::Dm(alice.nick.clone()), "hello").await;
+    let sent = wait_for(&mut bob.node, "sent", |e| matches!(e, Event::Sent { .. })).await;
+    let Event::Sent { id: Some(id), .. } = sent else { panic!("a DM has an id: {sent:?}") };
+    wait_for(&mut alice.node, "dm", |e| matches!(e, Event::Message { .. })).await;
+    let delivered = wait_for(&mut bob.node, "ack", |e| matches!(e, Event::Delivered { .. })).await;
+    assert_eq!(delivered, Event::Delivered { id });
+}
+
+#[tokio::test]
 async fn room_messages_reach_members_only() {
     let (mut alice, mut bob, mut carol) = trio().await;
     let (room, key) = create_room(&mut alice, "cat").await;
@@ -236,6 +248,58 @@ async fn a_room_is_gone_once_its_last_member_leaves() {
     knock(&mut carol, &room, &key).await;
     let event = wait_for(&mut carol.node, "join outcome", join_outcome).await;
     assert_eq!(event, Event::JoinEnded { name: room, why: JoinEnd::NoRoom });
+}
+
+/// alice, bob and carol all in a room alice made; returns its (name, key).
+async fn room_of_three(alice: &mut Peer, bob: &mut Peer, carol: &mut Peer) -> (String, String) {
+    let (room, key) = create_room(alice, "cat").await;
+    for p in [&mut *bob, &mut *carol] {
+        join_room(p, alice, &room, &key).await;
+        wait_member(alice, &p.nick).await;
+    }
+    // bob and carol prove each other too, so all three count the same votes.
+    let (b, c) = (bob.nick.clone(), carol.nick.clone());
+    wait_member(carol, &b).await;
+    wait_member(bob, &c).await;
+    (room, key)
+}
+
+/// Waits until `p` counts `nick` as a member of its room.
+async fn wait_member(p: &mut Peer, nick: &str) {
+    wait_for(&mut p.node, "member joined", |e| matches!(e, Event::MemberJoined { nick: n, .. } if n == nick)).await;
+}
+
+#[tokio::test]
+async fn a_leave_moves_the_others_to_a_new_key() {
+    let (mut alice, mut bob, mut carol) = trio().await;
+    let (room, _) = room_of_three(&mut alice, &mut bob, &mut carol).await;
+    send(&bob, Command::LeaveRoom { name: room.clone() }).await;
+    let rekeyed = |e: &Event| matches!(e, Event::Rekeyed { .. });
+    wait_for(&mut alice.node, "alice re-keyed", rekeyed).await;
+    wait_for(&mut carol.node, "carol re-keyed", rekeyed).await;
+    say(&carol, Target::Room(room.clone()), "after").await;
+    let got = wait_for(&mut alice.node, "message", |e| matches!(e, Event::Message { .. })).await;
+    assert!(matches!(got, Event::Message { text, .. } if text == "after"));
+}
+
+#[tokio::test]
+async fn kicked_twice_means_banned() {
+    let (mut alice, mut bob, mut carol) = trio().await;
+    let (room, key) = room_of_three(&mut alice, &mut bob, &mut carol).await;
+    // Three people: one vote is enough.
+    send(&alice, Command::Kick { room: room.clone(), nick: bob.nick.clone() }).await;
+    wait_for(&mut bob.node, "removed", |e| matches!(e, Event::Removed { .. })).await;
+    wait_for(&mut alice.node, "re-keyed", |e| matches!(e, Event::Rekeyed { .. })).await;
+    // Kicked once: bob may ask again and be let back in.
+    join_room(&mut bob, &mut alice, &room, &key).await;
+    let b = bob.nick.clone();
+    wait_member(&mut alice, &b).await;
+    wait_member(&mut carol, &b).await;
+    send(&alice, Command::Kick { room: room.clone(), nick: bob.nick.clone() }).await;
+    wait_for(&mut bob.node, "removed again", |e| matches!(e, Event::Removed { .. })).await;
+    knock(&mut bob, &room, &key).await;
+    let event = wait_for(&mut bob.node, "join outcome", join_outcome).await;
+    assert_eq!(event, Event::JoinEnded { name: room, why: JoinEnd::Banned });
 }
 
 #[tokio::test]
@@ -337,6 +401,7 @@ async fn an_asking_node_goes_live_on_confirm() {
         manual_peers: vec![],
         name_wait: Duration::ZERO,
         fixed_word: None,
+        prefer: None,
         ask_name: true,
     })
     .await

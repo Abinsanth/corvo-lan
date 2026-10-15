@@ -1,19 +1,21 @@
 //! Draws the TUI from the shared session and the TUI state. Pure: it only
 //! writes into a ratatui `Frame`, so it's tested with `TestBackend`.
 
+use std::net::Ipv4Addr;
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use super::state::{Editor, Hit, MAX_INPUT_ROWS, Tab, TuiState, tabs};
 use crate::api::Conv;
-use crate::convo::{LineKind, mentions};
+use crate::convo::{Delivery, LineKind, mentions};
+use crate::names::{display, display_in};
 use crate::ui::render::{Tone, clean, hhmm, nick_color, tone_of_notice};
-use crate::ui::session::Session;
+use crate::ui::session::{HELP, Session};
 
 pub const SIDEBAR_WIDTH: u16 = 22;
 pub const SIDEBAR_MIN_WIDTH: u16 = 70;
@@ -82,7 +84,7 @@ fn message_rows(
     let mut out = Vec::new();
     let mut first = Some(prefix);
     for part in text.split('\n') {
-        for piece in wrap(&clean(part), body_w) {
+        for piece in wrap(&clean(&display_in(part)), body_w) {
             let lead = first.take().unwrap_or_else(|| vec![Span::raw(" ".repeat(prefix_w))]);
             let mut spans = lead;
             spans.push(Span::styled(piece, style));
@@ -92,20 +94,31 @@ fn message_rows(
     out
 }
 
-fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) -> Vec<Line<'static>> {
+/// A conversation's rows, and how many of them come from lines up to `mark` (a `/clear`).
+fn conversation_rows(
+    session: &Session,
+    conv: &Conv,
+    width: usize,
+    color: bool,
+    mark: Option<u64>,
+) -> (Vec<Line<'static>>, usize) {
     let Some(c) = session.store.get(conv) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let me = session.store.me().unwrap_or("you").to_string();
-    let sender_of = |kind: &LineKind| match kind {
-        LineKind::Msg { from, .. } => Some(format!("@{}", clean(from))),
-        LineKind::Mine { .. } => Some(format!("@{}", clean(&me))),
+    let nick_of = |kind: &LineKind| match kind {
+        LineKind::Msg { from, .. } => Some(from.clone()),
+        LineKind::Mine { .. } => Some(me.clone()),
         LineKind::Notice(_) => None,
     };
+    let sender_of = |kind: &LineKind| nick_of(kind).map(|n| format!("@{}", clean(&display(&n))));
     let sender_w = c.lines.iter().filter_map(|l| sender_of(&l.kind)).map(|s| s.chars().count()).max().unwrap_or(1);
     let sender_w = sender_w.clamp(1, MAX_SENDER);
     let dim = tone_style(Tone::Dim, color);
-    let mut out = Vec::new();
+    // DM tabs get a column after the time: ← theirs; ours · waiting, ✓ delivered, ✗ not.
+    let marks = matches!(conv, Conv::Dm(_));
+    let mark_w = if marks { 2 } else { 0 };
+    let (mut out, mut before) = (Vec::new(), 0);
     for l in &c.lines {
         let time = Span::styled(format!("{} ", hhmm(l.ts)), dim);
         match &l.kind {
@@ -115,10 +128,10 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
             }
             kind => {
                 let sender = sender_of(kind).unwrap_or_default();
-                let nick = sender.trim_start_matches('@').to_string();
+                let nick = nick_of(kind).unwrap_or_default();
                 let label = format!("{:<sender_w$} ", truncate(&sender, sender_w));
                 let text = match kind {
-                    LineKind::Msg { text, .. } | LineKind::Mine { text } => text.as_str(),
+                    LineKind::Msg { text, .. } | LineKind::Mine { text, .. } => text.as_str(),
                     LineKind::Notice(_) => "",
                 };
                 let body_style = match kind {
@@ -127,22 +140,42 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
                     }
                     _ => Style::default(),
                 };
-                let prefix = vec![time, Span::styled(label, nick_style(&nick, color))];
-                out.extend(message_rows(prefix, TIME_WIDTH + sender_w + 1, text, body_style, width));
+                let mut prefix = vec![time];
+                if marks {
+                    prefix.push(match kind {
+                        LineKind::Mine { delivery: Some(Delivery::Waiting(_)), .. } => Span::styled("· ", dim),
+                        LineKind::Mine { delivery: Some(Delivery::Delivered), .. } => Span::styled("✓ ", dim),
+                        LineKind::Mine { delivery: Some(Delivery::Failed), .. } => {
+                            Span::styled("✗ ", tone_style(Tone::Bad, color))
+                        }
+                        LineKind::Msg { .. } => Span::styled("← ", dim),
+                        _ => Span::raw("  "),
+                    });
+                }
+                prefix.push(Span::styled(label, nick_style(&nick, color)));
+                out.extend(message_rows(prefix, TIME_WIDTH + mark_w + sender_w + 1, text, body_style, width));
             }
         }
+        if mark.is_some_and(|m| l.ts <= m) {
+            before = out.len();
+        }
     }
-    out
+    (out, before)
 }
 
-fn status_rows(state: &TuiState, width: usize) -> Vec<Line<'static>> {
+/// The corvo tab's rows, and how many come from lines up to its `/clear`.
+fn status_rows(state: &TuiState, width: usize) -> (Vec<Line<'static>>, usize) {
     let dim = tone_style(Tone::Dim, state.color);
-    let mut out = Vec::new();
+    let mark = state.cleared_at(None);
+    let (mut out, mut before) = (Vec::new(), 0);
     for l in state.status_lines() {
         let prefix = vec![Span::styled(format!("{} ", hhmm(l.ts)), dim)];
         out.extend(message_rows(prefix, TIME_WIDTH, &l.text, tone_style(l.tone, state.color), width));
+        if mark.is_some_and(|m| l.ts <= m) {
+            before = out.len();
+        }
     }
-    out
+    (out, before)
 }
 
 fn tab_label(tab: &Tab, session: &Session) -> (String, bool) {
@@ -151,8 +184,8 @@ fn tab_label(tab: &Tab, session: &Session) -> (String, bool) {
         Tab::Conv(conv) => {
             let c = session.store.get(conv);
             let name = match conv {
-                Conv::Room(n) => format!("#{}", clean(n)),
-                Conv::Dm(n) => format!("@{}", clean(n)),
+                Conv::Room(n) => format!("#{}", clean(&display(n))),
+                Conv::Dm(n) => format!("@{}", clean(&display(n))),
             };
             let (unread, mentioned) = c.map_or((0, 0), |c| (c.unread, c.mentions));
             let label = match (unread, mentioned) {
@@ -220,13 +253,18 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, session: &Session, state: &mut Tu
         } else {
             ("○", tone_style(Tone::Dim, state.color))
         };
-        Line::from(Span::styled(format!(" {dot} {}", truncate(&clean(nick), SIDEBAR_WIDTH as usize - 4)), style))
+        Line::from(Span::styled(
+            format!(" {dot} {}", truncate(&clean(&display(nick)), SIDEBAR_WIDTH as usize - 4)),
+            style,
+        ))
     };
     let mut invites: Vec<(usize, String)> = Vec::new();
     if let (false, Some(Conv::Room(room))) = (state.on_status, session.store.current()) {
         invites.push((lines.len(), room.clone()));
-        lines
-            .push(Line::from(Span::styled(format!("#{}", clean(room)), Style::default().add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(
+            format!("#{}", clean(&display(room))),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
         if let Some(c) = session.store.get(&Conv::Room(room.clone())) {
             let dim = tone_style(Tone::Dim, state.color);
             if let Some(key) = &c.key {
@@ -244,7 +282,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, session: &Session, state: &mut Tu
                 lines.push(Line::raw(""));
                 lines.push(Line::from(Span::styled("waiting", dim)));
                 for (nick, (have, need)) in &c.waiting {
-                    let name = truncate(&clean(nick), SIDEBAR_WIDTH as usize - 8);
+                    let name = truncate(&clean(&display(nick)), SIDEBAR_WIDTH as usize - 8);
                     let text = format!(" ? {name} {have}/{need}");
                     lines.push(Line::from(Span::styled(text, tone_style(Tone::Warn, state.color))));
                 }
@@ -301,7 +339,7 @@ fn draw_input(frame: &mut Frame, area: Rect, session: &Session, state: &TuiState
     let height = area.height as usize;
     let first = crow.saturating_sub(height.saturating_sub(1));
     let lines: Vec<Line> = if state.editor.is_empty() {
-        let hint = session.prompt().unwrap_or_else(|| "type a message…".into());
+        let hint = session.prompt().map_or_else(|| "type a message…".into(), |p| display_in(&p));
         vec![Line::from(vec![Span::raw("> "), Span::styled(hint, tone_style(Tone::Dim, state.color))])]
     } else {
         rows.iter()
@@ -360,6 +398,49 @@ fn draw_popup(frame: &mut Frame, input: Rect, state: &mut TuiState) {
     );
 }
 
+/// The help box, centred over everything but the status bar. A short
+/// terminal cuts the text, never the border that says how to close it.
+fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
+    let width = HELP.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 4;
+    let height = HELP.lines().count() as u16 + 2;
+    let [area] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(area);
+    let [area] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(area);
+    let lines: Vec<Line> = HELP
+        .lines()
+        .map(|l| {
+            let style =
+                if l.starts_with(' ') { Style::default() } else { Style::default().add_modifier(Modifier::BOLD) };
+            Line::from(Span::styled(l, style))
+        })
+        .collect();
+    let block = Block::bordered()
+        .border_style(tone_style(Tone::Dim, color))
+        .title(" help ")
+        .title_bottom(Line::from(" q close ").right_aligned())
+        .padding(Padding::horizontal(1));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Where we are on the LAN, so two people can tell they're on the same network.
+pub fn lan_label(ip: Option<Ipv4Addr>, port: u16) -> String {
+    let ip = ip.map_or_else(|| "none".into(), |ip| ip.to_string());
+    format!("ip {ip} · port {port}")
+}
+
+/// The window title, with the unread count first so a shortened title still
+/// shows it: "corvo-lan", "(3) corvo-lan", "(3 @1) corvo-lan".
+pub fn window_title(session: &Session, state: &TuiState) -> String {
+    let convs = session.store.conversations();
+    let unread = convs.iter().map(|c| c.unread).sum::<u32>() + state.away;
+    let mentioned = convs.iter().map(|c| c.mentions).sum::<u32>();
+    match (unread, mentioned) {
+        (0, _) => "corvo-lan".to_string(),
+        (u, 0) => format!("({u}) corvo-lan"),
+        (u, m) => format!("({u} @{m}) corvo-lan"),
+    }
+}
+
 fn draw_status_bar(frame: &mut Frame, area: Rect, session: &Session, state: &TuiState, now: Instant) {
     let line = if let Some(flash) = state.flash_text(now) {
         Line::from(Span::styled(flash.to_string(), tone_style(Tone::Bad, state.color)))
@@ -369,12 +450,13 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, session: &Session, state: &Tui
             tone_style(Tone::Dim, state.color),
         ))
     } else {
-        let me = session.store.me().unwrap_or("…");
+        let me = session.store.me().map_or_else(|| "…".into(), display);
         let online = session.store.online().count();
-        Line::from(Span::styled(
-            format!("@{me} · {online} online · Alt+Enter: new line · /help"),
-            tone_style(Tone::Dim, state.color),
-        ))
+        let mut text = format!("@{me} · {online} online · /help");
+        if !state.lan.is_empty() {
+            text = format!("{text} · {}", state.lan);
+        }
+        Line::from(Span::styled(text, tone_style(Tone::Dim, state.color)))
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -407,11 +489,16 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
     draw_tabs(frame, tabs_a, session, state);
 
     let width = msgs_a.width as usize;
-    let rows = match (state.on_status, session.store.current()) {
-        (false, Some(conv)) => conversation_rows(session, conv, width, state.color),
+    let (mut rows, before) = match (state.on_status, session.store.current()) {
+        (false, Some(conv)) => conversation_rows(session, conv, width, state.color, state.cleared_at(Some(conv))),
         _ => status_rows(state, width),
     };
     let height = msgs_a.height as usize;
+    if before > 0 {
+        // After a /clear, what came before sits just above the view, as in a terminal.
+        let pad = height.saturating_sub(rows.len() - before);
+        rows.extend(std::iter::repeat_n(Line::default(), pad));
+    }
     let top = state.scroll.top(rows.len(), height);
     state.view = (rows.len(), height);
     let visible: Vec<Line> = rows.into_iter().skip(top).take(height).collect();
@@ -427,6 +514,9 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
     draw_input(frame, input_a, session, state);
     draw_popup(frame, input_a, state);
     draw_status_bar(frame, status_a, session, state, now);
+    if state.help {
+        draw_help(frame, Rect { height: area.height - 1, ..area }, state.color);
+    }
 }
 
 #[cfg(test)]
@@ -491,8 +581,8 @@ mod tests {
         let buf = render(&s, &mut state, 80, 20);
         let top = &rows(&buf)[0];
         assert!(top.starts_with(" corvo "), "{top}");
-        assert!(top.contains("#catpie") && top.contains("@bobroger (2)"), "{top}");
-        let (x, y) = find(&buf, "#catpie").unwrap();
+        assert!(top.contains("#catPie") && top.contains("@bobRoger (2)"), "{top}");
+        let (x, y) = find(&buf, "#catPie").unwrap();
         assert!(buf[(x, y)].modifier.contains(ratatui::style::Modifier::REVERSED), "current tab is reversed");
         assert_eq!(state.hit(x, 0), Some(Hit::Tab(1)));
     }
@@ -509,11 +599,11 @@ mod tests {
         state.select_tab(&mut s, 1);
         let buf = render(&s, &mut state, 60, 20);
         let (x0, y0) = find(&buf, "first line").unwrap();
-        let (x1, y1) = find(&buf, "[14:02] #catpie @alice: fake").unwrap();
+        let (x1, y1) = find(&buf, "[14:02] #catPie @alice: fake").unwrap();
         let (x2, _) = find(&buf, "this third line").unwrap();
         assert_eq!((x1, y1), (x0, y0 + 1), "continuation starts at the text column");
         assert_eq!(x2, x0);
-        let (sx, sy) = find(&buf, "@bobroger").unwrap();
+        let (sx, sy) = find(&buf, "@bobRoger").unwrap();
         assert_eq!(sy, y0);
         assert!(sx < x0);
         assert!(
@@ -527,10 +617,10 @@ mod tests {
         let mut state = TuiState::new(true);
         state.select_tab(&mut s, 1);
         let buf = render(&s, &mut state, 80, 20);
-        let (x, y) = find(&buf, "● bobroger").unwrap();
+        let (x, y) = find(&buf, "● bobRoger").unwrap();
         assert_eq!(buf[(x, y)].fg, Color::Green);
         assert!(find(&buf, "online").is_some());
-        assert!(find(&buf, "● carolwolf").is_some());
+        assert!(find(&buf, "● carolWolf").is_some());
         assert_eq!(state.hit(x + 3, y), Some(Hit::Person("bobroger".into())));
     }
 
@@ -548,9 +638,9 @@ mod tests {
         let (x, y) = find(&buf, "key k7m9xq").unwrap_or_else(|| panic!("{:#?}", rows(&buf)));
         assert!(find(&buf, "2/13 members").is_some());
         assert!(find(&buf, "waiting").is_some());
-        assert!(find(&buf, "? daveoak 1/2").is_some(), "{:#?}", rows(&buf));
+        assert!(find(&buf, "? daveOak 1/2").is_some(), "{:#?}", rows(&buf));
         assert_eq!(state.hit(x, y), Some(Hit::Invite("catpie".into())), "click the key to copy the invite");
-        let (hx, hy) = find(&buf, "#catpie").filter(|(hx, _)| *hx > 50).unwrap_or((x, y - 1));
+        let (hx, hy) = find(&buf, "#catPie").filter(|(hx, _)| *hx > 50).unwrap_or((x, y - 1));
         assert_eq!(state.hit(hx, hy), Some(Hit::Invite("catpie".into())), "or the room name");
     }
 
@@ -571,9 +661,69 @@ mod tests {
         let mut s = session();
         let mut state = TuiState::new(true);
         state.select_tab(&mut s, 1);
-        assert!(find(&render(&s, &mut state, 69, 20), "● carolwolf").is_none());
+        assert!(find(&render(&s, &mut state, 69, 20), "● carolWolf").is_none());
         let tiny = render(&s, &mut state, 39, 9);
         assert!(find(&tiny, "terminal too small").is_some());
+    }
+
+    #[test]
+    fn dm_lines_show_a_delivery_mark_after_the_time() {
+        let mut s = session(); // annmoon, with bobroger online
+        s.on_line("/chat @bobroger", None);
+        let bob = || Conv::Dm("bobroger".into());
+        let sent = |text: &str, id| Event::Sent { conv: bob(), text: text.into(), ts: 0, id: Some(id) };
+        s.on_event(&Event::Message { conv: bob(), from: "bobroger".into(), text: "hey".into(), ts: 0 }, 0);
+        s.on_event(&sent("waiting", 1), 0);
+        s.on_event(&sent("arrived", 2), 0);
+        s.on_event(&sent("lost", 3), 0);
+        s.on_event(&Event::Delivered { id: 2 }, 0);
+        s.on_event(&Event::NotDelivered { ids: vec![3] }, 0);
+        let mut state = TuiState::new(true);
+        state.on_status = false;
+        let buf = render(&s, &mut state, 80, 20);
+        let all = rows(&buf);
+        let row = |needle: &str| all.iter().find(|r| r.contains(needle)).unwrap_or_else(|| panic!("{all:#?}")).clone();
+        let t = hhmm(0);
+        assert!(row("hey").starts_with(&format!("{t} ← @bobRoger hey")), "{}", row("hey"));
+        assert!(row("waiting").starts_with(&format!("{t} · @annMoon  waiting")), "{}", row("waiting"));
+        assert!(row("arrived").starts_with(&format!("{t} ✓ @annMoon  arrived")), "{}", row("arrived"));
+        assert!(row("lost").starts_with(&format!("{t} ✗ @annMoon  lost")), "{}", row("lost"));
+        assert!(row("message not delivered").starts_with(&format!("{t} * message not delivered")));
+        let (x, y) = find(&buf, "✗").unwrap();
+        assert_eq!(buf[(x, y)].fg, Color::Red);
+        let (x, y) = find(&buf, "message not delivered").unwrap();
+        assert_eq!(buf[(x, y)].fg, Color::Red);
+    }
+
+    #[test]
+    fn clear_pushes_old_lines_above_the_view() {
+        let mut s = session();
+        s.on_line("/chat @bobroger", None);
+        let bob = || Conv::Dm("bobroger".into());
+        let msg = |text: &str, ts| Event::Message { conv: bob(), from: "bobroger".into(), text: text.into(), ts };
+        for (i, text) in ["old one", "old two", "old three"].into_iter().enumerate() {
+            s.on_event(&msg(text, i as u64 + 1), 0);
+        }
+        let mut state = TuiState::new(false);
+        state.on_status = false;
+        state.clear_view(&s, 10);
+        s.on_event(&msg("new one", 11), 0);
+        let all = rows(&render(&s, &mut state, 80, 20));
+        assert!(all[1].contains("new one"), "new lines start at the top: {all:#?}");
+        assert!(!all.iter().any(|r| r.contains("old")), "{all:#?}");
+        let (total, height) = state.view;
+        state.scroll.page_up(total, height);
+        let all = rows(&render(&s, &mut state, 80, 20));
+        assert!(all.iter().any(|r| r.contains("old three")), "still there above: {all:#?}");
+
+        state.clear_view(&s, 20);
+        state.clear_view(&s, 21);
+        assert!(!rows(&render(&s, &mut state, 80, 20)).iter().any(|r| r.contains("new one")), "cleared twice");
+        state.on_status = true;
+        state.clear_view(&s, 22);
+        state.push_status(23, "* after", Tone::Plain);
+        let all = rows(&render(&s, &mut state, 80, 20));
+        assert!(all[1].contains("* after"), "the corvo tab clears too: {all:#?}");
     }
 
     #[test]
@@ -586,7 +736,7 @@ mod tests {
         let (x, y) = find(&buf, "! no room").unwrap();
         assert_eq!(buf[(x, y)].fg, Color::Red);
         let (px, py) = find(&buf, "* 2 peer(s) online:").unwrap();
-        let (bx, by) = find(&buf, "@bobroger").unwrap();
+        let (bx, by) = find(&buf, "@bobRoger").unwrap();
         assert_eq!((bx, by), (px + 2, py + 1));
     }
 
@@ -604,7 +754,40 @@ mod tests {
         assert_eq!(buf[(x, y)].fg, Color::Red);
         term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
         let bottom = rows(term.backend().buffer()).pop().unwrap();
-        assert!(bottom.contains("@annmoon · 2 online · Alt+Enter: new line · /help"), "{bottom}");
+        assert_eq!(bottom.trim_end(), "@annMoon · 2 online · /help", "nothing to add before the address is known");
+        state.lan = lan_label(Some(Ipv4Addr::new(192, 168, 1, 9)), 54321);
+        term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
+        let bottom = rows(term.backend().buffer()).pop().unwrap();
+        assert_eq!(bottom.trim_end(), "@annMoon · 2 online · /help · ip 192.168.1.9 · port 54321");
+    }
+
+    #[test]
+    fn the_window_title_counts_unread_and_mentions() {
+        let mut s = session(); // annmoon, looking at #catpie
+        let mut state = TuiState::new(false);
+        assert_eq!(window_title(&s, &state), "corvo-lan");
+        let dm = |text: &str| Event::Message {
+            conv: Conv::Dm("bobroger".into()),
+            from: "bobroger".into(),
+            text: text.into(),
+            ts: 0,
+        };
+        s.on_event(&dm("psst"), 0);
+        assert_eq!(window_title(&s, &state), "(1) corvo-lan");
+        s.on_event(&dm("@annmoon look"), 0);
+        assert_eq!(window_title(&s, &state), "(2 @1) corvo-lan");
+        state.away = 3;
+        assert_eq!(window_title(&s, &state), "(5 @1) corvo-lan", "plus what came in while away");
+        s.on_line("/chat @bobroger", None);
+        state.away = 0;
+        assert_eq!(window_title(&s, &state), "corvo-lan");
+    }
+
+    #[test]
+    fn the_lan_label_says_when_there_is_no_network() {
+        let ip = Some(Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(lan_label(ip, 4000), "ip 10.0.0.7 · port 4000");
+        assert_eq!(lan_label(None, 4000), "ip none · port 4000");
     }
 
     #[test]
@@ -651,8 +834,8 @@ mod tests {
         let buf = render(&s, &mut state, 80, 20);
         // Input on row 18; a 2-item list is 4 rows tall (with borders): rows 14–17.
         // "hi " is 3 columns after the 2-column prompt, plus 1 for the border.
-        assert_eq!(find(&buf, "@bobroger"), Some((6, 15)));
-        assert_eq!(find(&buf, "@carolwolf"), Some((6, 16)));
+        assert_eq!(find(&buf, "@bobRoger"), Some((6, 15)));
+        assert_eq!(find(&buf, "@carolWolf"), Some((6, 16)));
         assert!(buf[(6, 15)].modifier.contains(Modifier::REVERSED), "the choice is highlighted");
         assert!(!buf[(6, 16)].modifier.contains(Modifier::REVERSED));
     }
@@ -667,10 +850,31 @@ mod tests {
         state.editor.set("@".into());
         state.complete(&crate::ui::complete::Candidates::from_store(&s.store));
         let buf = render(&s, &mut state, 80, 10);
-        assert!(find(&buf, "@bobroger").is_some(), "{:#?}", rows(&buf));
+        assert!(find(&buf, "@bobRoger").is_some(), "{:#?}", rows(&buf));
         assert!(state.popup.is_some());
         render(&s, &mut state, 39, 9);
         assert!(state.popup.is_none(), "a list that can't be shown can't take keys");
+    }
+
+    #[test]
+    fn help_is_a_centred_box_over_the_chat() {
+        let s = session();
+        let mut state = TuiState::new(true);
+        state.help = true;
+        let buf = render(&s, &mut state, 80, 24);
+        let all = rows(&buf);
+        let (x, y) = find(&buf, "/chat @nick").unwrap_or_else(|| panic!("{all:#?}"));
+        for needle in ["/create <name>", "/quit", "Shift-Tab", "PgUp/PgDn", "q close"] {
+            assert!(find(&buf, needle).is_some(), "{needle} missing: {all:#?}");
+        }
+        assert!(x > 10 && y > 1, "centred, not in the corner: ({x}, {y})");
+        let (_, bottom) = find(&buf, "q close").unwrap();
+        assert!(bottom < 23, "fits above the status bar");
+        state.help = false;
+        assert!(find(&render(&s, &mut state, 80, 24), "q close").is_none(), "closed means gone");
+        state.help = true;
+        let small = render(&s, &mut state, 40, 10);
+        assert!(find(&small, "q close").is_some(), "a short terminal still shows how to close it");
     }
 
     #[test]
@@ -683,10 +887,10 @@ mod tests {
         }
         let mut state = TuiState::new(true);
         let top = rows(&render(&s, &mut state, 80, 20))[0].clone();
-        assert!(top.contains("#catpie (2 @1)"), "{top}");
+        assert!(top.contains("#catPie (2 @1)"), "{top}");
         state.select_tab(&mut s, 1);
         let buf = render(&s, &mut state, 80, 20);
-        let (x, y) = find(&buf, "ping @annmoon").unwrap();
+        let (x, y) = find(&buf, "ping @annMoon").unwrap();
         assert_eq!(buf[(x, y)].fg, Color::Yellow);
         assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
         let (px, py) = find(&buf, "plain words").unwrap();

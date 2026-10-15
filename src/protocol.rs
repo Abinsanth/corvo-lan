@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u8 = 4;
+pub const PROTOCOL_VERSION: u8 = 5;
 /// Largest JSON body in one frame: a Noise message (65,535 bytes) minus its 16-byte tag.
 pub const MAX_FRAME_LEN: usize = 65_535 - 16;
 
@@ -95,10 +95,15 @@ pub enum Frame {
         v: u8,
         nick: String,
     },
-    /// DM, protected by the Noise transport.
+    /// DM, protected by the Noise transport. `id` is the sender's, echoed in the `Ack`.
     Direct {
         text: String,
         ts: u64,
+        id: u64,
+    },
+    /// The DM with this `id` arrived.
+    Ack {
+        id: u64,
     },
     /// Only sent to settle a same-moment name clash (see node).
     Nick {
@@ -194,6 +199,16 @@ mod tests {
         assert!(PeerId::try_from(format!("+a{}", "ab".repeat(31))).is_err(), "a sign");
         assert!(PeerId::try_from(format!("zz{}", "ab".repeat(31))).is_err());
         assert!(PeerId::try_from("ab".repeat(31)).is_err(), "too short");
+    }
+
+    #[test]
+    fn dms_carry_an_id_and_acks_echo_it() {
+        let dm = Frame::Direct { text: "hi".into(), ts: 5, id: 7 };
+        let json = serde_json::to_string(&dm).unwrap();
+        assert_eq!(json, r#"{"type":"direct","text":"hi","ts":5,"id":7}"#);
+        assert_eq!(serde_json::from_str::<Frame>(&json).unwrap(), dm);
+        assert_eq!(serde_json::to_string(&Frame::Ack { id: 7 }).unwrap(), r#"{"type":"ack","id":7}"#);
+        assert!(serde_json::from_str::<Frame>(r#"{"type":"direct","text":"hi","ts":5}"#).is_err(), "id is required");
     }
 
     #[test]

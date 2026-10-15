@@ -39,16 +39,23 @@ pub enum Input {
         nick: String,
         room: Option<String>,
     },
+    /// Vote to remove someone from the named room, or the current one.
+    Kick {
+        nick: String,
+        room: Option<String>,
+    },
     /// Answer an invitation; the room if typed, else the only one.
     Accept(Option<String>),
     Decline(Option<String>),
     Leave(Option<String>),
     Rooms,
     Chats,
-    /// `/update` checks; `/update yes` installs the newest release.
+    /// `/update` checks; `/update yes` (or `y`) installs the newest release.
     Update {
         confirm: bool,
     },
+    /// Clear the open tab's view; nothing is deleted.
+    Clear,
     /// Close the current or named DM.
     Close(Option<String>),
     Who,
@@ -63,8 +70,8 @@ const SIGIL_HINT: &str = "use @name for people or #name for rooms";
 /// Every command name `parse_line` accepts, aliases included. Completion and
 /// typo hints read it, so keep it in step with the match below.
 pub const COMMANDS: &[&str] = &[
-    "msg", "m", "chat", "c", "create", "invite", "accept", "decline", "approve", "deny", "leave", "close", "rooms",
-    "chats", "who", "update", "help", "h", "?", "quit", "q",
+    "msg", "m", "chat", "c", "create", "invite", "accept", "decline", "approve", "deny", "kick", "leave", "close",
+    "rooms", "chats", "who", "update", "clear", "help", "h", "?", "quit", "q",
 ];
 
 /// Names that were dropped, and the command that replaced each.
@@ -134,6 +141,13 @@ pub fn parse_line(line: &str) -> Input {
             }
             _ => Input::Error("usage: /invite @nick [#room]".into()),
         },
+        "kick" => match words.as_slice() {
+            [nick] if nick.starts_with('@') => Input::Kick { nick: lower(&nick[1..]), room: None },
+            [nick, room] if nick.starts_with('@') && room.starts_with('#') => {
+                Input::Kick { nick: lower(&nick[1..]), room: Some(lower(&room[1..])) }
+            }
+            _ => Input::Error("usage: /kick @nick [#room]".into()),
+        },
         "accept" | "decline" => {
             let room = match words.as_slice() {
                 [] => None,
@@ -149,7 +163,7 @@ pub fn parse_line(line: &str) -> Input {
         },
         "update" => match words.as_slice() {
             [] => Input::Update { confirm: false },
-            ["yes"] => Input::Update { confirm: true },
+            ["yes" | "y"] => Input::Update { confirm: true },
             _ => Input::Error("usage: /update [yes]".into()),
         },
         "close" => match words.as_slice() {
@@ -157,6 +171,10 @@ pub fn parse_line(line: &str) -> Input {
             [nick] if nick.starts_with('@') => Input::Close(Some(lower(&nick[1..]))),
             [room] if room.starts_with('#') => Input::Error("use /leave for rooms".into()),
             _ => Input::Error("usage: /close [@nick]".into()),
+        },
+        "clear" => match words.as_slice() {
+            [] => Input::Clear,
+            _ => Input::Error("usage: /clear".into()),
         },
         "rooms" => Input::Rooms,
         "chats" => Input::Chats,
@@ -356,6 +374,18 @@ mod tests {
     }
 
     #[test]
+    fn kick_parses() {
+        assert_eq!(parse_line("/kick @BobRoger"), Input::Kick { nick: "bobroger".into(), room: None });
+        assert_eq!(
+            parse_line("/kick @bobroger #CatPie"),
+            Input::Kick { nick: "bobroger".into(), room: Some("catpie".into()) }
+        );
+        assert_eq!(parse_line("/kick"), err("usage: /kick @nick [#room]"));
+        assert_eq!(parse_line("/kick bob"), err("usage: /kick @nick [#room]"));
+        assert!(COMMANDS.contains(&"kick"));
+    }
+
+    #[test]
     fn every_listed_command_parses() {
         for name in COMMANDS {
             let parsed = parse_line(&format!("/{name}"));
@@ -367,6 +397,10 @@ mod tests {
     fn update_checks_or_installs() {
         assert_eq!(parse_line("/update"), Input::Update { confirm: false });
         assert_eq!(parse_line("/update yes"), Input::Update { confirm: true });
+        assert_eq!(parse_line("/update y"), Input::Update { confirm: true });
+        assert_eq!(parse_line("/clear"), Input::Clear);
+        assert_eq!(parse_line("/clear all"), err("usage: /clear"));
+        assert!(COMMANDS.contains(&"clear"));
         assert_eq!(parse_line("/update now"), err("usage: /update [yes]"));
         assert_eq!(parse_line("/update yes please"), err("usage: /update [yes]"));
     }

@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 use crate::api::Conv;
 use crate::convo::Store;
+use crate::names::display;
 use crate::ui::input::COMMANDS;
 
 /// What can be completed right now.
@@ -89,8 +90,13 @@ pub fn complete(before: &str, cands: &Candidates) -> Option<Completion> {
         }
         _ => return None,
     };
-    let matches: Vec<String> =
-        pool.into_iter().filter(|n| n.to_lowercase().starts_with(&part)).map(|n| format!("{sigil}{n}")).collect();
+    // Names are offered as they're shown (`@bobRoger`); input lowercases them again.
+    let shown = |n: &str| if sigil == '/' { n.to_string() } else { display(n) };
+    let matches: Vec<String> = pool
+        .into_iter()
+        .filter(|n| n.to_lowercase().starts_with(&part))
+        .map(|n| format!("{sigil}{}", shown(n)))
+        .collect();
     (!matches.is_empty()).then_some(Completion { start, matches })
 }
 
@@ -128,9 +134,9 @@ mod tests {
     fn names_and_rooms_complete_by_prefix_ignoring_case() {
         assert_eq!(
             complete("hi @BO", &cands()),
-            Some(Completion { start: 3, matches: vec!["@bobroger".into(), "@bobkite".into()] })
+            Some(Completion { start: 3, matches: vec!["@bobRoger".into(), "@bobKite".into()] })
         );
-        assert_eq!(matches("#c"), vec!["#catpie"]);
+        assert_eq!(matches("#c"), vec!["#catPie"]);
         assert_eq!(matches("@").len(), 3, "a bare sigil lists everyone");
         assert_eq!(complete("@zed", &cands()), None);
         assert_eq!(complete("hello", &cands()), None);
@@ -141,11 +147,11 @@ mod tests {
 
     #[test]
     fn approve_and_deny_complete_who_is_waiting() {
-        assert_eq!(matches("/approve @"), vec!["@daveoak"]);
-        assert_eq!(matches("/deny @d"), vec!["@daveoak"]);
+        assert_eq!(matches("/approve @"), vec!["@daveOak"]);
+        assert_eq!(matches("/deny @d"), vec!["@daveOak"]);
         assert_eq!(matches("/approve @b"), Vec::<String>::new(), "only people who asked");
         assert_eq!(matches("/msg @d"), Vec::<String>::new(), "elsewhere it's everyone online");
-        assert_eq!(matches("/invite #c"), vec!["#catpie"]);
+        assert_eq!(matches("/invite #c"), vec!["#catPie"]);
         assert_eq!(matches("/inv"), vec!["/invite"]);
     }
 
@@ -203,8 +209,8 @@ mod tests {
         let mut s = Store::new();
         s.apply(&Event::Invited { from: "bobroger".into(), room: "catpie".into() }, 0);
         let c = Candidates::from_store(&s);
-        assert_eq!(complete("/accept #c", &c).unwrap().matches, vec!["#catpie"]);
-        assert_eq!(complete("/decline #", &c).unwrap().matches, vec!["#catpie"]);
+        assert_eq!(complete("/accept #c", &c).unwrap().matches, vec!["#catPie"]);
+        assert_eq!(complete("/decline #", &c).unwrap().matches, vec!["#catPie"]);
         assert!(complete("/chat #c", &c).is_none(), "not a room we're in");
     }
 }

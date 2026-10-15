@@ -262,7 +262,7 @@ mod tests {
         let ((mut seal, _), _) = test_pair().await;
         let (mut ours, _theirs) = tokio::io::duplex(64); // the other end is never read
         let (tx, rx) = mpsc::channel(4);
-        tx.send(Frame::Direct { text: "x".repeat(1000), ts: 0 }).await.unwrap();
+        tx.send(Frame::Direct { text: "x".repeat(1000), ts: 0, id: 0 }).await.unwrap();
         assert_eq!(write_loop(&mut ours, &mut seal, rx).await, WriterExit::Stalled);
     }
 
@@ -271,12 +271,12 @@ mod tests {
         let ((mut seal, _), (_, mut open)) = test_pair().await;
         let (mut ours, mut theirs) = tokio::io::duplex(4096);
         let (tx, rx) = mpsc::channel(4);
-        tx.send(Frame::Direct { text: "hi".into(), ts: 0 }).await.unwrap();
+        tx.send(Frame::Direct { text: "hi".into(), ts: 0, id: 0 }).await.unwrap();
         tx.send(Frame::Bye).await.unwrap();
-        tx.send(Frame::Direct { text: "after bye".into(), ts: 0 }).await.unwrap();
+        tx.send(Frame::Direct { text: "after bye".into(), ts: 0, id: 0 }).await.unwrap();
         assert_eq!(write_loop(&mut ours, &mut seal, rx).await, WriterExit::Bye);
         drop(ours);
-        assert_eq!(open.read_frame(&mut theirs).await.unwrap(), Frame::Direct { text: "hi".into(), ts: 0 });
+        assert_eq!(open.read_frame(&mut theirs).await.unwrap(), Frame::Direct { text: "hi".into(), ts: 0, id: 0 });
         assert_eq!(open.read_frame(&mut theirs).await.unwrap(), Frame::Bye);
         assert!(open.read_frame(&mut theirs).await.is_err()); // closed, nothing after Bye
     }
@@ -286,7 +286,7 @@ mod tests {
         let ((mut seal, _), (_, mut open)) = test_pair().await;
         let (mut ours, mut theirs) = tokio::io::duplex(4096);
         let (tx, rx) = mpsc::channel(4);
-        tx.send(Frame::Direct { text: "x".repeat(MAX_FRAME_LEN), ts: 0 }).await.unwrap();
+        tx.send(Frame::Direct { text: "x".repeat(MAX_FRAME_LEN), ts: 0, id: 0 }).await.unwrap();
         tx.send(Frame::Bye).await.unwrap();
         assert_eq!(write_loop(&mut ours, &mut seal, rx).await, WriterExit::Bye);
         assert_eq!(open.read_frame(&mut theirs).await.unwrap(), Frame::Bye);
@@ -306,7 +306,7 @@ mod tests {
         let ((mut seal, _), (_, mut open)) = test_pair().await;
         let (mut ours, mut theirs) = tokio::io::duplex(4096);
         let (node_tx, mut node_rx) = mpsc::channel(4);
-        let chat = Frame::Direct { text: "late".into(), ts: 0 };
+        let chat = Frame::Direct { text: "late".into(), ts: 0, id: 0 };
         seal.write_frame(&mut theirs, &Frame::Ping).await.unwrap();
         seal.write_frame(&mut theirs, &chat).await.unwrap();
         drop(theirs);
@@ -402,7 +402,7 @@ mod tests {
     async fn writer_stops_on_an_invalid_input_that_isnt_too_large() {
         let ((mut seal, _), _) = test_pair().await;
         let (tx, rx) = mpsc::channel(4);
-        tx.send(Frame::Direct { text: "hi".into(), ts: 0 }).await.unwrap();
+        tx.send(Frame::Direct { text: "hi".into(), ts: 0, id: 0 }).await.unwrap();
         drop(tx);
         assert_eq!(write_loop(&mut Refuses, &mut seal, rx).await, WriterExit::Failed);
     }

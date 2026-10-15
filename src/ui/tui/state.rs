@@ -2,7 +2,7 @@
 //! scroll position, the corvo (status) tab, the error flash and click targets.
 //! Pure, so it's tested without a terminal.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -377,6 +377,8 @@ pub fn goes_to_status(event: &Event) -> bool {
             | Event::MemberLeft { .. }
             | Event::Approved { .. }
             | Event::RequestEnded { .. }
+            | Event::Delivered { .. }
+            | Event::NotDelivered { .. }
     )
 }
 
@@ -398,7 +400,20 @@ pub struct TuiState {
     pub view: (usize, usize),
     /// The completion list, while open.
     pub popup: Option<Popup>,
+    /// The help box is open: it takes every key until q, Q or Esc.
+    pub help: bool,
+    /// Our LAN address for the status bar, e.g. "ip 192.168.1.9 · port 54321".
+    pub lan: String,
+    /// The terminal window has focus. Assumed until the terminal says otherwise.
+    pub focused: bool,
+    /// Messages that arrived in the open conversation while the window was in
+    /// the background; the store counts those as read.
+    pub away: u32,
     status: VecDeque<StatusLine>,
+    /// The last status line is a download's progress, which the next one replaces.
+    progress_last: bool,
+    /// Where each tab was `/clear`ed (unix millis); `None` is the corvo tab.
+    cleared: HashMap<Option<Conv>, u64>,
     flash: Option<(String, Instant)>,
     hits: Vec<(Rect, Hit)>,
 }
@@ -413,7 +428,13 @@ impl TuiState {
             color,
             view: (0, 0),
             popup: None,
+            help: false,
+            lan: String::new(),
+            focused: true,
+            away: 0,
             status: VecDeque::new(),
+            progress_last: false,
+            cleared: HashMap::new(),
             flash: None,
             hits: Vec::new(),
         }
@@ -495,10 +516,36 @@ impl TuiState {
     }
 
     pub fn push_status(&mut self, ts: u64, text: &str, tone: Tone) {
+        self.progress_last = false;
         self.status.push_back(StatusLine { ts, text: text.to_string(), tone });
         if self.status.len() > STATUS_LEN {
             self.status.pop_front();
         }
+    }
+
+    /// A download's progress: replaces the previous progress line while it's the last line.
+    pub fn push_progress(&mut self, ts: u64, text: &str) {
+        if self.progress_last
+            && let Some(last) = self.status.back_mut()
+        {
+            (last.ts, last.text) = (ts, text.to_string());
+            return;
+        }
+        self.push_status(ts, text, Tone::Plain);
+        self.progress_last = true;
+    }
+
+    /// Like a terminal's `clear`: the open tab shows empty from `now_ms` on.
+    /// Nothing is deleted; scrolling up shows what came before.
+    pub fn clear_view(&mut self, session: &Session, now_ms: u64) {
+        let tab = if self.on_status { None } else { session.store.current().cloned() };
+        self.cleared.insert(tab, now_ms);
+        self.scroll.to_bottom();
+    }
+
+    /// When `tab` (`None`: corvo) was last cleared.
+    pub fn cleared_at(&self, tab: Option<&Conv>) -> Option<u64> {
+        self.cleared.get(&tab.cloned()).copied()
     }
 
     pub fn status_lines(&self) -> impl Iterator<Item = &StatusLine> {
@@ -681,6 +728,32 @@ mod tests {
         s
     }
 
+    #[test]
+    fn progress_replaces_only_progress() {
+        let mut t = TuiState::new(false);
+        t.push_progress(0, "* downloading v0.6.0  0%");
+        t.push_progress(1, "* downloading v0.6.0  52%");
+        let texts = |t: &TuiState| t.status_lines().map(|l| l.text.clone()).collect::<Vec<_>>();
+        assert_eq!(texts(&t), vec!["* downloading v0.6.0  52%"]);
+        t.push_status(2, "* something else", Tone::Plain);
+        t.push_progress(3, "* downloading v0.6.0  60%");
+        assert_eq!(texts(&t).len(), 3, "a progress line after other news starts a new line");
+    }
+
+    #[test]
+    fn clear_marks_the_open_tab() {
+        let mut s = session_with_tabs();
+        let mut t = TuiState::new(false);
+        t.scroll.page_up(100, 10);
+        t.clear_view(&s, 5);
+        assert_eq!(t.cleared_at(None), Some(5), "the corvo tab");
+        assert!(!t.scroll.is_scrolled(), "back to the latest");
+        t.select_tab(&mut s, 1);
+        t.clear_view(&s, 7);
+        assert_eq!(t.cleared_at(Some(&Conv::Room("catpie".into()))), Some(7));
+        assert_eq!(t.cleared_at(Some(&Conv::Dm("bobroger".into()))), None);
+    }
+
     fn bobs() -> Candidates {
         Candidates { nicks: vec!["bobroger".into(), "bobkite".into(), "carolwolf".into()], ..Default::default() }
     }
@@ -690,21 +763,21 @@ mod tests {
         let mut t = TuiState::new(false);
         t.editor.set("hi @car".into());
         t.complete(&bobs());
-        assert_eq!(t.editor.text(), "hi @carolwolf ");
+        assert_eq!(t.editor.text(), "hi @carolWolf ");
         assert_eq!(t.popup, None);
 
         t.editor.set("é @b".into());
         t.complete(&bobs());
         assert_eq!(t.editor.text(), "é @bob", "fills the shared prefix");
-        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobroger", "@bobkite"]);
+        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobRoger", "@bobKite"]);
         t.move_selection(1);
         t.accept();
-        assert_eq!(t.editor.text(), "é @bobkite ");
+        assert_eq!(t.editor.text(), "é @bobKite ");
         assert_eq!(t.popup, None);
 
         t.editor.set("line one\n@car".into());
         t.complete(&bobs());
-        assert_eq!(t.editor.text(), "line one\n@carolwolf ");
+        assert_eq!(t.editor.text(), "line one\n@carolWolf ");
 
         t.editor.set("@zed".into());
         t.complete(&bobs());
@@ -720,7 +793,7 @@ mod tests {
         assert_eq!(t.popup.as_ref().unwrap().selected, 1);
         t.editor.insert('k');
         t.refresh_popup(&bobs());
-        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobkite"]);
+        assert_eq!(t.popup.as_ref().unwrap().matches, vec!["@bobKite"]);
         assert_eq!(t.popup.as_ref().unwrap().selected, 0);
         t.editor.insert(' ');
         t.refresh_popup(&bobs());
@@ -828,7 +901,9 @@ mod tests {
     fn only_chat_lines_stay_out_of_the_corvo_tab() {
         let msg = Event::Message { conv: Conv::Dm("b".into()), from: "b".into(), text: "x".into(), ts: 0 };
         assert!(!goes_to_status(&msg));
-        assert!(!goes_to_status(&Event::Sent { conv: Conv::Dm("b".into()), text: "x".into(), ts: 0 }));
+        assert!(!goes_to_status(&Event::Sent { conv: Conv::Dm("b".into()), text: "x".into(), ts: 0, id: Some(1) }));
+        assert!(!goes_to_status(&Event::Delivered { id: 1 }));
+        assert!(!goes_to_status(&Event::NotDelivered { ids: vec![1] }));
         assert!(!goes_to_status(&Event::MemberJoined { room: "r".into(), nick: "b".into() }));
         assert!(goes_to_status(&Event::Error("x".into())));
         assert!(goes_to_status(&Event::RoomCreated { name: "r".into(), key: "k".into(), max: 13 }));
