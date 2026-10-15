@@ -29,6 +29,7 @@ async fn spawn_node_with_word(base: &str, peers: &[SocketAddr], word: Option<&st
         manual_peers: peers.to_vec(),
         name_wait: Duration::ZERO,
         fixed_word: word.map(String::from),
+        prefer: None,
         ask_name: false,
     })
     .await
@@ -400,6 +401,7 @@ async fn an_asking_node_goes_live_on_confirm() {
         manual_peers: vec![],
         name_wait: Duration::ZERO,
         fixed_word: None,
+        prefer: None,
         ask_name: true,
     })
     .await

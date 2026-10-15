@@ -71,6 +71,9 @@ pub struct NodeConfig {
     /// Pin the Word part of our first name instead of drawing one; tests use
     /// it to force a same-moment clash. `None` (the app) picks at random.
     pub fixed_word: Option<String>,
+    /// A whole name to keep if nobody announced it while we listened, e.g. our
+    /// name before an update's restart. Otherwise a name is picked as usual.
+    pub prefer: Option<String>,
 }
 
 pub struct NodeHandle {
@@ -233,6 +236,8 @@ struct Node {
     /// `Some(nicks seen so far)` during the listen-only naming window.
     naming: Option<HashSet<String>>,
     fixed_word: Option<String>,
+    /// See `NodeConfig::prefer`.
+    prefer: Option<String>,
     /// See `NodeConfig::ask_name`.
     ask_name: bool,
     /// The name last sent as `Event::NamePreview`.
@@ -271,6 +276,7 @@ pub async fn start(config: NodeConfig) -> anyhow::Result<NodeHandle> {
     let mut node = Node::new(config.keys, config.base, event_tx, msg_tx.clone());
     node.naming = Some(HashSet::new());
     node.fixed_word = config.fixed_word;
+    node.prefer = config.prefer;
     node.ask_name = config.ask_name;
     node.listener = Some(listener);
     node.manual_peers = config.manual_peers;
@@ -326,6 +332,7 @@ impl Node {
             nick: watch::Sender::new(String::new()),
             naming: None,
             fixed_word: None,
+            prefer: None,
             ask_name: false,
             preview: None,
             confirmed: false,
@@ -576,7 +583,10 @@ impl Node {
             (None, Some(kept)) if !seen.contains(&kept) => (Some(kept), false),
             // Someone announced the preview while the user was deciding.
             (None, Some(_)) => (names::pick_name(&self.base, |n| seen.contains(n)), true),
-            (None, None) => (names::pick_name(&self.base, |n| seen.contains(n)), false),
+            (None, None) => match self.prefer.take() {
+                Some(name) if !seen.contains(&name) => (Some(name), false),
+                _ => (names::pick_name(&self.base, |n| seen.contains(n)), false),
+            },
         };
         let Some(nick) = picked else {
             self.emit(Event::Error(format!("every name for '{}' is taken; restart with another --nick", self.base)));
@@ -997,6 +1007,26 @@ pub(super) mod tests {
         h.node.naming = Some(HashSet::new());
         h.node.handle_command(dm("bobroger", "hi"));
         assert!(matches!(h.events().as_slice(), [Event::Error(e)] if e.contains("still picking")));
+    }
+
+    #[test]
+    fn a_preferred_name_is_kept_unless_someone_has_it() {
+        let mut h = Harness::new();
+        h.node.nick.send_replace(String::new());
+        h.node.naming = Some(HashSet::new());
+        h.node.prefer = Some("annpie".into());
+        h.node.on_name_wait_over();
+        assert_eq!(h.node.my_nick(), "annpie");
+        assert_eq!(h.events(), vec![Event::Assigned { nick: "annpie".into(), renamed: false }]);
+
+        let mut h = Harness::new();
+        h.node.nick.send_replace(String::new());
+        h.node.naming = Some(HashSet::new());
+        h.node.prefer = Some("annpie".into());
+        h.node.on_discovered(sighting(1, "annpie"));
+        h.node.on_name_wait_over();
+        let got = h.node.my_nick();
+        assert!(got.starts_with("ann") && got != "annpie" && names::is_valid_name(&got), "{got}");
     }
 
     /// A node in its naming window that asks the user, like the app without `--nick`.

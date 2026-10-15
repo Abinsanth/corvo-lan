@@ -9,6 +9,7 @@ pub mod tui;
 pub mod updates;
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
@@ -21,7 +22,18 @@ use crate::node::NodeHandle;
 use crate::update::Version;
 
 pub struct Options {
-    pub check_updates: bool,
+    /// This binary, captured at startup: an update replaces it, and a restart runs it.
+    pub exe: Option<PathBuf>,
+}
+
+/// How the UI ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exit {
+    Quit,
+    /// Start the newly installed version, keeping `name` if there was one.
+    Restart {
+        name: Option<String>,
+    },
 }
 
 /// Output from background work (`/update`).
@@ -102,20 +114,19 @@ async fn run_ui(
 }
 
 /// Runs the full-screen UI until the user quits, then waits for the Node to say goodbye.
-pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<()> {
+pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<Exit> {
     let NodeHandle { commands, events, task, local_addr, .. } = handle;
     let lan = tui::view::lan_label(discovery::lan_ip(), local_addr.port());
     tui::install_panic_hook();
     let (notice_tx, notices) = mpsc::unbounded_channel();
-    let updater = Updater::new(notice_tx.clone(), crate::update::running_exe().ok());
-    if opts.check_updates {
-        updater.check_at_startup();
-    }
+    let updater = Updater::new(notice_tx.clone(), opts.exe);
+    updater.check_at_startup();
     let session = Session::new(Style::detect().color);
     let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater, lan, restart: false };
     let result = run_ui(&mut ctx, std::io::stdout().is_terminal(), tui::run).await;
     let _ = task.await;
-    result
+    result?;
+    Ok(if ctx.restart { Exit::Restart { name: ctx.session.store.me().map(str::to_string) } } else { Exit::Quit })
 }
 
 #[cfg(test)]

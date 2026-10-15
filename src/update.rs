@@ -2,7 +2,7 @@
 //! Talks to GitHub through the system `curl` and unpacks with the system `tar` (as install.sh does; Windows 10+
 //! ships both), so the app needs no HTTP or TLS crates.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -168,11 +168,6 @@ pub fn asset_name(os: &str, arch: &str) -> Option<String> {
     }
 }
 
-/// Whether `CORVO_LAN_NO_UPDATE_CHECK=<value>` turns the startup check off.
-pub fn check_disabled_by(value: Option<&str>) -> bool {
-    value.is_some_and(|v| !v.is_empty() && v != "0")
-}
-
 /// Where releases are listed and downloaded from. Tests point these at `file://`.
 pub struct Urls {
     pub api: String,
@@ -330,6 +325,40 @@ fn swap_in(new: &Path, target: &Path) -> std::io::Result<()> {
 /// and the error messages would then show.
 pub fn running_exe() -> std::io::Result<PathBuf> {
     if cfg!(windows) { std::env::current_exe() } else { std::env::current_exe()?.canonicalize() }
+}
+
+/// The arguments to restart with: ours, minus any `--resume-as`, plus
+/// `--resume-as <name>` when we have a name to keep.
+pub fn restart_args(args: impl IntoIterator<Item = OsString>, name: Option<&str>) -> Vec<OsString> {
+    let mut out = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--resume-as" {
+            args.next();
+        } else if !arg.to_string_lossy().starts_with("--resume-as=") {
+            out.push(arg);
+        }
+    }
+    if let Some(name) = name {
+        out.extend([OsString::from("--resume-as"), OsString::from(name)]);
+    }
+    out
+}
+
+/// Starts `exe` with `args` in this terminal, in place of this process.
+/// Unix replaces the process; Windows runs it and exits with its code.
+/// Returns only if it couldn't start.
+pub fn relaunch(exe: &Path, args: Vec<OsString>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(std::process::Command::new(exe).args(args).exec())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = std::process::Command::new(exe).args(args).status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 /// Deletes the exe a Windows update moved aside; it couldn't go while it ran.
@@ -537,12 +566,15 @@ mod tests {
     }
 
     #[test]
-    fn the_env_var_turns_the_startup_check_off() {
-        assert!(!check_disabled_by(None));
-        assert!(!check_disabled_by(Some("")));
-        assert!(!check_disabled_by(Some("0")));
-        assert!(check_disabled_by(Some("1")));
-        assert!(check_disabled_by(Some("yes")));
+    fn restart_args_keep_the_rest_and_replace_resume_as() {
+        let os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        let old = os(&["--peer", "1.2.3.4:5", "--resume-as", "oldname", "--debug"]);
+        assert_eq!(
+            restart_args(old.clone(), Some("annmoon")),
+            os(&["--peer", "1.2.3.4:5", "--debug", "--resume-as", "annmoon"])
+        );
+        assert_eq!(restart_args(os(&["--resume-as=x", "--debug"]), None), os(&["--debug"]));
+        assert_eq!(restart_args(os(&["--nick", "ann"]), None), os(&["--nick", "ann"]), "nothing added");
     }
 
     #[cfg(unix)]
