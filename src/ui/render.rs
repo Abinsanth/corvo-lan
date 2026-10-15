@@ -204,7 +204,7 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
         Event::Message { conv: Conv::Dm(_), from, text, ts } => {
             format!("{} {} → you: {}", s.dim(&stamp(*ts)), s.nick(from), body(text))
         }
-        Event::Sent { conv: Conv::Dm(to), text, ts } => {
+        Event::Sent { conv: Conv::Dm(to), text, ts, .. } => {
             format!("{} you → {}: {}", s.dim(&stamp(*ts)), s.nick(to), body(text))
         }
         Event::Sent { conv: Conv::Room(_), .. } => return None,
@@ -286,6 +286,7 @@ pub fn event(event: &Event, now: u64, style: &Style) -> Option<String> {
             return None;
         }
         Event::NamePreview { .. } => return None,
+        Event::Delivered { .. } | Event::NotDelivered { .. } => return None,
     })
 }
 
@@ -382,9 +383,9 @@ mod tests {
         let dm_in =
             Event::Message { conv: Conv::Dm("bobroger".into()), from: "bobroger".into(), text: "psst".into(), ts: 0 };
         assert_eq!(event(&dm_in, 0, &P).unwrap(), format!("{} @bobRoger → you: psst", t(0)));
-        let dm_out = Event::Sent { conv: Conv::Dm("bobroger".into()), text: "yo".into(), ts: 0 };
+        let dm_out = Event::Sent { conv: Conv::Dm("bobroger".into()), text: "yo".into(), ts: 0, id: Some(1) };
         assert_eq!(event(&dm_out, 0, &P).unwrap(), format!("{} you → @bobRoger: yo", t(0)));
-        let room_out = Event::Sent { conv: Conv::Room("catpie".into()), text: "mine".into(), ts: 0 };
+        let room_out = Event::Sent { conv: Conv::Room("catpie".into()), text: "mine".into(), ts: 0, id: None };
         assert_eq!(event(&room_out, 0, &P), None);
     }
 

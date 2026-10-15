@@ -171,11 +171,21 @@ pub enum Event {
         text: String,
         ts: u64,
     },
-    /// Something we sent, so the conversation store can record it.
+    /// Something we sent, so the conversation store can record it. A DM has an
+    /// `id`, and a `Delivered` or `NotDelivered` with it follows; a room message has none.
     Sent {
         conv: Conv,
         text: String,
         ts: u64,
+        id: Option<u64>,
+    },
+    /// The other app got our DM `id`.
+    Delivered {
+        id: u64,
+    },
+    /// These DMs got no ack within `ACK_WAIT`, or their peer went away first. Sorted.
+    NotDelivered {
+        ids: Vec<u64>,
     },
     RoomCreated {
         name: String,

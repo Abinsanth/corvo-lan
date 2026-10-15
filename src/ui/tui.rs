@@ -664,7 +664,7 @@ mod tests {
         let msg = Event::Message { conv: room.clone(), from: "bobroger".into(), text: "x".into(), ts: 0 };
         on_event(&mut s, &mut state, &msg, now);
         assert_eq!(state.scroll.unseen(), 1);
-        on_event(&mut s, &mut state, &Event::Sent { conv: room, text: "mine".into(), ts: 0 }, now);
+        on_event(&mut s, &mut state, &Event::Sent { conv: room, text: "mine".into(), ts: 0, id: None }, now);
         assert_eq!(state.scroll.unseen(), 0, "our own message isn't news");
         assert!(!state.scroll.is_scrolled(), "sending shows the latest messages");
     }

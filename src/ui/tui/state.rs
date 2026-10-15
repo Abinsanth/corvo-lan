@@ -377,6 +377,8 @@ pub fn goes_to_status(event: &Event) -> bool {
             | Event::MemberLeft { .. }
             | Event::Approved { .. }
             | Event::RequestEnded { .. }
+            | Event::Delivered { .. }
+            | Event::NotDelivered { .. }
     )
 }
 
@@ -834,7 +836,9 @@ mod tests {
     fn only_chat_lines_stay_out_of_the_corvo_tab() {
         let msg = Event::Message { conv: Conv::Dm("b".into()), from: "b".into(), text: "x".into(), ts: 0 };
         assert!(!goes_to_status(&msg));
-        assert!(!goes_to_status(&Event::Sent { conv: Conv::Dm("b".into()), text: "x".into(), ts: 0 }));
+        assert!(!goes_to_status(&Event::Sent { conv: Conv::Dm("b".into()), text: "x".into(), ts: 0, id: Some(1) }));
+        assert!(!goes_to_status(&Event::Delivered { id: 1 }));
+        assert!(!goes_to_status(&Event::NotDelivered { ids: vec![1] }));
         assert!(!goes_to_status(&Event::MemberJoined { room: "r".into(), nick: "b".into() }));
         assert!(goes_to_status(&Event::Error("x".into())));
         assert!(goes_to_status(&Event::RoomCreated { name: "r".into(), key: "k".into(), max: 13 }));

@@ -39,6 +39,8 @@ pub const MAX_RENAMES: u8 = 3;
 /// Messages a peer may send in a burst before being throttled to `RATE_PER_SEC`.
 pub const RATE_BURST: u32 = 30;
 const RATE_PER_SEC: f64 = 10.0;
+/// How long a sent DM waits for its `Ack` before it's shown as not delivered.
+pub const ACK_WAIT: Duration = Duration::from_secs(5);
 /// How long to listen to discovery before picking our name.
 pub const NAME_WAIT: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_secs(1);
@@ -215,6 +217,12 @@ struct Backoff {
     next_try: Instant,
 }
 
+/// A DM we sent that hasn't been acked yet.
+struct Unacked {
+    to: PeerId,
+    at: Instant,
+}
+
 struct Node {
     id: PeerId,
     keys: Keys,
@@ -238,6 +246,10 @@ struct Node {
     peers: HashMap<PeerId, PeerEntry>,
     dialing: HashSet<PeerId>,
     backoff: HashMap<PeerId, Backoff>,
+    /// The id for our next DM.
+    next_dm: u64,
+    /// DMs waiting for their `Ack`, by id.
+    unacked: HashMap<u64, Unacked>,
     /// Bound at start, accepted from only once we have a name.
     listener: Option<TcpListener>,
     manual_peers: Vec<SocketAddr>,
@@ -323,6 +335,8 @@ impl Node {
             peers: HashMap::new(),
             dialing: HashSet::new(),
             backoff: HashMap::new(),
+            next_dm: 1,
+            unacked: HashMap::new(),
             listener: None,
             manual_peers: Vec::new(),
             rooms: rooms::Rooms::default(),
@@ -436,13 +450,33 @@ impl Node {
     }
 
     fn send_dm(&mut self, nick: String, text: String) {
-        let Some(id) = self.peer_by_nick(&nick) else {
+        let Some(to) = self.peer_by_nick(&nick) else {
             self.emit(Event::Error(format!("@{nick} is offline")));
             return;
         };
-        let ts = now_millis();
-        self.send_to(id, Frame::Direct { text: text.clone(), ts });
-        self.emit(Event::Sent { conv: Conv::Dm(nick), text, ts });
+        let (ts, id) = (now_millis(), self.next_dm);
+        self.next_dm += 1;
+        self.send_to(to, Frame::Direct { text: text.clone(), ts, id });
+        self.unacked.insert(id, Unacked { to, at: Instant::now() });
+        self.emit(Event::Sent { conv: Conv::Dm(nick), text, ts, id: Some(id) });
+    }
+
+    /// DMs unanswered for `ACK_WAIT` weren't delivered.
+    fn expire_dms(&mut self, now: Instant) {
+        self.fail_dms(|u| now.saturating_duration_since(u.at) >= ACK_WAIT);
+    }
+
+    /// Forgets the unacked DMs `lost` picks and says they weren't delivered.
+    fn fail_dms(&mut self, lost: impl Fn(&Unacked) -> bool) {
+        let mut ids: Vec<u64> = self.unacked.iter().filter(|(_, u)| lost(u)).map(|(id, _)| *id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        ids.sort_unstable();
+        for id in &ids {
+            self.unacked.remove(id);
+        }
+        self.emit(Event::NotDelivered { ids });
     }
 
     fn handle_msg(&mut self, msg: NodeMsg) {
@@ -463,6 +497,7 @@ impl Node {
                     self.forget_member_everywhere(id);
                     if let Some(p) = self.peers.remove(&id) {
                         self.emit(Event::PeerLeft { id, nick: p.nick, reason });
+                        self.fail_dms(|u| u.to == id);
                     }
                 }
             }
@@ -483,7 +518,11 @@ impl Node {
             NodeMsg::JoinExpired(id, attempt) => self.on_join_expired(id, attempt),
             NodeMsg::Settle(id) => self.settle(id),
             NodeMsg::RekeyDue(name) => self.on_rekey_due(&name, Instant::now()),
-            NodeMsg::Tick => self.on_tick(Instant::now()),
+            NodeMsg::Tick => {
+                let now = Instant::now();
+                self.on_tick(now);
+                self.expire_dms(now);
+            }
         }
     }
 
@@ -675,8 +714,15 @@ impl Node {
             Frame::Direct { text, .. } if text.len() > MAX_TEXT_LEN => {
                 debug!(%id, "dropping oversized DM ({} bytes)", text.len());
             }
-            Frame::Direct { text, .. } => {
+            Frame::Direct { text, id: dm, .. } => {
+                self.send_to(id, Frame::Ack { id: dm });
                 self.emit(Event::Message { conv: Conv::Dm(nick.clone()), from: nick, text, ts: now_millis() })
+            }
+            Frame::Ack { id: dm } => {
+                if self.unacked.get(&dm).is_some_and(|u| u.to == id) {
+                    self.unacked.remove(&dm);
+                    self.emit(Event::Delivered { id: dm });
+                }
             }
             Frame::Room { room_id, nonce, ct } => self.on_room_frame(id, &room_id, &nonce, &ct, Instant::now()),
             Frame::Nick { nick: new } => {
@@ -1125,13 +1171,14 @@ pub(super) mod tests {
         h.events();
         let conn = h.node.peers[&BOB].conn;
         for i in 0..100 {
-            h.node.on_frame(conn, BOB, Frame::Direct { text: format!("spam {i}"), ts: 0 });
+            h.node.on_frame(conn, BOB, Frame::Direct { text: format!("spam {i}"), ts: 0, id: 0 });
         }
         let events = h.events();
         let messages = events.iter().filter(|e| matches!(e, Event::Message { .. })).count();
         let warnings = events.iter().filter(|e| matches!(e, Event::Info(m) if m.contains("too fast"))).count();
         assert_eq!(messages, RATE_BURST as usize);
         assert_eq!(warnings, 1);
+        assert_eq!(h.sent(BOB).len(), RATE_BURST as usize, "only DMs that got through are acked");
     }
 
     #[test]
@@ -1164,11 +1211,102 @@ pub(super) mod tests {
         h.connect(BOB, "bobroger", true);
         h.events();
         let conn = h.node.peers[&BOB].conn;
-        h.node.on_frame(conn, BOB, Frame::Direct { text: "hi".into(), ts: 0 });
+        h.node.on_frame(conn, BOB, Frame::Direct { text: "hi".into(), ts: 0, id: 0 });
         assert!(matches!(
             h.events().as_slice(),
             [Event::Message { conv: Conv::Dm(c), from, text, .. }] if c == "bobroger" && from == "bobroger" && text == "hi"
         ));
+    }
+
+    /// The id of the one DM just sent to `to`.
+    fn sent_dm_id(h: &mut Harness, to: PeerId) -> u64 {
+        let sent = h.sent(to);
+        let [Frame::Direct { id, .. }] = sent.as_slice() else { panic!("one DM expected: {sent:?}") };
+        *id
+    }
+
+    #[test]
+    fn incoming_dms_are_acked() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bobroger", true);
+        h.events();
+        let conn = h.node.peers[&BOB].conn;
+        h.node.on_frame(conn, BOB, Frame::Direct { text: "hi".into(), ts: 0, id: 42 });
+        assert_eq!(h.sent(BOB), vec![Frame::Ack { id: 42 }]);
+    }
+
+    #[test]
+    fn an_oversized_dm_is_not_acked() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bobroger", true);
+        h.events();
+        let conn = h.node.peers[&BOB].conn;
+        h.node.on_frame(conn, BOB, Frame::Direct { text: "x".repeat(MAX_TEXT_LEN + 1), ts: 0, id: 1 });
+        assert!(h.sent(BOB).is_empty());
+        assert!(h.events().is_empty());
+    }
+
+    #[test]
+    fn a_dm_is_acked_once_and_only_by_its_peer() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bobroger", true);
+        h.connect(CAROL, "carolwolf", true);
+        h.events();
+        h.node.handle_command(dm("bobroger", "psst"));
+        let id = sent_dm_id(&mut h, BOB);
+        assert!(matches!(h.events().as_slice(), [Event::Sent { id: Some(i), .. }] if *i == id));
+        let (bob, carol) = (h.node.peers[&BOB].conn, h.node.peers[&CAROL].conn);
+        h.node.on_frame(carol, CAROL, Frame::Ack { id });
+        h.node.on_frame(bob, BOB, Frame::Ack { id: id + 100 });
+        assert!(h.events().is_empty(), "someone else's ack, or an unknown id, does nothing");
+        h.node.on_frame(bob, BOB, Frame::Ack { id });
+        assert_eq!(h.events(), vec![Event::Delivered { id }]);
+        h.node.on_frame(bob, BOB, Frame::Ack { id });
+        assert!(h.events().is_empty(), "a second ack does nothing");
+        h.node.expire_dms(Instant::now() + ACK_WAIT);
+        assert!(h.events().is_empty(), "a delivered DM never times out");
+    }
+
+    #[test]
+    fn an_unacked_dm_is_not_delivered_after_the_wait() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bobroger", true);
+        h.events();
+        let before = Instant::now();
+        h.node.handle_command(dm("bobroger", "one"));
+        h.node.handle_command(dm("bobroger", "two"));
+        let after = Instant::now();
+        let ids: Vec<u64> =
+            h.sent(BOB).iter().map(|f| if let Frame::Direct { id, .. } = f { *id } else { panic!("{f:?}") }).collect();
+        assert!(ids[0] < ids[1], "ids count up");
+        h.events();
+        h.node.expire_dms(before + ACK_WAIT - Duration::from_millis(1));
+        assert!(h.events().is_empty(), "still within the wait");
+        h.node.expire_dms(after + ACK_WAIT);
+        assert_eq!(h.events(), vec![Event::NotDelivered { ids: ids.clone() }]);
+        let conn = h.node.peers[&BOB].conn;
+        h.node.on_frame(conn, BOB, Frame::Ack { id: ids[0] });
+        assert!(h.events().is_empty(), "a late ack is ignored");
+    }
+
+    #[test]
+    fn a_peer_that_goes_away_fails_its_unacked_dms_at_once() {
+        let mut h = Harness::new();
+        h.connect(BOB, "bobroger", true);
+        h.connect(CAROL, "carolwolf", true);
+        h.events();
+        h.node.handle_command(dm("bobroger", "for bob"));
+        h.node.handle_command(dm("carolwolf", "for carol"));
+        let (to_bob, to_carol) = (sent_dm_id(&mut h, BOB), sent_dm_id(&mut h, CAROL));
+        h.events();
+        let conn = h.node.peers[&BOB].conn;
+        h.node.handle_msg(NodeMsg::PeerGone { conn, id: BOB, reason: LeaveReason::Lost });
+        let events = h.events();
+        assert!(matches!(events.first(), Some(Event::PeerLeft { .. })), "{events:?}");
+        assert_eq!(events.last(), Some(&Event::NotDelivered { ids: vec![to_bob] }));
+        let carol = h.node.peers[&CAROL].conn;
+        h.node.on_frame(carol, CAROL, Frame::Ack { id: to_carol });
+        assert_eq!(h.events(), vec![Event::Delivered { id: to_carol }], "carol's DM is still waiting");
     }
 
     #[test]
@@ -1188,7 +1326,7 @@ pub(super) mod tests {
         h.connect(BOB, "bobroger", true); // conn 2 replaces it
         h.events();
         // bob may have sent this before he switched over too.
-        h.node.on_frame(1, BOB, Frame::Direct { text: "in flight".into(), ts: 0 });
+        h.node.on_frame(1, BOB, Frame::Direct { text: "in flight".into(), ts: 0, id: 0 });
         h.node.handle_msg(NodeMsg::PeerGone { conn: 1, id: BOB, reason: LeaveReason::Lost });
         assert!(matches!(h.events().as_slice(), [Event::Message { text, .. }] if text == "in flight"));
         assert!(h.node.peers.contains_key(&BOB));

@@ -167,7 +167,7 @@ impl Store {
                     c.mentions += u32::from(mention);
                 }
             }
-            Event::Sent { conv, text, ts } => {
+            Event::Sent { conv, text, ts, .. } => {
                 push(self.entry(conv), Line { ts: *ts, kind: LineKind::Mine { text: text.clone() } })
             }
             Event::RoomCreated { name, key, max } => {
@@ -275,7 +275,9 @@ impl Store {
             | Event::Error(_)
             | Event::Info(_)
             | Event::NamePreview { .. }
-            | Event::InviteDeclined { .. } => {}
+            | Event::InviteDeclined { .. }
+            | Event::Delivered { .. }
+            | Event::NotDelivered { .. } => {}
         }
     }
 
@@ -406,7 +408,7 @@ mod tests {
         for i in 0..5 {
             s.apply(&msg(room("catpie"), "bobroger", &format!("m{i}")), 0);
         }
-        s.apply(&Event::Sent { conv: room("catpie"), text: "mine".into(), ts: 2 }, 0);
+        s.apply(&Event::Sent { conv: room("catpie"), text: "mine".into(), ts: 2, id: None }, 0);
         s.switch(room("catpie"));
         s.apply(&msg(room("catpie"), "bobroger", "late"), 0);
         let tail = s.history(2);
@@ -565,7 +567,7 @@ mod tests {
     fn mentions_before_i_have_a_name_do_not_count() {
         let mut s = Store::new();
         s.apply(&msg(dm("bobroger"), "bobroger", "@annmoon early"), 0);
-        s.apply(&Event::Sent { conv: dm("bobroger"), text: "@annmoon me".into(), ts: 2 }, 0);
+        s.apply(&Event::Sent { conv: dm("bobroger"), text: "@annmoon me".into(), ts: 2, id: None }, 0);
         assert_eq!(s.get(&dm("bobroger")).unwrap().mentions, 0);
     }
 
