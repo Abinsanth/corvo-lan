@@ -161,6 +161,14 @@ enum KeyOutcome {
 
 /// Applies an editing, scrolling or tab key. Sending and quitting are left to the caller.
 fn apply_key(session: &mut Session, state: &mut TuiState, action: Action) -> KeyOutcome {
+    if state.welcome {
+        state.welcome = false;
+        return match action {
+            Action::Quit => KeyOutcome::Quit,
+            Action::Redraw => KeyOutcome::Redraw,
+            _ => KeyOutcome::Stay,
+        };
+    }
     if state.help {
         match action {
             Action::Insert('q' | 'Q') | Action::Esc => state.help = false,
@@ -308,6 +316,17 @@ fn note_input(state: &mut TuiState, ev: &TermEvent) {
     }
 }
 
+/// A click, scroll or paste closes the welcome box; moving the mouse doesn't.
+fn closes_welcome(ev: &TermEvent) -> bool {
+    match ev {
+        TermEvent::Mouse(m) => {
+            matches!(m.kind, MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+        }
+        TermEvent::Paste(_) => true,
+        _ => false,
+    }
+}
+
 /// The terminal window gained or lost focus. Coming back counts as seeing what's open.
 fn on_focus(state: &mut TuiState, focused: bool) {
     state.focused = focused;
@@ -449,6 +468,7 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
     let reader = InputThread::start(tx);
     let mut state = TuiState::new(ctx.session.color());
     state.lan = ctx.lan.clone();
+    state.welcome = ctx.welcome;
     state.on_status = ctx.session.store.current().is_none();
     let mut tick = tokio::time::interval(TICK);
     let mut title = String::new();
@@ -524,6 +544,10 @@ async fn on_terminal_event(
         }
         TermEvent::FocusLost => {
             on_focus(state, false);
+            None
+        }
+        TermEvent::Paste(_) | TermEvent::Mouse(_) if state.welcome => {
+            state.welcome = !closes_welcome(&ev);
             None
         }
         TermEvent::Paste(_) | TermEvent::Mouse(_) if state.help => None,
@@ -738,7 +762,7 @@ mod tests {
         let now = Instant::now();
         on_event(&mut s, &mut state, &Event::NamePreview { nick: "bobroger".into() }, now);
         assert!(state.on_status);
-        assert_eq!(last_status(&state), ("you'll be @bobroger — Enter to keep it, or type a name", Tone::Warn));
+        assert_eq!(last_status(&state), ("you'll be @bobroger — Enter to keep, or type a new start", Tone::Warn));
         on_event(&mut s, &mut state, &Event::NamePreview { nick: "luffysunny".into() }, now);
         assert!(last_status(&state).0.contains("@luffysunny"), "each new preview is asked again");
         on_send(&mut s, &mut state, String::new(), now);
@@ -858,8 +882,8 @@ mod tests {
         let mut s = session();
         let mut state = TuiState::new(false);
         let now = Instant::now();
-        on_event(&mut s, &mut state, &Event::Error("no room #x with that key".into()), now);
-        assert_eq!(state.status_lines().last().unwrap().text, "! no room #x with that key");
+        on_event(&mut s, &mut state, &Event::Error("no #x with that key".into()), now);
+        assert_eq!(state.status_lines().last().unwrap().text, "! no #x with that key");
         assert!(state.flash_text(now).is_some());
         on_event(
             &mut s,
@@ -875,10 +899,10 @@ mod tests {
         assert_eq!(state.scroll.unseen(), 1);
         on_event(&mut s, &mut state, &Event::RoomLeft { name: "catpie".into() }, now);
         assert!(state.on_status, "leaving the room you're viewing falls back to corvo");
-        let warn = Event::Info("@bobmoon has a different key from the bob you met before (last seen 2026-10-12). Compare fingerprints in /who.".into());
+        let warn = Event::Info("@bobmoon may not be the bob you met before".into());
         let later = now + Duration::from_secs(60);
         on_event(&mut s, &mut state, &warn, later);
-        assert!(state.flash_text(later).is_some_and(|t| t.contains("different key")), "warnings flash");
+        assert!(state.flash_text(later).is_some_and(|t| t.contains("may not be")), "warnings flash");
     }
 
     #[test]
@@ -994,6 +1018,38 @@ mod tests {
             assert!(!state.help, "{close:?} closes it");
             assert!(state.editor.is_empty(), "{close:?} isn't typed");
         }
+    }
+
+    #[test]
+    fn any_key_closes_the_welcome_box_and_does_nothing_else() {
+        let mut s = session();
+        s.on_event(&Event::NamePreview { nick: "bobroger".into() }, 0);
+        let mut state = TuiState::new(false);
+        let tab = state.current_tab(&s);
+        for key in [Action::Insert('x'), Action::Send, Action::NextTab, Action::Esc, Action::Insert('q')] {
+            state.welcome = true;
+            assert_eq!(apply_key(&mut s, &mut state, key.clone()), KeyOutcome::Stay, "{key:?}");
+            assert!(!state.welcome, "{key:?} closes it");
+            assert!(!state.help, "{key:?} doesn't open help");
+        }
+        assert!(state.editor.is_empty(), "nothing is typed");
+        assert_eq!(state.current_tab(&s), tab, "tabs don't switch");
+        assert!(s.prompt().is_some_and(|p| p.contains("@bobroger")), "Enter didn't answer the name question");
+        state.welcome = true;
+        assert_eq!(apply_key(&mut s, &mut state, Action::Quit), KeyOutcome::Quit, "Ctrl-C still quits");
+    }
+
+    #[test]
+    fn a_click_closes_the_welcome_box_but_moving_the_mouse_doesnt() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseEvent};
+        let mouse = |kind| TermEvent::Mouse(MouseEvent { kind, column: 3, row: 3, modifiers: KeyModifiers::NONE });
+        assert!(closes_welcome(&mouse(MouseEventKind::Down(MouseButton::Left))));
+        assert!(closes_welcome(&mouse(MouseEventKind::Down(MouseButton::Right))));
+        assert!(closes_welcome(&mouse(MouseEventKind::ScrollDown)));
+        assert!(closes_welcome(&TermEvent::Paste("hi".into())));
+        assert!(!closes_welcome(&mouse(MouseEventKind::Moved)));
+        assert!(!closes_welcome(&mouse(MouseEventKind::Up(MouseButton::Left))));
+        assert!(!closes_welcome(&TermEvent::FocusGained));
     }
 
     /// Windows writes some of these through the console API, not as escape codes.

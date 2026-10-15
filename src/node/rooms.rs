@@ -302,7 +302,7 @@ impl Node {
 
     pub(super) fn create_room(&mut self, name: &str, max: u8) {
         if !names::is_valid_name(name) {
-            self.emit(Event::Error(format!("#{name} isn't a room name")));
+            self.emit(Event::Error(format!("#{name} isn't a room name, e.g. #catpie")));
             return;
         }
         if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&max) {
@@ -322,7 +322,7 @@ impl Node {
 
     pub(super) fn join_room(&mut self, name: &str, key: &str) {
         if !names::is_valid_name(name) {
-            self.emit(Event::Error(format!("#{name} isn't a room name")));
+            self.emit(Event::Error(format!("#{name} isn't a room name, e.g. #catpie")));
             return;
         }
         if let Err(e) = room::validate_key(key) {
@@ -1027,7 +1027,7 @@ impl Node {
         }
         if let Some(nick) = self.nick_of(from) {
             let minutes = ts.abs_diff(now_millis()) / 60_000;
-            self.emit(Event::Info(format!("@{nick}'s clock is {minutes} min off; their room messages are ignored")));
+            self.emit(Event::Info(format!("@{nick}'s clock is {minutes} min off — room messages hidden")));
         }
     }
 
@@ -1369,8 +1369,8 @@ mod tests {
         h.node.handle_command(Command::Approve { room: NAME.into(), nick: "bobroger".into() });
         let errors: Vec<String> =
             h.events().into_iter().map(|e| if let Event::Error(m) = e { m } else { panic!("{e:?}") }).collect();
-        assert_eq!(errors[0], "#chat isn't a room name");
-        assert_eq!(errors[1], "#catPie isn't a room name");
+        assert_eq!(errors[0], "#chat isn't a room name, e.g. #catpie");
+        assert_eq!(errors[1], "#catPie isn't a room name, e.g. #catpie");
         assert!(errors[2].starts_with("a room key is 6"));
         assert_eq!(errors[3..], ["you're not in #catpie"; 3]);
         assert!(h.sent(BOB).is_empty());
@@ -1965,10 +1965,7 @@ mod tests {
         for text in ["one", "two"] {
             deliver(&mut h, BOB, frame_at(BOB, &keys, ten_min_ago, RoomBody::Chat { text: text.into() }));
         }
-        assert_eq!(
-            h.events(),
-            vec![Event::Info("@bobroger's clock is 10 min off; their room messages are ignored".into())]
-        );
+        assert_eq!(h.events(), vec![Event::Info("@bobroger's clock is 10 min off — room messages hidden".into())]);
     }
 
     #[tokio::test]

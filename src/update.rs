@@ -473,10 +473,16 @@ fn curl_error(code: Option<i32>, stderr: &str) -> String {
         // DNS, connect, timeout, TLS handshake.
         Some(6 | 7 | 28 | 35) => "couldn't reach GitHub (offline?)".into(),
         Some(22) => match stderr.rsplit_once("error: ").and_then(|(_, n)| n.trim().parse::<u16>().ok()) {
-            Some(status) => format!("GitHub said no (HTTP {status}); try again later"),
-            None => "GitHub said no; try again later".into(),
+            Some(status) => {
+                tracing::debug!("update server answered HTTP {status}");
+                "update server busy — try later".into()
+            }
+            None => "update server busy — try later".into(),
         },
-        Some(n) => format!("curl failed (exit {n})"),
+        Some(n) => {
+            tracing::debug!("curl exited with {n}");
+            "download failed — check internet".into()
+        }
         None => "curl was stopped".into(),
     }
 }
@@ -859,9 +865,9 @@ mod tests {
             assert_eq!(curl_error(Some(code), ""), "couldn't reach GitHub (offline?)");
         }
         let forbidden = "curl: (22) The requested URL returned error: 403";
-        assert_eq!(curl_error(Some(22), forbidden), "GitHub said no (HTTP 403); try again later");
-        assert_eq!(curl_error(Some(22), "curl: (22) weird"), "GitHub said no; try again later");
-        assert_eq!(curl_error(Some(37), ""), "curl failed (exit 37)");
+        assert_eq!(curl_error(Some(22), forbidden), "update server busy — try later");
+        assert_eq!(curl_error(Some(22), "curl: (22) weird"), "update server busy — try later");
+        assert_eq!(curl_error(Some(37), ""), "download failed — check internet");
         assert_eq!(curl_error(None, ""), "curl was stopped");
     }
 }
