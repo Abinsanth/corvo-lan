@@ -4,7 +4,7 @@
 pub mod state;
 pub mod view;
 
-use std::io::{Stdout, stdout};
+use std::io::{Stdout, Write, stdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -50,16 +50,23 @@ const RESTORE_TITLE: &str = "\x1b[23;0t";
 
 /// Best-effort and idempotent: puts the terminal back the way line mode expects.
 fn restore_terminal() {
-    let _ = execute!(
-        stdout(),
+    let _ = restore_to(&mut stdout());
+    let _ = disable_raw_mode();
+}
+
+/// The escape codes `restore_terminal` writes.
+fn restore_to(out: &mut impl Write) -> std::io::Result<()> {
+    execute!(
+        out,
         PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
         DisableFocusChange,
         LeaveAlternateScreen,
+        // Our unread count mustn't outlive us where there's no title stack.
+        SetTitle(""),
         Print(RESTORE_TITLE)
-    );
-    let _ = disable_raw_mode();
+    )
 }
 
 /// Restores the terminal before a panic message prints, so it stays usable.
@@ -244,6 +251,14 @@ fn say(state: &mut TuiState, text: &str, now: Instant) {
 /// BEL: the terminal beeps, flashes or badges the window, however the user set it up.
 fn ring_bell() {
     let _ = execute!(stdout(), Print('\x07'));
+}
+
+/// Typing, clicking or pasting means the window has focus, even if the
+/// terminal never said it came back.
+fn note_input(state: &mut TuiState, ev: &TermEvent) {
+    if !state.focused && matches!(ev, TermEvent::Key(_) | TermEvent::Mouse(_) | TermEvent::Paste(_)) {
+        on_focus(state, true);
+    }
 }
 
 /// The terminal window gained or lost focus. Coming back counts as seeing what's open.
@@ -444,6 +459,7 @@ async fn on_terminal_event(
     ev: TermEvent,
 ) -> anyhow::Result<bool> {
     let now = Instant::now();
+    note_input(state, &ev);
     let reaction = match ev {
         TermEvent::Key(key) => match action_for(key).map(|a| apply_key(&mut ctx.session, state, a)) {
             Some(KeyOutcome::Send(text)) => on_send(&mut ctx.session, state, text, now),
@@ -573,6 +589,19 @@ mod tests {
         on_focus(&mut state, true);
         state.on_status = true;
         assert!(rings(&mut s, &mut state, &room("@annmoon look")), "a mention while on the corvo tab");
+    }
+
+    #[test]
+    fn typing_brings_the_window_back_even_without_a_focus_event() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = TuiState::new(false);
+        on_focus(&mut state, false);
+        state.away = 2;
+        note_input(&mut state, &TermEvent::FocusLost);
+        assert!(!state.focused, "only input counts");
+        note_input(&mut state, &TermEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(state.focused);
+        assert_eq!(state.away, 0);
     }
 
     #[test]
@@ -889,6 +918,18 @@ mod tests {
             assert!(!state.help, "{close:?} closes it");
             assert!(state.editor.is_empty(), "{close:?} isn't typed");
         }
+    }
+
+    /// Windows writes some of these through the console API, not as escape codes.
+    #[cfg(unix)]
+    #[test]
+    fn leaving_clears_our_title_before_restoring_the_saved_one() {
+        let mut out = Vec::new();
+        restore_to(&mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let clear = out.find("\x1b]0;\x07").expect("title cleared, for terminals without a title stack");
+        assert!(out.ends_with(RESTORE_TITLE), "{out:?}");
+        assert!(clear < out.len() - RESTORE_TITLE.len(), "cleared first, so a saved title wins: {out:?}");
     }
 
     #[test]
