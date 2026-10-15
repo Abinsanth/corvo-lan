@@ -104,7 +104,6 @@ Then you're connected to everyone else running it. With `--nick` it skips the qu
 /msg @bobroger hi          # one-off private message
 /chat bob                  # the @ or # is optional when only one name matches
 /who                       # who's connected
-/bell                      # ring for private messages and mentions (off at start)
 /update [yes]              # check for and install a newer version
 /close [@nick]             # close a private chat (TUI)
 /help  /h                  # show commands (q or Esc closes it)
@@ -121,13 +120,11 @@ bottom line shows your `ip` and `port`: on most home and office networks,
 people on the same LAN share the first three numbers of the ip. To select
 text, hold Shift (Option on macOS) while dragging.
 
-A private message you send shows a mark after the time: `·` while it's on its
-way, `✓` once the other app has it, and `✗` if it didn't arrive within 5
-seconds (say they closed the lid). Nothing is resent, so press ↑ to bring it
-back and send it again. `/bell` rings the terminal bell when a private message
-or a mention of you arrives somewhere you aren't looking; it's off each time
-corvo-lan starts, and the bottom line shows 🔔 or 🔕. The window title shows
-how many messages you haven't read.
+In a private chat, each line has a mark after the time: `←` for messages you
+received, and for yours `·` while it's on its way, `✓` once the other app has
+it, or `✗` if it didn't arrive within 5 seconds (say they closed the lid).
+Nothing is resent, so press ↑ to bring it back and send it again. The window
+title shows how many messages you haven't read.
 
 ### Rooms
 

@@ -108,7 +108,7 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
     let sender_w = c.lines.iter().filter_map(|l| sender_of(&l.kind)).map(|s| s.chars().count()).max().unwrap_or(1);
     let sender_w = sender_w.clamp(1, MAX_SENDER);
     let dim = tone_style(Tone::Dim, color);
-    // DM tabs get a delivery column after the time: · waiting, ✓ delivered, ✗ not.
+    // DM tabs get a column after the time: ← theirs; ours · waiting, ✓ delivered, ✗ not.
     let marks = matches!(conv, Conv::Dm(_));
     let mark_w = if marks { 2 } else { 0 };
     let mut out = Vec::new();
@@ -141,6 +141,7 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
                         LineKind::Mine { delivery: Some(Delivery::Failed), .. } => {
                             Span::styled("✗ ", tone_style(Tone::Bad, color))
                         }
+                        LineKind::Msg { .. } => Span::styled("← ", dim),
                         _ => Span::raw("  "),
                     });
                 }
@@ -436,8 +437,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, session: &Session, state: &Tui
     } else {
         let me = session.store.me().map_or_else(|| "…".into(), display);
         let online = session.store.online().count();
-        let bell = if state.bell { "🔔" } else { "🔕" };
-        let mut text = format!("{bell} @{me} · {online} online · /help");
+        let mut text = format!("@{me} · {online} online · /help");
         if !state.lan.is_empty() {
             text = format!("{text} · {}", state.lan);
         }
@@ -664,7 +664,7 @@ mod tests {
         let all = rows(&buf);
         let row = |needle: &str| all.iter().find(|r| r.contains(needle)).unwrap_or_else(|| panic!("{all:#?}")).clone();
         let t = hhmm(0);
-        assert!(row("hey").starts_with(&format!("{t}   @bobRoger hey")), "{}", row("hey"));
+        assert!(row("hey").starts_with(&format!("{t} ← @bobRoger hey")), "{}", row("hey"));
         assert!(row("waiting").starts_with(&format!("{t} · @annMoon  waiting")), "{}", row("waiting"));
         assert!(row("arrived").starts_with(&format!("{t} ✓ @annMoon  arrived")), "{}", row("arrived"));
         assert!(row("lost").starts_with(&format!("{t} ✗ @annMoon  lost")), "{}", row("lost"));
@@ -703,16 +703,11 @@ mod tests {
         assert_eq!(buf[(x, y)].fg, Color::Red);
         term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
         let bottom = rows(term.backend().buffer()).pop().unwrap();
-        // The bell is two cells wide; the cell it covers reads as a space here.
-        assert_eq!(bottom.trim_end(), "🔕  @annMoon · 2 online · /help", "nothing to add before the address is known");
+        assert_eq!(bottom.trim_end(), "@annMoon · 2 online · /help", "nothing to add before the address is known");
         state.lan = lan_label(Some(Ipv4Addr::new(192, 168, 1, 9)), 54321);
         term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
         let bottom = rows(term.backend().buffer()).pop().unwrap();
-        assert_eq!(bottom.trim_end(), "🔕  @annMoon · 2 online · /help · ip 192.168.1.9 · port 54321");
-        state.bell = true;
-        term.draw(|f| draw(f, &s, &mut state, now + FLASH_FOR)).unwrap();
-        let bottom = rows(term.backend().buffer()).pop().unwrap();
-        assert!(bottom.starts_with("🔔  @annMoon"), "{bottom}");
+        assert_eq!(bottom.trim_end(), "@annMoon · 2 online · /help · ip 192.168.1.9 · port 54321");
     }
 
     #[test]

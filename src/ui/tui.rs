@@ -248,11 +248,6 @@ fn say(state: &mut TuiState, text: &str, now: Instant) {
     }
 }
 
-/// BEL: the terminal beeps, flashes or badges the window, however the user set it up.
-fn ring_bell() {
-    let _ = execute!(stdout(), Print('\x07'));
-}
-
 /// Typing, clicking or pasting means the window has focus, even if the
 /// terminal never said it came back.
 fn note_input(state: &mut TuiState, ev: &TermEvent) {
@@ -325,10 +320,6 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
         state.popup = None;
         state.help = true;
     }
-    if reaction.bell {
-        let line = state.toggle_bell();
-        say(state, line, now);
-    }
     let complained = reaction.print.iter().any(|l| l.starts_with("! "));
     for line in std::mem::take(&mut reaction.print) {
         say(state, &line, now);
@@ -342,8 +333,8 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     Some(reaction)
 }
 
-/// An event from the node. Returns whether to ring the bell.
-fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Instant) -> bool {
+/// An event from the node.
+fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Instant) {
     let before = session.store.current().cloned();
     let text = session.on_event(event, now_millis());
     if goes_to_status(event)
@@ -377,7 +368,6 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
     {
         ask(session, state, &question, now);
     }
-    state.worth_a_ring(session, event) && state.ring(now)
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -427,11 +417,7 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
                 }
             }
             event = ctx.events.recv() => match event {
-                Some(event) => {
-                    if on_event(&mut ctx.session, &mut state, &event, Instant::now()) {
-                        ring_bell();
-                    }
-                }
+                Some(event) => on_event(&mut ctx.session, &mut state, &event, Instant::now()),
                 None => {
                     drop(reader);
                     drop(guard);
@@ -529,7 +515,6 @@ async fn act(ctx: &mut Ctx, reaction: Option<Reaction>) -> anyhow::Result<bool> 
 
 #[cfg(test)]
 mod tests {
-    use super::state::BELL_GAP;
     use super::*;
     use crate::api::{Conv, Event, PeerId, Target};
 
@@ -538,57 +523,6 @@ mod tests {
         s.on_event(&Event::Assigned { nick: "annmoon".into(), renamed: false }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobroger".into() }, 0);
         s
-    }
-
-    #[test]
-    fn bell_is_off_at_start_and_bell_toggles_it() {
-        let mut s = session();
-        let mut state = TuiState::new(false);
-        let now = Instant::now();
-        assert!(!state.bell);
-        let r = on_send(&mut s, &mut state, "/bell".into(), now).unwrap();
-        assert!(r.commands.is_empty());
-        assert!(state.bell);
-        assert_eq!(last_status(&state).0, "* bell on — rings for DMs and mentions of you");
-        on_send(&mut s, &mut state, "/bell".into(), now);
-        assert!(!state.bell);
-        assert_eq!(last_status(&state).0, "* bell off");
-    }
-
-    #[test]
-    fn the_bell_rings_for_dms_and_mentions_out_of_sight() {
-        let mut s = session(); // annmoon, with bobroger online
-        let mut state = TuiState::new(false);
-        let joined = Event::RoomJoined { name: "catpie".into(), key: "k7m9xq".into(), max: 13, members: vec![] };
-        let mut at = Instant::now();
-        on_event(&mut s, &mut state, &joined, at); // now looking at #catpie
-        let dm = |text: &str| Event::Message {
-            conv: Conv::Dm("bobroger".into()),
-            from: "bobroger".into(),
-            text: text.into(),
-            ts: 0,
-        };
-        let room = |text: &str| Event::Message {
-            conv: Conv::Room("catpie".into()),
-            from: "bobroger".into(),
-            text: text.into(),
-            ts: 0,
-        };
-        let mut rings = |s: &mut Session, state: &mut TuiState, e: &Event| {
-            at += BELL_GAP;
-            on_event(s, state, e, at)
-        };
-        assert!(!rings(&mut s, &mut state, &dm("psst")), "silent until /bell");
-        state.bell = true;
-        assert!(rings(&mut s, &mut state, &dm("psst")), "a DM in another tab");
-        assert!(!rings(&mut s, &mut state, &room("@annmoon look")), "a mention in plain view");
-        assert!(!rings(&mut s, &mut state, &room("hi all")), "room chatter");
-        on_focus(&mut state, false);
-        assert!(rings(&mut s, &mut state, &room("@annmoon look")), "a mention while the window is away");
-        assert!(!rings(&mut s, &mut state, &room("hi all")), "room chatter, even then");
-        on_focus(&mut state, true);
-        state.on_status = true;
-        assert!(rings(&mut s, &mut state, &room("@annmoon look")), "a mention while on the corvo tab");
     }
 
     #[test]
