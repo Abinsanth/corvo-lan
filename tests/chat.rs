@@ -170,6 +170,17 @@ async fn dm_reaches_its_target() {
 }
 
 #[tokio::test]
+async fn a_dm_is_confirmed_delivered() {
+    let (mut alice, mut bob) = pair().await;
+    say(&bob, Target::Dm(alice.nick.clone()), "hello").await;
+    let sent = wait_for(&mut bob.node, "sent", |e| matches!(e, Event::Sent { .. })).await;
+    let Event::Sent { id: Some(id), .. } = sent else { panic!("a DM has an id: {sent:?}") };
+    wait_for(&mut alice.node, "dm", |e| matches!(e, Event::Message { .. })).await;
+    let delivered = wait_for(&mut bob.node, "ack", |e| matches!(e, Event::Delivered { .. })).await;
+    assert_eq!(delivered, Event::Delivered { id });
+}
+
+#[tokio::test]
 async fn room_messages_reach_members_only() {
     let (mut alice, mut bob, mut carol) = trio().await;
     let (room, key) = create_room(&mut alice, "cat").await;
