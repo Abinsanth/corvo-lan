@@ -9,10 +9,26 @@ use crate::api::{Conv, Event, RequestEnd};
 pub const MAX_LINES: usize = 1000;
 pub const MAX_CONVS: usize = 256;
 
+/// Where a DM we sent is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Sent as this id; waiting for the ack.
+    Waiting(u64),
+    Delivered,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineKind {
-    Msg { from: String, text: String },
-    Mine { text: String },
+    Msg {
+        from: String,
+        text: String,
+    },
+    /// `delivery` is for a DM; room messages have none.
+    Mine {
+        text: String,
+        delivery: Option<Delivery>,
+    },
     Notice(String),
 }
 
@@ -167,8 +183,34 @@ impl Store {
                     c.mentions += u32::from(mention);
                 }
             }
-            Event::Sent { conv, text, ts, .. } => {
-                push(self.entry(conv), Line { ts: *ts, kind: LineKind::Mine { text: text.clone() } })
+            Event::Sent { conv, text, ts, id } => {
+                let kind = LineKind::Mine { text: text.clone(), delivery: id.map(Delivery::Waiting) };
+                push(self.entry(conv), Line { ts: *ts, kind })
+            }
+            Event::Delivered { id } => {
+                self.settle_dm(*id, Delivery::Delivered);
+            }
+            Event::NotDelivered { ids } => {
+                // (conversation index, how many failed there), in first-seen order.
+                let mut failed: Vec<(usize, u32)> = Vec::new();
+                for id in ids {
+                    let Some(i) = self.settle_dm(*id, Delivery::Failed) else { continue };
+                    match failed.iter_mut().find(|(j, _)| *j == i) {
+                        Some((_, n)) => *n += 1,
+                        None => failed.push((i, 1)),
+                    }
+                }
+                for (i, n) in failed {
+                    let unread = self.current.as_ref() != Some(&self.convs[i].conv);
+                    let text = if n == 1 {
+                        "message not delivered".to_string()
+                    } else {
+                        format!("{n} messages not delivered")
+                    };
+                    let c = &mut self.convs[i];
+                    push(c, Line { ts: now, kind: LineKind::Notice(text) });
+                    c.unread += u32::from(unread);
+                }
             }
             Event::RoomCreated { name, key, max } => {
                 let c = self.entry(&Conv::Room(name.clone()));
@@ -275,9 +317,7 @@ impl Store {
             | Event::Error(_)
             | Event::Info(_)
             | Event::NamePreview { .. }
-            | Event::InviteDeclined { .. }
-            | Event::Delivered { .. }
-            | Event::NotDelivered { .. } => {}
+            | Event::InviteDeclined { .. } => {}
         }
     }
 
@@ -324,6 +364,21 @@ impl Store {
 
     fn find_mut(&mut self, conv: &Conv) -> Option<&mut Conversation> {
         self.convs.iter_mut().find(|c| &c.conv == conv)
+    }
+
+    /// Moves our DM `id` from waiting to `to`; returns its conversation's index.
+    /// A DM that's already settled, or gone, is left alone.
+    fn settle_dm(&mut self, id: u64, to: Delivery) -> Option<usize> {
+        self.convs.iter_mut().enumerate().filter(|(_, c)| matches!(c.conv, Conv::Dm(_))).find_map(|(i, c)| {
+            let line =
+                c.lines.iter_mut().rev().find(
+                    |l| matches!(l.kind, LineKind::Mine { delivery: Some(Delivery::Waiting(w)), .. } if w == id),
+                )?;
+            if let LineKind::Mine { delivery, .. } = &mut line.kind {
+                *delivery = Some(to);
+            }
+            Some(i)
+        })
     }
 
     fn entry(&mut self, conv: &Conv) -> &mut Conversation {
@@ -400,6 +455,64 @@ mod tests {
         assert_eq!(s.current(), Some(&dm("bobroger")));
     }
 
+    fn mine(text: &str, delivery: Option<Delivery>) -> LineKind {
+        LineKind::Mine { text: text.into(), delivery }
+    }
+
+    fn sent_dm(to: &str, text: &str, id: u64) -> Event {
+        Event::Sent { conv: dm(to), text: text.into(), ts: 1, id: Some(id) }
+    }
+
+    #[test]
+    fn a_dm_waits_then_is_delivered_or_not() {
+        let mut s = Store::new();
+        s.switch(dm("bobroger"));
+        s.apply(&sent_dm("bobroger", "one", 1), 0);
+        s.apply(&sent_dm("bobroger", "two", 2), 0);
+        s.apply(&sent_dm("bobroger", "three", 3), 0);
+        s.apply(&Event::Sent { conv: room("catpie"), text: "hey".into(), ts: 1, id: None }, 0);
+        assert_eq!(s.get(&dm("bobroger")).unwrap().lines[0].kind, mine("one", Some(Delivery::Waiting(1))));
+        s.apply(&Event::Delivered { id: 1 }, 0);
+        s.apply(&Event::NotDelivered { ids: vec![2, 3] }, 5);
+        let kinds: Vec<LineKind> = s.get(&dm("bobroger")).unwrap().lines.iter().map(|l| l.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                mine("one", Some(Delivery::Delivered)),
+                mine("two", Some(Delivery::Failed)),
+                mine("three", Some(Delivery::Failed)),
+                LineKind::Notice("2 messages not delivered".into()),
+            ]
+        );
+        assert_eq!(s.get(&dm("bobroger")).unwrap().unread, 0, "seen as it happened");
+        assert_eq!(s.get(&room("catpie")).unwrap().lines[0].kind, mine("hey", None));
+    }
+
+    #[test]
+    fn a_failure_in_another_tab_is_unread_and_stays_failed() {
+        let mut s = Store::new();
+        s.apply(&sent_dm("bobroger", "hi", 9), 0);
+        s.switch(room("catpie"));
+        s.apply(&Event::NotDelivered { ids: vec![9, 77] }, 0);
+        s.apply(&Event::Delivered { id: 9 }, 0);
+        s.apply(&Event::Delivered { id: 78 }, 0);
+        let c = s.get(&dm("bobroger")).unwrap();
+        assert_eq!(c.lines[0].kind, mine("hi", Some(Delivery::Failed)), "a late ack doesn't undo it");
+        assert_eq!(c.lines[1].kind, LineKind::Notice("message not delivered".into()));
+        assert_eq!(c.unread, 1);
+        assert!(s.get(&room("catpie")).unwrap().lines.is_empty(), "unknown ids touch nothing");
+    }
+
+    #[test]
+    fn delivery_follows_a_renamed_dm() {
+        let mut s = Store::new();
+        s.apply(&Event::PeerJoined { id: PeerId::test(1), nick: "bobroger".into() }, 0);
+        s.apply(&sent_dm("bobroger", "hi", 4), 0);
+        s.apply(&Event::Renamed { old: "bobroger".into(), new: "bobpie".into() }, 0);
+        s.apply(&Event::Delivered { id: 4 }, 0);
+        assert_eq!(s.get(&dm("bobpie")).unwrap().lines[0].kind, mine("hi", Some(Delivery::Delivered)));
+    }
+
     #[test]
     fn history_returns_the_tail_and_marks_read() {
         let mut s = Store::new();
@@ -412,7 +525,7 @@ mod tests {
         s.switch(room("catpie"));
         s.apply(&msg(room("catpie"), "bobroger", "late"), 0);
         let tail = s.history(2);
-        assert_eq!(tail[0].kind, LineKind::Mine { text: "mine".into() });
+        assert_eq!(tail[0].kind, LineKind::Mine { text: "mine".into(), delivery: None });
         assert_eq!(tail[1].kind, LineKind::Msg { from: "bobroger".into(), text: "late".into() });
         assert_eq!(s.get(&room("catpie")).unwrap().unread, 0);
         assert_eq!(s.history(100).len(), 7);

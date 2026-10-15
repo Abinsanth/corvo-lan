@@ -123,7 +123,7 @@ pub fn tone_of_text(text: &str) -> Tone {
 pub fn tone_of_notice(text: &str) -> Tone {
     if text.ends_with(" joined") || text.starts_with("created ") || text.starts_with("joined ") {
         Tone::Good
-    } else if text.ends_with(" left") {
+    } else if text.ends_with(" left") || text.ends_with("not delivered") {
         Tone::Bad
     } else {
         Tone::Dim

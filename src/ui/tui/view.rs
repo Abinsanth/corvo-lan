@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use super::state::{Editor, Hit, MAX_INPUT_ROWS, Tab, TuiState, tabs};
 use crate::api::Conv;
-use crate::convo::{LineKind, mentions};
+use crate::convo::{Delivery, LineKind, mentions};
 use crate::names::{display, display_in};
 use crate::ui::render::{Tone, clean, hhmm, nick_color, tone_of_notice};
 use crate::ui::session::{HELP, Session};
@@ -108,6 +108,9 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
     let sender_w = c.lines.iter().filter_map(|l| sender_of(&l.kind)).map(|s| s.chars().count()).max().unwrap_or(1);
     let sender_w = sender_w.clamp(1, MAX_SENDER);
     let dim = tone_style(Tone::Dim, color);
+    // DM tabs get a delivery column after the time: · waiting, ✓ delivered, ✗ not.
+    let marks = matches!(conv, Conv::Dm(_));
+    let mark_w = if marks { 2 } else { 0 };
     let mut out = Vec::new();
     for l in &c.lines {
         let time = Span::styled(format!("{} ", hhmm(l.ts)), dim);
@@ -121,7 +124,7 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
                 let nick = nick_of(kind).unwrap_or_default();
                 let label = format!("{:<sender_w$} ", truncate(&sender, sender_w));
                 let text = match kind {
-                    LineKind::Msg { text, .. } | LineKind::Mine { text } => text.as_str(),
+                    LineKind::Msg { text, .. } | LineKind::Mine { text, .. } => text.as_str(),
                     LineKind::Notice(_) => "",
                 };
                 let body_style = match kind {
@@ -130,8 +133,19 @@ fn conversation_rows(session: &Session, conv: &Conv, width: usize, color: bool) 
                     }
                     _ => Style::default(),
                 };
-                let prefix = vec![time, Span::styled(label, nick_style(&nick, color))];
-                out.extend(message_rows(prefix, TIME_WIDTH + sender_w + 1, text, body_style, width));
+                let mut prefix = vec![time];
+                if marks {
+                    prefix.push(match kind {
+                        LineKind::Mine { delivery: Some(Delivery::Waiting(_)), .. } => Span::styled("· ", dim),
+                        LineKind::Mine { delivery: Some(Delivery::Delivered), .. } => Span::styled("✓ ", dim),
+                        LineKind::Mine { delivery: Some(Delivery::Failed), .. } => {
+                            Span::styled("✗ ", tone_style(Tone::Bad, color))
+                        }
+                        _ => Span::raw("  "),
+                    });
+                }
+                prefix.push(Span::styled(label, nick_style(&nick, color)));
+                out.extend(message_rows(prefix, TIME_WIDTH + mark_w + sender_w + 1, text, body_style, width));
             }
         }
     }
@@ -616,6 +630,35 @@ mod tests {
         assert!(find(&render(&s, &mut state, 69, 20), "● carolWolf").is_none());
         let tiny = render(&s, &mut state, 39, 9);
         assert!(find(&tiny, "terminal too small").is_some());
+    }
+
+    #[test]
+    fn dm_lines_show_a_delivery_mark_after_the_time() {
+        let mut s = session(); // annmoon, with bobroger online
+        s.on_line("/chat @bobroger", None);
+        let bob = || Conv::Dm("bobroger".into());
+        let sent = |text: &str, id| Event::Sent { conv: bob(), text: text.into(), ts: 0, id: Some(id) };
+        s.on_event(&Event::Message { conv: bob(), from: "bobroger".into(), text: "hey".into(), ts: 0 }, 0);
+        s.on_event(&sent("waiting", 1), 0);
+        s.on_event(&sent("arrived", 2), 0);
+        s.on_event(&sent("lost", 3), 0);
+        s.on_event(&Event::Delivered { id: 2 }, 0);
+        s.on_event(&Event::NotDelivered { ids: vec![3] }, 0);
+        let mut state = TuiState::new(true);
+        state.on_status = false;
+        let buf = render(&s, &mut state, 80, 20);
+        let all = rows(&buf);
+        let row = |needle: &str| all.iter().find(|r| r.contains(needle)).unwrap_or_else(|| panic!("{all:#?}")).clone();
+        let t = hhmm(0);
+        assert!(row("hey").starts_with(&format!("{t}   @bobRoger hey")), "{}", row("hey"));
+        assert!(row("waiting").starts_with(&format!("{t} · @annMoon  waiting")), "{}", row("waiting"));
+        assert!(row("arrived").starts_with(&format!("{t} ✓ @annMoon  arrived")), "{}", row("arrived"));
+        assert!(row("lost").starts_with(&format!("{t} ✗ @annMoon  lost")), "{}", row("lost"));
+        assert!(row("message not delivered").starts_with(&format!("{t} * message not delivered")));
+        let (x, y) = find(&buf, "✗").unwrap();
+        assert_eq!(buf[(x, y)].fg, Color::Red);
+        let (x, y) = find(&buf, "message not delivered").unwrap();
+        assert_eq!(buf[(x, y)].fg, Color::Red);
     }
 
     #[test]
