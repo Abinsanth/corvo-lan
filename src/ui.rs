@@ -9,6 +9,7 @@ pub mod tui;
 pub mod updates;
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
@@ -18,22 +19,42 @@ use self::updates::Updater;
 use crate::api::{Command, Event};
 use crate::discovery;
 use crate::node::NodeHandle;
+use crate::update::Version;
 
 pub struct Options {
-    pub check_updates: bool,
+    /// This binary, captured at startup: an update replaces it, and a restart runs it.
+    pub exe: Option<PathBuf>,
+    /// We were just restarted by an update: don't force another one.
+    pub after_update: bool,
 }
 
-/// Output from background work (`/update`), shown in the corvo tab.
+/// How the UI ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Notice {
-    pub text: String,
-    pub tone: Tone,
+pub enum Exit {
+    Quit,
+    /// Start the newly installed version, keeping `name` if there was one.
+    Restart {
+        name: Option<String>,
+    },
+}
+
+/// Output from background work (`/update`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// A line for the corvo tab.
+    Line { text: String, tone: Tone },
+    /// How far a download got; replaces the previous progress line.
+    Progress(String),
+    /// `version` can be installed: ask whether to.
+    Offer(Version),
+    /// `version` is installed. `forced` restarts at once; otherwise ask.
+    Installed { version: Version, forced: bool },
 }
 
 impl Notice {
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
-        Notice { tone: tone_of_text(&text), text }
+        Notice::Line { tone: tone_of_text(&text), text }
     }
 }
 
@@ -47,6 +68,8 @@ pub struct Ctx {
     pub updater: Updater,
     /// Our LAN address for the status bar.
     pub lan: String,
+    /// The user chose to restart into a newly installed version.
+    pub restart: bool,
 }
 
 impl Ctx {
@@ -57,7 +80,8 @@ impl Ctx {
     /// Carries out a reaction's commands and update; says whether to quit.
     /// The caller shows `reaction.print` first.
     pub async fn act(&mut self, reaction: Reaction) -> anyhow::Result<bool> {
-        if reaction.quit {
+        if reaction.quit || reaction.restart {
+            self.restart |= reaction.restart;
             let _ = self.commands.send(Command::Quit).await;
             return Ok(true);
         }
@@ -92,20 +116,19 @@ async fn run_ui(
 }
 
 /// Runs the full-screen UI until the user quits, then waits for the Node to say goodbye.
-pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<()> {
+pub async fn run(handle: NodeHandle, opts: Options) -> anyhow::Result<Exit> {
     let NodeHandle { commands, events, task, local_addr, .. } = handle;
     let lan = tui::view::lan_label(discovery::lan_ip(), local_addr.port());
     tui::install_panic_hook();
     let (notice_tx, notices) = mpsc::unbounded_channel();
-    let updater = Updater::new(notice_tx.clone());
-    if opts.check_updates {
-        updater.check_at_startup();
-    }
+    let updater = Updater::new(notice_tx.clone(), opts.exe);
+    updater.check_at_startup(!opts.after_update);
     let session = Session::new(Style::detect().color);
-    let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater, lan };
+    let mut ctx = Ctx { session, commands, events, notices, notice_tx, updater, lan, restart: false };
     let result = run_ui(&mut ctx, std::io::stdout().is_terminal(), tui::run).await;
     let _ = task.await;
-    result
+    result?;
+    Ok(if ctx.restart { Exit::Restart { name: ctx.session.store.me().map(str::to_string) } } else { Exit::Quit })
 }
 
 #[cfg(test)]
@@ -127,10 +150,19 @@ mod tests {
             events,
             notices,
             notice_tx: notice_tx.clone(),
-            updater: Updater::new(notice_tx),
+            updater: Updater::new(notice_tx, None),
             lan: String::new(),
+            restart: false,
         };
         (ctx, event_tx, cmd_rx)
+    }
+
+    #[tokio::test]
+    async fn a_restart_quits_and_is_remembered() {
+        let (mut ctx, _event_tx, mut cmd_rx) = ctx();
+        assert!(ctx.act(Reaction { restart: true, ..Default::default() }).await.unwrap());
+        assert!(ctx.restart);
+        assert_eq!(cmd_rx.recv().await, Some(Command::Quit));
     }
 
     #[tokio::test]
@@ -141,7 +173,7 @@ mod tests {
         assert_eq!(cmd_rx.recv().await, Some(Command::Quit));
         assert!(!ctx.act(Reaction::send(Command::ListPeers)).await.unwrap());
         assert_eq!(cmd_rx.recv().await, Some(Command::ListPeers));
-        assert_eq!(Notice::new("! boom").tone, Tone::Bad);
+        assert_eq!(Notice::new("! boom"), Notice::Line { text: "! boom".into(), tone: Tone::Bad });
     }
 
     #[tokio::test]

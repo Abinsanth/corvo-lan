@@ -236,7 +236,7 @@ mod tests {
         let frames = vec![
             Frame::Hello { v: PROTOCOL_VERSION, nick: "alicemoon".into() },
             Frame::Room { room_id: "ab".repeat(16), nonce: "cd".repeat(24), ct: "ef".repeat(20) },
-            Frame::Direct { text: "psst".into(), ts: 2 },
+            Frame::Direct { text: "psst".into(), ts: 2, id: 0 },
             Frame::Nick { nick: "bob".into() },
             Frame::Ping,
             Frame::Bye,
@@ -253,7 +253,7 @@ mod tests {
     async fn frames_are_not_readable_on_the_wire() {
         let ((mut seal, _), _) = test_pair().await;
         let mut wire: Vec<u8> = Vec::new();
-        seal.write_frame(&mut wire, &Frame::Direct { text: "secret plans".into(), ts: 0 }).await.unwrap();
+        seal.write_frame(&mut wire, &Frame::Direct { text: "secret plans".into(), ts: 0, id: 0 }).await.unwrap();
         assert!(!wire.windows(6).any(|w| w == b"secret"));
         let len = u16::from_be_bytes([wire[0], wire[1]]) as usize;
         assert_eq!(len, wire.len() - 2);
@@ -285,7 +285,7 @@ mod tests {
     async fn an_oversized_frame_is_refused_without_writing() {
         let ((mut seal, _), _) = test_pair().await;
         let mut wire: Vec<u8> = Vec::new();
-        let big = Frame::Direct { text: "x".repeat(MAX_FRAME_LEN), ts: 0 };
+        let big = Frame::Direct { text: "x".repeat(MAX_FRAME_LEN), ts: 0, id: 0 };
         let err = seal.write_frame(&mut wire, &big).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(wire.is_empty());
@@ -294,8 +294,8 @@ mod tests {
     #[tokio::test]
     async fn a_frame_at_the_limit_goes_through() {
         let ((mut seal, _), (_, mut open)) = test_pair().await;
-        let overhead = serde_json::to_vec(&Frame::Direct { text: String::new(), ts: 0 }).unwrap().len();
-        let frame = Frame::Direct { text: "x".repeat(MAX_FRAME_LEN - overhead), ts: 0 };
+        let overhead = serde_json::to_vec(&Frame::Direct { text: String::new(), ts: 0, id: 0 }).unwrap().len();
+        let frame = Frame::Direct { text: "x".repeat(MAX_FRAME_LEN - overhead), ts: 0, id: 0 };
         let mut wire: Vec<u8> = Vec::new();
         seal.write_frame(&mut wire, &frame).await.unwrap();
         let mut reader: &[u8] = &wire;

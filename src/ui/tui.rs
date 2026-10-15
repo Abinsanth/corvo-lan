@@ -4,7 +4,7 @@
 pub mod state;
 pub mod view;
 
-use std::io::{Stdout, stdout};
+use std::io::{Stdout, Write, stdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -13,22 +13,24 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as TermEvent,
-    KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
+    EnableMouseCapture, Event as TermEvent, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
+use ratatui::crossterm::style::Print;
 use ratatui::crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
     supports_keyboard_enhancement,
 };
 use tokio::sync::mpsc;
 
 use self::state::{Action, Hit, TuiState, WHEEL_STEP, action_for, goes_to_status};
-use super::Ctx;
 use super::clip;
 use super::complete::Candidates;
 use super::render::{Tone, tone_of, tone_of_text};
 use super::session::{Reaction, Session};
+use super::{Ctx, Notice};
 use crate::api::{Command, Conv, Event};
 use crate::protocol::now_millis;
 
@@ -41,16 +43,30 @@ const TICK: Duration = Duration::from_millis(250);
 const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
 
+/// xterm's title stack: save the window title on entry and put it back on exit.
+/// Terminals without one ignore both.
+const SAVE_TITLE: &str = "\x1b[22;0t";
+const RESTORE_TITLE: &str = "\x1b[23;0t";
+
 /// Best-effort and idempotent: puts the terminal back the way line mode expects.
 fn restore_terminal() {
-    let _ = execute!(
-        stdout(),
+    let _ = restore_to(&mut stdout());
+    let _ = disable_raw_mode();
+}
+
+/// The escape codes `restore_terminal` writes.
+fn restore_to(out: &mut impl Write) -> std::io::Result<()> {
+    execute!(
+        out,
         PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
-        LeaveAlternateScreen
-    );
-    let _ = disable_raw_mode();
+        DisableFocusChange,
+        LeaveAlternateScreen,
+        // Our unread count mustn't outlive us where there's no title stack.
+        SetTitle(""),
+        Print(RESTORE_TITLE)
+    )
 }
 
 /// Restores the terminal before a panic message prints, so it stays usable.
@@ -74,7 +90,14 @@ impl TerminalGuard {
     fn enter() -> std::io::Result<Self> {
         enable_raw_mode()?;
         let guard = TerminalGuard;
-        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+        execute!(
+            stdout(),
+            Print(SAVE_TITLE),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            EnableFocusChange
+        )?;
         if supports_keyboard_enhancement().unwrap_or(false) {
             execute!(stdout(), PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))?;
         }
@@ -216,12 +239,80 @@ fn apply_key(session: &mut Session, state: &mut TuiState, action: Action) -> Key
     KeyOutcome::Stay
 }
 
+/// Ctrl-L: clears the open tab, like `/clear` (the caller repaints).
+fn on_redraw(session: &Session, state: &mut TuiState) {
+    state.clear_view(session, now_millis());
+}
+
+/// Output from the updater. Returns true to restart into a new version now.
+fn on_notice(session: &mut Session, state: &mut TuiState, notice: Notice, now: Instant) -> bool {
+    match notice {
+        Notice::Line { text, tone } => {
+            state.push_status(now_millis(), &text, tone);
+            if text.starts_with("! ") {
+                state.flash(&text, now);
+            }
+        }
+        Notice::Progress(text) => state.push_progress(now_millis(), &text),
+        Notice::Offer(version) => {
+            if session.offer_update(version) {
+                update_question(None, session, state, now);
+            }
+        }
+        Notice::Installed { version, forced: true } => {
+            say(state, &format!("* installed v{version} — restarting"), now);
+            return true;
+        }
+        Notice::Installed { version, forced: false } => {
+            update_question(session.offer_restart(version), session, state, now)
+        }
+    }
+    false
+}
+
+/// Asks a waiting install question once the open one is answered.
+fn ask_pending(session: &mut Session, state: &mut TuiState, now: Instant) {
+    if session.ask_pending() {
+        update_question(None, session, state, now);
+    }
+}
+
+/// Shows the question just asked, or `instead` if another was already open.
+/// Unlike `ask`, it stays on the current tab: these come unasked.
+fn update_question(instead: Option<String>, session: &Session, state: &mut TuiState, now: Instant) {
+    match instead {
+        Some(line) => say(state, &line, now),
+        None => {
+            if let Some(question) = session.prompt() {
+                state.push_status(now_millis(), &question, Tone::Warn);
+                state.flash(&question, now);
+            }
+        }
+    }
+}
+
 /// Shows `text` in the corvo tab, flashing it if it's an error.
 fn say(state: &mut TuiState, text: &str, now: Instant) {
     let tone = tone_of_text(text);
     state.push_status(now_millis(), text, tone);
     if text.starts_with("! ") {
         state.flash(text, now);
+    }
+}
+
+/// Typing, clicking or pasting means the window has focus, even if the
+/// terminal never said it came back.
+fn note_input(state: &mut TuiState, ev: &TermEvent) {
+    if !state.focused && matches!(ev, TermEvent::Key(_) | TermEvent::Mouse(_) | TermEvent::Paste(_)) {
+        on_focus(state, true);
+    }
+}
+
+/// The terminal window gained or lost focus. Coming back counts as seeing what's open.
+fn on_focus(state: &mut TuiState, focused: bool) {
+    state.focused = focused;
+    if focused {
+        state.away = 0;
     }
 }
 
@@ -269,7 +360,7 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     if !text.trim().is_empty() {
         state.history.push(&text);
     }
-    if state.on_status && !text.starts_with('/') && !asking {
+    if state.on_status && !text.trim().is_empty() && !text.starts_with('/') && !session.takes(&text) {
         say(state, "! this is the corvo tab — switch to a chat (Shift-Tab) to send messages", now);
         return None;
     }
@@ -280,6 +371,9 @@ fn on_send(session: &mut Session, state: &mut TuiState, text: String, now: Insta
     if reaction.help {
         state.popup = None;
         state.help = true;
+    }
+    if reaction.clear {
+        state.clear_view(session, now_millis());
     }
     let complained = reaction.print.iter().any(|l| l.starts_with("! "));
     for line in std::mem::take(&mut reaction.print) {
@@ -316,6 +410,13 @@ fn on_event(session: &mut Session, state: &mut TuiState, event: &Event, now: Ins
             state.scroll.note_new();
         }
     }
+    if let Event::Message { conv, .. } = event
+        && !state.focused
+        && !state.on_status
+        && session.store.current() == Some(conv)
+    {
+        state.away += 1;
+    }
     follow_current(state, before, session);
     if matches!(event, Event::NamePreview { .. })
         && let Some(question) = session.prompt()
@@ -350,9 +451,16 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
     state.lan = ctx.lan.clone();
     state.on_status = ctx.session.store.current().is_none();
     let mut tick = tokio::time::interval(TICK);
+    let mut title = String::new();
 
     loop {
         let now = Instant::now();
+        ask_pending(&mut ctx.session, &mut state, now);
+        let want = view::window_title(&ctx.session, &state);
+        if want != title {
+            let _ = execute!(stdout(), SetTitle(&want));
+            title = want;
+        }
         terminal.draw(|f| view::draw(f, &ctx.session, &mut state, now))?;
         tokio::select! {
             ev = input.recv() => {
@@ -373,9 +481,10 @@ pub async fn run(ctx: &mut Ctx) -> anyhow::Result<()> {
                 }
             },
             Some(notice) = ctx.notices.recv() => {
-                state.push_status(now_millis(), &notice.text, notice.tone);
-                if notice.text.starts_with("! ") {
-                    state.flash(&notice.text, Instant::now());
+                if on_notice(&mut ctx.session, &mut state, notice, Instant::now()) {
+                    ctx.restart = true;
+                    let _ = ctx.commands.send(Command::Quit).await;
+                    break;
                 }
             }
             _ = tick.tick() => {}
@@ -393,11 +502,13 @@ async fn on_terminal_event(
     ev: TermEvent,
 ) -> anyhow::Result<bool> {
     let now = Instant::now();
+    note_input(state, &ev);
     let reaction = match ev {
         TermEvent::Key(key) => match action_for(key).map(|a| apply_key(&mut ctx.session, state, a)) {
             Some(KeyOutcome::Send(text)) => on_send(&mut ctx.session, state, text, now),
             Some(KeyOutcome::Quit) => Some(Reaction { quit: true, ..Default::default() }),
             Some(KeyOutcome::Redraw) => {
+                on_redraw(&ctx.session, state);
                 // A fresh terminal has an empty back buffer, so the next draw repaints
                 // everything on the cleared screen; if it can't be built, keep the old one.
                 if let Ok(fresh) = open_terminal() {
@@ -407,6 +518,14 @@ async fn on_terminal_event(
             }
             Some(KeyOutcome::Stay) | None => None,
         },
+        TermEvent::FocusGained => {
+            on_focus(state, true);
+            None
+        }
+        TermEvent::FocusLost => {
+            on_focus(state, false);
+            None
+        }
         TermEvent::Paste(_) | TermEvent::Mouse(_) if state.help => None,
         TermEvent::Paste(text) => {
             state.popup = None;
@@ -462,6 +581,120 @@ mod tests {
         s.on_event(&Event::Assigned { nick: "annmoon".into(), renamed: false }, 0);
         s.on_event(&Event::PeerJoined { id: PeerId::test(2), nick: "bobroger".into() }, 0);
         s
+    }
+
+    #[test]
+    fn typing_brings_the_window_back_even_without_a_focus_event() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = TuiState::new(false);
+        on_focus(&mut state, false);
+        state.away = 2;
+        note_input(&mut state, &TermEvent::FocusLost);
+        assert!(!state.focused, "only input counts");
+        note_input(&mut state, &TermEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(state.focused);
+        assert_eq!(state.away, 0);
+    }
+
+    const V: crate::update::Version = crate::update::Version(0, 6, 0);
+
+    #[test]
+    fn an_offer_is_asked_without_switching_tabs() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_send(&mut s, &mut state, "/chat @bobroger".into(), now);
+        assert!(!on_notice(&mut s, &mut state, Notice::Offer(V), now));
+        assert!(!state.on_status, "still on the chat");
+        assert_eq!(last_status(&state), ("v0.6.0 is available — install it now? (y/n)", Tone::Warn));
+        assert!(state.flash_text(now).is_some());
+        assert!(s.prompt().is_some());
+        let lines = state.status_lines().count();
+        on_notice(&mut s, &mut state, Notice::Offer(V), now);
+        assert_eq!(state.status_lines().count(), lines, "already asking: nothing to show");
+    }
+
+    #[test]
+    fn a_queued_offer_is_asked_once_the_name_is_picked() {
+        let mut s = Session::new(false);
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_event(&mut s, &mut state, &Event::NamePreview { nick: "annmoon".into() }, now);
+        on_notice(&mut s, &mut state, Notice::Offer(V), now);
+        assert!(s.prompt().is_some_and(|p| p.contains("you'll be @annmoon")));
+        ask_pending(&mut s, &mut state, now);
+        assert!(s.prompt().is_some_and(|p| p.contains("you'll be")), "not while the name is open");
+        on_event(&mut s, &mut state, &Event::Assigned { nick: "annmoon".into(), renamed: false }, now);
+        ask_pending(&mut s, &mut state, now);
+        assert_eq!(last_status(&state), ("v0.6.0 is available — install it now? (y/n)", Tone::Warn));
+    }
+
+    #[test]
+    fn forced_installed_restarts_at_once() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        assert!(on_notice(&mut s, &mut state, Notice::Installed { version: V, forced: true }, now));
+        assert_eq!(last_status(&state).0, "* installed v0.6.0 — restarting");
+        assert!(!on_notice(&mut s, &mut state, Notice::Installed { version: V, forced: false }, now));
+        assert_eq!(last_status(&state).0, "v0.6.0 is installed — restart now? You'll leave your rooms. (y/n)");
+        assert!(on_send(&mut s, &mut state, "y".into(), now).unwrap().restart);
+    }
+
+    #[test]
+    fn updater_lines_and_progress_reach_the_corvo_tab() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_notice(&mut s, &mut state, Notice::Progress("* downloading v0.6.0  10%".into()), now);
+        on_notice(&mut s, &mut state, Notice::Progress("* downloading v0.6.0  90%".into()), now);
+        assert_eq!(state.status_lines().count(), 1);
+        on_notice(&mut s, &mut state, Notice::new("! couldn't reach GitHub (offline?)"), now);
+        assert_eq!(last_status(&state), ("! couldn't reach GitHub (offline?)", Tone::Bad));
+        assert!(state.flash_text(now).is_some());
+    }
+
+    #[test]
+    fn an_open_update_question_does_not_let_chat_through_on_corvo() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_notice(&mut s, &mut state, Notice::Offer(V), now);
+        assert_eq!(on_send(&mut s, &mut state, "hello".into(), now), None);
+        assert!(last_status(&state).0.starts_with("! this is the corvo tab"));
+        assert_eq!(on_send(&mut s, &mut state, String::new(), now), Some(Reaction::default()), "Enter is harmless");
+        let r = on_send(&mut s, &mut state, "y".into(), now).unwrap();
+        assert_eq!(r.update, Some(crate::ui::updates::UpdateAction::Install));
+    }
+
+    #[test]
+    fn clear_sets_a_mark_on_the_open_tab() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_send(&mut s, &mut state, "/clear".into(), now);
+        assert!(state.cleared_at(None).is_some(), "the corvo tab");
+        on_send(&mut s, &mut state, "/chat @bobroger".into(), now);
+        assert_eq!(apply_key(&mut s, &mut state, Action::Redraw), KeyOutcome::Redraw);
+        on_redraw(&s, &mut state);
+        assert!(state.cleared_at(Some(&Conv::Dm("bobroger".into()))).is_some(), "Ctrl-L clears too");
+    }
+
+    #[test]
+    fn messages_in_view_count_while_the_window_is_away() {
+        let mut s = session();
+        let mut state = TuiState::new(false);
+        let now = Instant::now();
+        on_send(&mut s, &mut state, "/chat @bobroger".into(), now);
+        let dm = Event::Message { conv: Conv::Dm("bobroger".into()), from: "bobroger".into(), text: "x".into(), ts: 0 };
+        on_event(&mut s, &mut state, &dm, now);
+        assert_eq!(state.away, 0, "seen as it arrived");
+        on_focus(&mut state, false);
+        on_event(&mut s, &mut state, &dm, now);
+        on_event(&mut s, &mut state, &dm, now);
+        assert_eq!(view::window_title(&s, &state), "(2) corvo-lan");
+        on_focus(&mut state, true);
+        assert_eq!(view::window_title(&s, &state), "corvo-lan", "coming back counts as seeing them");
     }
 
     #[test]
@@ -664,7 +897,7 @@ mod tests {
         let msg = Event::Message { conv: room.clone(), from: "bobroger".into(), text: "x".into(), ts: 0 };
         on_event(&mut s, &mut state, &msg, now);
         assert_eq!(state.scroll.unseen(), 1);
-        on_event(&mut s, &mut state, &Event::Sent { conv: room, text: "mine".into(), ts: 0 }, now);
+        on_event(&mut s, &mut state, &Event::Sent { conv: room, text: "mine".into(), ts: 0, id: None }, now);
         assert_eq!(state.scroll.unseen(), 0, "our own message isn't news");
         assert!(!state.scroll.is_scrolled(), "sending shows the latest messages");
     }
@@ -761,6 +994,18 @@ mod tests {
             assert!(!state.help, "{close:?} closes it");
             assert!(state.editor.is_empty(), "{close:?} isn't typed");
         }
+    }
+
+    /// Windows writes some of these through the console API, not as escape codes.
+    #[cfg(unix)]
+    #[test]
+    fn leaving_clears_our_title_before_restoring_the_saved_one() {
+        let mut out = Vec::new();
+        restore_to(&mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let clear = out.find("\x1b]0;\x07").expect("title cleared, for terminals without a title stack");
+        assert!(out.ends_with(RESTORE_TITLE), "{out:?}");
+        assert!(clear < out.len() - RESTORE_TITLE.len(), "cleared first, so a saved title wins: {out:?}");
     }
 
     #[test]

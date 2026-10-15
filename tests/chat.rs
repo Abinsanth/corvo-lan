@@ -29,6 +29,7 @@ async fn spawn_node_with_word(base: &str, peers: &[SocketAddr], word: Option<&st
         manual_peers: peers.to_vec(),
         name_wait: Duration::ZERO,
         fixed_word: word.map(String::from),
+        prefer: None,
         ask_name: false,
     })
     .await
@@ -167,6 +168,17 @@ async fn dm_reaches_its_target() {
     let event = wait_for(&mut alice.node, "dm", |e| matches!(e, Event::Message { .. })).await;
     assert!(matches!(event, Event::Message { conv: Conv::Dm(c), from, text, .. }
         if c == bob.nick && from == bob.nick && text == "hello"));
+}
+
+#[tokio::test]
+async fn a_dm_is_confirmed_delivered() {
+    let (mut alice, mut bob) = pair().await;
+    say(&bob, Target::Dm(alice.nick.clone()), "hello").await;
+    let sent = wait_for(&mut bob.node, "sent", |e| matches!(e, Event::Sent { .. })).await;
+    let Event::Sent { id: Some(id), .. } = sent else { panic!("a DM has an id: {sent:?}") };
+    wait_for(&mut alice.node, "dm", |e| matches!(e, Event::Message { .. })).await;
+    let delivered = wait_for(&mut bob.node, "ack", |e| matches!(e, Event::Delivered { .. })).await;
+    assert_eq!(delivered, Event::Delivered { id });
 }
 
 #[tokio::test]
@@ -389,6 +401,7 @@ async fn an_asking_node_goes_live_on_confirm() {
         manual_peers: vec![],
         name_wait: Duration::ZERO,
         fixed_word: None,
+        prefer: None,
         ask_name: true,
     })
     .await

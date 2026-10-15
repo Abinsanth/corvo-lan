@@ -105,6 +105,7 @@ Then you're connected to everyone else running it. With `--nick` it skips the qu
 /chat bob                  # the @ or # is optional when only one name matches
 /who                       # who's connected
 /update [yes]              # check for and install a newer version
+/clear                     # clear the screen, like in a terminal (also Ctrl-L)
 /close [@nick]             # close a private chat (TUI)
 /help  /h                  # show commands (q or Esc closes it)
 /quit  /q                  # leave
@@ -119,6 +120,12 @@ opens a private chat. Command output and errors appear in the `corvo` tab. The
 bottom line shows your `ip` and `port`: on most home and office networks,
 people on the same LAN share the first three numbers of the ip. To select
 text, hold Shift (Option on macOS) while dragging.
+
+In a private chat, each line has a mark after the time: `←` for messages you
+received, and for yours `·` while it's on its way, `✓` once the other app has
+it, or `✗` if it didn't arrive within 5 seconds (say they closed the lid).
+Nothing is resent, so press ↑ to bring it back and send it again. The window
+title shows how many messages you haven't read.
 
 ### Rooms
 
@@ -167,14 +174,19 @@ with a different key, corvo-lan warns you.
 
 ### Updating
 
-Type `/update` to see newer versions, then `/update yes` to install the
-newest one; restart corvo-lan to use it. On Windows the old version is set
-aside as `corvo-lan.old.exe` and deleted the next time corvo-lan starts; `/update` there needs Windows 10
-version 1803 or newer, which has the built-in curl and tar. At
-startup corvo-lan makes one request to GitHub to see whether a newer version
-exists. That request sends only your IP address and the app version; turn it
-off with `--no-update-check` or `CORVO_LAN_NO_UPDATE_CHECK=1`. Nothing else
-ever leaves your network.
+At startup corvo-lan asks GitHub once whether a newer version exists. If one
+does, the `corvo` tab asks `install it now? (y/n)`; `/update` lists what's new
+and asks the same, and `/update yes` (or `/update y`) installs straight away.
+A version that's been out for 22 days or more is installed at startup without
+asking, so nobody stays on an old one. While it downloads, a progress bar
+shows how far it got; afterwards corvo-lan offers to restart into the new
+version in the same window, keeping your name if it's still free (restarting
+leaves your rooms). On Windows the old version is set aside as
+`corvo-lan.old-<n>.exe` and deleted once it's no longer running; `/update` there
+needs Windows 10 version 1803 or newer, which has the built-in curl and tar.
+The check sends GitHub only your IP address and the app version, and if GitHub
+can't be reached corvo-lan just starts as usual. Nothing else ever leaves your
+network.
 
 ### If peers don't find each other
 

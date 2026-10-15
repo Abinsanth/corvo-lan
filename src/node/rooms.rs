@@ -483,7 +483,7 @@ impl Node {
         let frame = self.seal(&room.keys, RoomBody::Chat { text: text.clone() });
         self.broadcast(frame);
         let alone = room.members.is_empty() && !room.told_alone;
-        self.emit(Event::Sent { conv: Conv::Room(name.to_string()), text, ts: now_millis() });
+        self.emit(Event::Sent { conv: Conv::Room(name.to_string()), text, ts: now_millis(), id: None });
         if alone {
             if let Some(room) = self.rooms.joined.get_mut(&id) {
                 room.told_alone = true;

@@ -25,9 +25,12 @@ struct Args {
     /// Write debug logs to ./corvo-lan.log
     #[arg(long)]
     debug: bool,
-    /// Don't check GitHub for a newer version at startup (or set CORVO_LAN_NO_UPDATE_CHECK=1)
-    #[arg(long)]
-    no_update_check: bool,
+    /// After an update's restart: come back as this name if it's still free
+    #[arg(long, hide = true, value_name = "NAME")]
+    resume_as: Option<String>,
+    /// Set by an update's restart, so a start never forces two updates in a row
+    #[arg(long, hide = true)]
+    after_update: bool,
 }
 
 #[tokio::main]
@@ -49,10 +52,17 @@ async fn main() -> anyhow::Result<()> {
         update::remove_old_exe(dir);
     }
 
+    // Noted now: an update replaces the file, and a restart runs it from here.
+    let exe = update::running_exe().ok();
+
     // Windows sets USERNAME rather than USER.
     let login = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok();
-    let ask_name = args.nick.is_none();
-    let base = args.nick.map(|n| n.to_ascii_lowercase()).unwrap_or_else(|| names::default_base(login.as_deref()));
+    let resume = args.resume_as.filter(|name| names::is_valid_name(name));
+    let ask_name = args.nick.is_none() && resume.is_none();
+    let base = match resume.as_deref().and_then(names::base_of) {
+        Some(base) => base.to_string(),
+        None => args.nick.map(|n| n.to_ascii_lowercase()).unwrap_or_else(|| names::default_base(login.as_deref())),
+    };
     names::validate_base(&base).map_err(|e| anyhow!("invalid --nick {base:?}: {e}"))?;
 
     // Holds the identity lock until the app exits.
@@ -67,9 +77,16 @@ async fn main() -> anyhow::Result<()> {
         manual_peers: args.peers,
         name_wait: node::NAME_WAIT,
         fixed_word: None,
+        prefer: resume,
         ask_name,
     })
     .await?;
-    let env_off = update::check_disabled_by(std::env::var("CORVO_LAN_NO_UPDATE_CHECK").ok().as_deref());
-    ui::run(handle, ui::Options { check_updates: !args.no_update_check && !env_off }).await
+    let exit = ui::run(handle, ui::Options { exe: exe.clone(), after_update: args.after_update }).await?;
+    if let (ui::Exit::Restart { name }, Some(exe)) = (exit, exe) {
+        // The new version takes the identity lock, so let go of it first.
+        drop(identity);
+        let args = update::restart_args(std::env::args_os().skip(1), name.as_deref());
+        update::relaunch(&exe, args).map_err(|e| anyhow!("couldn't restart corvo-lan: {e}"))?;
+    }
+    Ok(())
 }
