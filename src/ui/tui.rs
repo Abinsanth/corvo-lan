@@ -561,18 +561,26 @@ async fn on_terminal_event(
             match m.kind {
                 MouseEventKind::ScrollUp => state.scroll.by(-(WHEEL_STEP as isize), total, height),
                 MouseEventKind::ScrollDown => state.scroll.by(WHEEL_STEP as isize, total, height),
-                MouseEventKind::Down(MouseButton::Left) => match state.hit(m.column, m.row) {
-                    Some(Hit::Tab(i)) => state.select_tab(&mut ctx.session, i),
-                    Some(Hit::Invite(room)) => {
-                        let reaction = on_copy(&ctx.session, state, &room, now);
-                        return act(ctx, Some(reaction)).await;
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let hit = state.hit(m.column, m.row);
+                    let double = state.click(hit.clone(), now);
+                    match hit {
+                        Some(Hit::Tab(i)) => state.select_tab(&mut ctx.session, i),
+                        Some(Hit::Invite(room)) => {
+                            let reaction = on_copy(&ctx.session, state, &room, now);
+                            return act(ctx, Some(reaction)).await;
+                        }
+                        Some(Hit::Person(nick)) if Some(nick.as_str()) != ctx.session.store.me() => {
+                            let reaction = on_send(&mut ctx.session, state, format!("/chat @{nick}"), now);
+                            return act(ctx, reaction).await;
+                        }
+                        Some(Hit::Message { text, .. }) if double => {
+                            state.flash("* copied (if it didn't copy, Shift/Option-drag to select it)", now);
+                            return act(ctx, Some(Reaction { copy: Some(text), ..Default::default() })).await;
+                        }
+                        _ => {}
                     }
-                    Some(Hit::Person(nick)) if Some(nick.as_str()) != ctx.session.store.me() => {
-                        let reaction = on_send(&mut ctx.session, state, format!("/chat @{nick}"), now);
-                        return act(ctx, reaction).await;
-                    }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
             None
