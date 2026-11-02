@@ -115,8 +115,8 @@ corvo-lan opens a full-screen view: tabs for each chat along the top, the
 people in the room and everyone online on the right. `Shift-Tab`,
 `Alt-←`/`Alt-→` or `Alt-1..9` switch tabs, `Tab` completes `@names`, `#rooms`
 and `/commands`, `Alt+Enter` (or `Shift+Enter` where your terminal supports it)
-adds a new line, `PgUp`/`PgDn` or the mouse wheel scroll, and clicking a name
-opens a private chat. Command output and errors appear in the `corvo` tab. The
+adds a new line, `PgUp`/`PgDn` or the mouse wheel scroll, clicking a name
+opens a private chat, and double-clicking a message copies its text. Command output and errors appear in the `corvo` tab. The
 bottom line shows your `ip` and `port`: on most home and office networks,
 people on the same LAN share the first three numbers of the ip. To select
 text, hold Shift (Option on macOS) while dragging.

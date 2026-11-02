@@ -94,16 +94,17 @@ fn message_rows(
     out
 }
 
-/// A conversation's rows, and how many of them come from lines up to `mark` (a `/clear`).
+/// A conversation's rows, what clicking each one hits, and how many of them
+/// come from lines up to `mark` (a `/clear`).
 fn conversation_rows(
     session: &Session,
     conv: &Conv,
     width: usize,
     color: bool,
     mark: Option<u64>,
-) -> (Vec<Line<'static>>, usize) {
+) -> (Vec<Line<'static>>, Vec<Option<Hit>>, usize) {
     let Some(c) = session.store.get(conv) else {
-        return (Vec::new(), 0);
+        return (Vec::new(), Vec::new(), 0);
     };
     let me = session.store.me().unwrap_or("you").to_string();
     let nick_of = |kind: &LineKind| match kind {
@@ -118,8 +119,8 @@ fn conversation_rows(
     // DM tabs get a column after the time: ← theirs; ours · waiting, ✓ delivered, ✗ not.
     let marks = matches!(conv, Conv::Dm(_));
     let mark_w = if marks { 2 } else { 0 };
-    let (mut out, mut before) = (Vec::new(), 0);
-    for l in &c.lines {
+    let (mut out, mut hits, mut before) = (Vec::new(), Vec::new(), 0);
+    for (at, l) in c.lines.iter().enumerate() {
         let time = Span::styled(format!("{} ", hhmm(l.ts)), dim);
         match &l.kind {
             LineKind::Notice(text) => {
@@ -156,11 +157,18 @@ fn conversation_rows(
                 out.extend(message_rows(prefix, TIME_WIDTH + mark_w + sender_w + 1, text, body_style, width));
             }
         }
+        let hit = match &l.kind {
+            LineKind::Msg { text, .. } | LineKind::Mine { text, .. } => {
+                Some(Hit::Message { at, text: text.split('\n').map(clean).collect::<Vec<_>>().join("\n") })
+            }
+            LineKind::Notice(_) => None,
+        };
+        hits.resize(out.len(), hit);
         if mark.is_some_and(|m| l.ts <= m) {
             before = out.len();
         }
     }
-    (out, before)
+    (out, hits, before)
 }
 
 /// The corvo tab's rows, and how many come from lines up to its `/clear`.
@@ -505,9 +513,12 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
     draw_tabs(frame, tabs_a, session, state);
 
     let width = msgs_a.width as usize;
-    let (mut rows, before) = match (state.on_status, session.store.current()) {
+    let (mut rows, hits, before) = match (state.on_status, session.store.current()) {
         (false, Some(conv)) => conversation_rows(session, conv, width, state.color, state.cleared_at(Some(conv))),
-        _ => status_rows(state, width),
+        _ => {
+            let (rows, before) = status_rows(state, width);
+            (rows, Vec::new(), before)
+        }
     };
     let height = msgs_a.height as usize;
     if before > 0 {
@@ -519,6 +530,11 @@ pub fn draw(frame: &mut Frame, session: &Session, state: &mut TuiState, now: Ins
     state.view = (rows.len(), height);
     let visible: Vec<Line> = rows.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(visible), msgs_a);
+    for (row, hit) in hits.into_iter().skip(top).take(height).enumerate() {
+        if let Some(hit) = hit {
+            state.add_hit(Rect::new(msgs_a.x, msgs_a.y + row as u16, msgs_a.width, 1), hit);
+        }
+    }
 
     if let Some(side) = side_a {
         draw_sidebar(frame, side, session, state);
@@ -629,6 +645,27 @@ mod tests {
         assert!(
             rows(&buf).iter().any(|r| r.contains("wrap onto another row") && r.find("wrap").unwrap() >= x0 as usize)
         );
+    }
+
+    #[test]
+    fn every_row_of_a_message_holds_its_text_for_copying() {
+        let mut s = session();
+        let room = || Conv::Room("catpie".into());
+        let text = "first line\nthis second line is long enough that it has to wrap onto another row";
+        s.on_event(&Event::Message { conv: room(), from: "bobroger".into(), text: text.into(), ts: 0 }, 0);
+        s.on_event(&Event::MemberLeft { room: "catpie".into(), nick: "bobroger".into() }, 0);
+        s.on_event(&Event::Message { conv: room(), from: "carolwolf".into(), text: "a\u{7}b".into(), ts: 0 }, 0);
+        let mut state = TuiState::new(false);
+        state.select_tab(&mut s, 1);
+        let buf = render(&s, &mut state, 60, 20);
+        let first = Some(Hit::Message { at: 1, text: text.into() });
+        let (x, y) = find(&buf, "first line").unwrap();
+        assert_eq!(state.hit(0, y), first, "the time and name count too");
+        assert_eq!(state.hit(x, y + 1), first);
+        let (x, y) = find(&buf, "wrap onto another row").unwrap();
+        assert_eq!(state.hit(x, y), first);
+        assert_eq!(state.hit(x, y + 1), None, "notices aren't messages");
+        assert_eq!(state.hit(x, y + 2), Some(Hit::Message { at: 3, text: "a\u{fffd}b".into() }), "shown as drawn");
     }
 
     #[test]
