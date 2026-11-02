@@ -18,6 +18,7 @@ pub const HISTORY_LEN: usize = 100;
 pub const STATUS_LEN: usize = 500;
 pub const FLASH_FOR: Duration = Duration::from_secs(5);
 pub const WHEEL_STEP: usize = 3;
+pub const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 /// The multi-line input box. `cursor` is a byte index on a char boundary.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -290,6 +291,11 @@ pub enum Hit {
     Person(String),
     /// A room's name or key in the sidebar: copies its invite.
     Invite(String),
+    /// A row of the `at`th line of the open conversation: a double click copies `text`.
+    Message {
+        at: usize,
+        text: String,
+    },
 }
 
 /// Completion choices shown above the input.
@@ -418,6 +424,7 @@ pub struct TuiState {
     cleared: HashMap<Option<Conv>, u64>,
     flash: Option<(String, Instant)>,
     hits: Vec<(Rect, Hit)>,
+    last_click: Option<(Hit, Instant)>,
 }
 
 impl TuiState {
@@ -440,6 +447,7 @@ impl TuiState {
             cleared: HashMap::new(),
             flash: None,
             hits: Vec::new(),
+            last_click: None,
         }
     }
 
@@ -573,6 +581,14 @@ impl TuiState {
 
     pub fn hit(&self, col: u16, row: u16) -> Option<Hit> {
         self.hits.iter().find(|(area, _)| area.contains(Position::new(col, row))).map(|(_, hit)| hit.clone())
+    }
+
+    /// A left click on `hit`. Says whether it's the second of a double click.
+    pub fn click(&mut self, hit: Option<Hit>, now: Instant) -> bool {
+        let double = matches!((&self.last_click, &hit),
+            (Some((last, at)), Some(hit)) if last == hit && now.saturating_duration_since(*at) < DOUBLE_CLICK);
+        self.last_click = if double { None } else { hit.map(|h| (h, now)) };
+        double
     }
 }
 
@@ -898,6 +914,20 @@ mod tests {
         assert_eq!(t.hit(80, 3), None);
         t.clear_hits();
         assert_eq!(t.hit(3, 0), None);
+    }
+
+    #[test]
+    fn two_quick_clicks_on_the_same_thing_are_a_double_click() {
+        let mut t = TuiState::new(false);
+        let msg = |at| Some(Hit::Message { at, text: "hi".into() });
+        let t0 = Instant::now();
+        assert!(!t.click(msg(0), t0));
+        assert!(t.click(msg(0), t0 + Duration::from_millis(300)));
+        assert!(!t.click(msg(0), t0 + Duration::from_millis(400)), "a third click starts over");
+        assert!(!t.click(msg(0), t0 + Duration::from_millis(400) + DOUBLE_CLICK), "too slow");
+        assert!(!t.click(msg(1), t0 + Duration::from_millis(1000)), "a different message");
+        assert!(!t.click(None, t0 + Duration::from_millis(1100)));
+        assert!(!t.click(msg(1), t0 + Duration::from_millis(1200)), "clicking elsewhere in between");
     }
 
     #[test]
